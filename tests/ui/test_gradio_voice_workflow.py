@@ -2,6 +2,7 @@ import asyncio
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
+from threading import Event
 import wave
 
 import pytest
@@ -12,6 +13,7 @@ from gradio.state_holder import SessionState
 from tts_audiobook_tool import gradio_app, web_projects, web_voice_panel, web_voices
 from tts_audiobook_tool.app_types import Book, BookSection, RoomReverb
 from tts_audiobook_tool.app_types.phrase import Phrase, PhraseGroup, Reason
+from tts_audiobook_tool.generation_events import BookRenderTelemetry
 from tts_audiobook_tool.speaker_assign.roster import Roster, RosterCharacter
 from tts_audiobook_tool.web_backend import BookSession
 from tts_audiobook_tool.web_models import ModelRunError
@@ -65,6 +67,50 @@ def _uploaded_audio(directory):
         clip.setparams((1, 2, 8000, 0, "NONE", "not compressed"))
         clip.writeframes(b"\x00\x00" * 8_000)
     return {"path": str(path), "meta": {"_type": "gradio.FileData"}}
+
+
+def test_live_console_and_overall_audio_speed_update_before_render_finishes(tmp_path, monkeypatch):
+    monkeypatch.setattr(gradio_app, "installed_model_choices", lambda: [("Breeze TTS 2", "venv-breeze")])
+    halfway = Event()
+    finish = Event()
+
+    def render(_model, _session, _voices, *, on_console, on_telemetry, **_kwargs):
+        on_console("Saved audio for the first batch.\n")
+        on_telemetry(BookRenderTelemetry(processed=2, total=4, speed_multiplier=10.0))
+        halfway.set()
+        assert finish.wait(10)
+        on_telemetry(BookRenderTelemetry(processed=4, total=4, speed_multiplier=8.0))
+
+    monkeypatch.setattr(gradio_app, "render_model_book", render)
+    ui = VoiceApp()
+    generate = ui.event("generate_audiobook")
+    refresh = ui.event("refresh_activity")
+    assert refresh.queue is False
+    book = Book([BookSection([PhraseGroup([Phrase(f"Line {i}.", Reason.SENTENCE)]) for i in range(4)])])
+    ui.state[generate.inputs[0]._id] = BookSession(book, str(tmp_path))
+
+    async def exercise():
+        job = asyncio.create_task(ui.run(generate))
+        try:
+            assert await asyncio.to_thread(halfway.wait, 10)
+            (midway,) = await ui.run(refresh)
+            assert "Saved audio for the first batch." in midway[0]
+            assert "2 of 4 segments · 50%" in midway[1]["value"]
+            assert "10.0x" in midway[1]["value"]
+            assert '<progress aria-label="Overall audiobook progress" max="4" value="2">' in midway[1]["value"]
+
+            viewer = gr.Request(session_hash="another-session")
+            other = await ui.app.process_api(refresh, [None], SessionState(ui.app), request=viewer)
+            assert all("value" not in item for item in other["data"][:2])
+        finally:
+            finish.set()
+            await job
+        (completed,) = await ui.run(refresh)
+        assert "Selected lines are ready" in completed[0]
+        assert "4 of 4 segments · 100%" in completed[1]["value"]
+        assert "8.0x" in completed[1]["value"]
+
+    asyncio.run(exercise())
 
 
 def test_reference_upload_and_recording_transcribe_with_editable_fallback(tmp_path, monkeypatch):

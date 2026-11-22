@@ -35,7 +35,7 @@ from tts_audiobook_tool.constants_config import (
     PROJECT_MAX_RETRIES_MIN,
     VOICE_CLONE_TRANSCRIBE_MIN_PROBABILITY,
 )
-from tts_audiobook_tool.generation_events import GenerationProgress, GenerationTimedOut, ModelUnhealthy
+from tts_audiobook_tool.generation_events import BookRenderTelemetry, GenerationProgress, GenerationTimedOut, ModelUnhealthy
 from tts_audiobook_tool.l import L
 from tts_audiobook_tool.model_runtime import mark_interactive_main
 from tts_audiobook_tool.model_worker import ModelWorker, ModelWorkerUnavailable
@@ -327,9 +327,10 @@ def _wait_for_job(
     operation_id: str,
     result_type: type[GenerationFinished] | type[TtsPreviewFinished],
     cancel_event: threading.Event | None,
-    on_progress: Callable[[int, int], None] | None = None,
+    on_progress: Callable[[GenerationProgress], None] | None = None,
     *,
     transcript: GenerationTranscript | None = None,
+    on_console: Callable[[str], None] | None = None,
 ) -> GenerationFinished | TtsPreviewFinished:
     cancellation_deadline = None
     try:
@@ -344,8 +345,11 @@ def _wait_for_job(
             event = ModelWorker.get_event(timeout=0.1)
             if getattr(event, "operation_id", None) != operation_id:
                 continue
-            if transcript is not None and isinstance(event, ConsoleOutput):
-                transcript.write_chunk(event.text, event.stream)
+            if isinstance(event, ConsoleOutput):
+                if transcript is not None:
+                    transcript.write_chunk(event.text, event.stream)
+                if on_console is not None:
+                    on_console(event.text)
             if isinstance(event, result_type):
                 _check_cancelled(cancel_event)
                 if event.status is GenerationTerminalStatus.COMPLETED:
@@ -368,7 +372,7 @@ def _wait_for_job(
                     L.w(update.reason)
                     raise WebRenderError("The model could not continue rendering.")
                 if on_progress is not None and isinstance(update, GenerationProgress):
-                    on_progress(update.processed, update.total)
+                    on_progress(update)
     finally:
         if ModelWorker.is_busy():
             # End a hung or cancelled job before removing its temporary project.
@@ -412,6 +416,7 @@ def render_sample(
     model_options: dict[str, object] | None = None,
     runtime_settings: WebRuntimeSettings | None = None,
     remote_selection: RemoteTtsSelection | None = None,
+    on_console: Callable[[str], None] | None = None,
 ) -> str:
     """Render a single prompt with the active environment's model to a WAV file."""
     text = text.strip()
@@ -434,7 +439,7 @@ def render_sample(
             except ModelWorkerUnavailable as error:
                 L.w(str(error))
                 raise WebRenderError("The model worker could not start.") from error
-            event = _wait_for_job(operation_id, TtsPreviewFinished, cancel_event)
+            event = _wait_for_job(operation_id, TtsPreviewFinished, cancel_event, on_console=on_console)
             if not isinstance(event, TtsPreviewFinished) or not isinstance(event.sound, Sound):
                 raise WebRenderError("The model returned no playable audio.")
             sound = _apply_sample_effects(event.sound, state.project.voice_references[0])
@@ -651,6 +656,7 @@ def render_book(
     validate_audio: bool = True,
     batch_size: int = PROJECT_BATCH_SIZE_DEFAULT,
     on_progress: Callable[[int, int], None] | None = None,
+    on_telemetry: Callable[[BookRenderTelemetry], None] | None = None,
     cancel_event: threading.Event | None = None,
     model_options: dict[str, object] | None = None,
     first_line: int = 1,
@@ -661,6 +667,7 @@ def render_book(
     max_retries: int = PROJECT_MAX_RETRIES_DEFAULT,
     runtime_settings: WebRuntimeSettings | None = None,
     remote_selection: RemoteTtsSelection | None = None,
+    on_console: Callable[[str], None] | None = None,
 ) -> str | None:
     """Generate a requested range and export when the whole book is ready."""
     from filelock import FileLock, Timeout
@@ -703,10 +710,12 @@ def render_book(
                 return _render_book_checkpoint(
                     work, book, references, language_code, validate_audio,
                     batch_size, on_progress, cancel_event, model=model, model_options=options,
+                    on_telemetry=on_telemetry,
                     word_substitutions=session.word_substitutions, selected=selected, regenerate=regenerate,
                     auto_concat=auto_concat, strictness=tolerance, max_retries=max_retries,
                     runtime_settings=runtime_settings,
                     remote_selection=remote_selection,
+                    on_console=on_console,
                 )
         except Timeout as error:
             raise WebRenderError("This audiobook is already rendering.") from error
@@ -722,6 +731,7 @@ def _render_book_checkpoint(
     on_progress: Callable[[int, int], None] | None,
     cancel_event: threading.Event | None,
     *,
+    on_telemetry: Callable[[BookRenderTelemetry], None] | None,
     model: TtsModelType,
     model_options: dict[str, object],
     word_substitutions: dict[str, str],
@@ -732,13 +742,26 @@ def _render_book_checkpoint(
     max_retries: int,
     runtime_settings: WebRuntimeSettings,
     remote_selection: RemoteTtsSelection | None = None,
+    on_console: Callable[[str], None] | None = None,
 ) -> str | None:
     _check_cancelled(cancel_event)
     total = len(selected)
+    speed_multiplier = None
+    previous_telemetry = None
+
+    def report_progress(processed: int) -> None:
+        nonlocal previous_telemetry
+        if on_progress is not None:
+            on_progress(processed, total)
+        if on_telemetry is not None:
+            telemetry = BookRenderTelemetry(processed, total, speed_multiplier)
+            if telemetry != previous_telemetry:
+                on_telemetry(telemetry)
+                previous_telemetry = telemetry
+
     output = work / "audiobook.abr.m4b"
     if auto_concat and not regenerate and _automatic_export_matches(output, runtime_settings.aac_bitrate):
-        if on_progress is not None:
-            on_progress(total, total)
+        report_progress(total)
         return str(output)
 
     with _project_state(
@@ -748,8 +771,7 @@ def _render_book_checkpoint(
         remote_selection=remote_selection,
     ) as state:
         remaining = selected if regenerate else _missing_segments(state.project, selected)
-        if on_progress is not None:
-            on_progress(total - len(remaining), total)
+        report_progress(total - len(remaining))
         _check_cancelled(cancel_event)
         if remaining:
             try:
@@ -757,9 +779,10 @@ def _render_book_checkpoint(
             except WebRuntimeSettingsError as error:
                 raise WebRenderError(str(error)) from error
 
-            def report_progress(processed: int, requested: int) -> None:
-                if on_progress is not None:
-                    on_progress(total - requested + processed, total)
+            def report_generation_progress(update: GenerationProgress) -> None:
+                nonlocal speed_multiplier
+                speed_multiplier = update.speed_multiplier
+                report_progress(total - update.total + update.processed)
 
             staging = tempfile.TemporaryDirectory(dir=work, prefix=".regeneration-") if regenerate else nullcontext("")
             with staging as staging_dir, _generation_log(work, state.prefs.save_gen_log) as transcript:
@@ -770,7 +793,10 @@ def _render_book_checkpoint(
                 except ModelWorkerUnavailable as error:
                     L.w(str(error))
                     raise WebRenderError("The model worker could not start.") from error
-                _wait_for_job(operation_id, GenerationFinished, cancel_event, report_progress, transcript=transcript)
+                _wait_for_job(
+                    operation_id, GenerationFinished, cancel_event, report_generation_progress,
+                    transcript=transcript, on_console=on_console,
+                )
                 _check_cancelled(cancel_event)
                 if regenerate:
                     _publish_regenerated_takes(state.project, staging_dir, selected, output)
@@ -778,8 +804,7 @@ def _render_book_checkpoint(
                     raise WebRenderError(
                         f"The model did not produce audio for {len(missing)} of {total} text segments."
                     )
-            if on_progress is not None:
-                on_progress(total, total)
+            report_progress(total)
 
         _check_cancelled(cancel_event)
         if not auto_concat or _missing_segments(state.project, set(range(len(book.phrase_groups))) - selected):

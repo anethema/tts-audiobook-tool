@@ -30,6 +30,16 @@ class GenerationProgress:
     # (never interpolated by the consumer). None until enough per-batch
     # durations have been recorded in generate_files().
     eta_seconds: float | None = None
+    speed_multiplier: float | None = None
+
+
+@dataclass(frozen=True)
+class BookRenderTelemetry:
+    """Progress through the requested lines, including checkpointed audio."""
+
+    processed: int
+    total: int
+    speed_multiplier: float | None = None
 
 
 @dataclass(frozen=True)

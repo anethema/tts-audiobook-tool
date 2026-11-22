@@ -70,7 +70,7 @@ class VoiceChatPanel:
         return [("Text only", ""), *installed_choices]
 
     def bind(self, *, api_key, llm_model, effort, endpoint, voice_panel, model_settings,
-             event_options, runtime_panel=None, remote_panel=None):
+             event_options, runtime_panel=None, remote_panel=None, console_for=None):
         outputs = [self.state, self.history, self.message, self.microphone, self.audio, self.status, self.send, self.stop]
         runtime_inputs = runtime_panel.inputs if runtime_panel is not None else ()
         remote_inputs = remote_panel.selection_inputs if remote_panel is not None else ()
@@ -123,6 +123,9 @@ class VoiceChatPanel:
                 audio = gr.skip()
                 message = "Reply ready."
                 if speech_model:
+                    console = console_for(request.session_hash) if console_for is not None else None
+                    if console is not None:
+                        console("\nGenerating voice chat audio\n")
                     yield (
                         completed, completed.messages(), gr.update(value=""), None, gr.skip(),
                         _status("Generating reply audio…"), gr.skip(), gr.skip(),
@@ -139,6 +142,7 @@ class VoiceChatPanel:
                             speech_model, reply, voice, language_code=language or "en", cancel_event=turn.cancel_event,
                             model_options=(settings or {}).get(speech_model),
                             runtime_settings=runtime,
+                            **({"on_console": console} if console is not None else {}),
                             **({"remote_selection": remote} if remote is not None else {}),
                         ))
                         cached = None
@@ -156,6 +160,8 @@ class VoiceChatPanel:
                         message = "Reply audio stopped." if turn.cancel_event.is_set() else str(exc)
                     except Exception:
                         message = "Could not generate reply audio."
+                    if console is not None:
+                        console(message + "\n")
                 yield (
                     completed, completed.messages(), gr.update(value="", interactive=True), None, audio,
                     _status(message), gr.update(interactive=True), gr.update(interactive=False),

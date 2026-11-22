@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import time
+from time import monotonic
 
 import numpy as np
 
@@ -124,6 +125,7 @@ class GenerateUtil:
         stt_variant = state.prefs.stt_variant
         stt_config = state.prefs.stt_config
         showed_vram_warning = False
+        generation_started = monotonic()
 
         GenerationEvents.emit(GenerationPhase("Preparing models"))
 
@@ -195,6 +197,9 @@ class GenerateUtil:
         num_passed = 0
         num_retries = 0
         saved_indices: set[int] = set()
+        saved_durations: dict[int, float] = {}
+        saved_audio_seconds = 0.0
+        speed_multiplier: float | None = None
         word_counts: dict[int, int] = {}
         preexisting_word_error_counts = project.sound_segments.get_word_error_counts_in_generate_range()
         best_word_error_counts = dict(preexisting_word_error_counts)
@@ -284,6 +289,7 @@ class GenerateUtil:
                     errored=num_errored,
                     retries=num_retries,
                     eta_seconds=eta_seconds,
+                    speed_multiplier=speed_multiplier,
                 )
             )
             heading_voice_index = sub.voice_selection_index
@@ -477,6 +483,12 @@ class GenerateUtil:
                         else:
                             project.sound_segments.delete_redundants_for(index)
 
+                        # A retry contributes the duration of the retained take for its line.
+                        if Path(saved_path).is_file():
+                            duration = validation_result.sound.duration
+                            saved_audio_seconds += duration - saved_durations.get(index, 0.0)
+                            saved_durations[index] = duration
+
                         url = saved_path
                         text = Path(saved_path).name
                         link = text_util.make_terminal_hyperlink(url=url, text=text, is_file=True)
@@ -529,6 +541,8 @@ class GenerateUtil:
                     + (len(pending_retries) + batch_size - 1) // batch_size
                 ),
             )
+            elapsed = monotonic() - generation_started
+            speed_multiplier = saved_audio_seconds / elapsed if saved_audio_seconds > 0 and elapsed > 0 else None
             GenerationEvents.emit(
                 GenerationProgress(
                     processed=num_processed,
@@ -539,6 +553,7 @@ class GenerateUtil:
                     errored=num_errored,
                     retries=num_retries,
                     eta_seconds=eta_seconds,
+                    speed_multiplier=speed_multiplier,
                 )
             )
 

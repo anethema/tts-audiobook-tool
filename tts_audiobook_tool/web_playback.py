@@ -1,7 +1,7 @@
 """Browser audio playback from matching takes and the normal model worker."""
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, replace
 from fractions import Fraction
 from io import BytesIO
@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from tts_audiobook_tool.constants import APP_SAMPLE_RATE, PROJECT_SOUND_SEGMENTS_SUBDIR
 from tts_audiobook_tool.constants_config import PROJECT_MAX_RETRIES_DEFAULT
 from tts_audiobook_tool.text_ops.range_string_util import RangeStringUtil
+from tts_audiobook_tool.web_console import capture_synthesis_console, relay_synthesis_console
 from tts_audiobook_tool.web_models import ModelRunError, ROOT, _RENDER_LOCK, _python_for, _stop, _write_json
 from tts_audiobook_tool.web_remote_models import (
     REMOTE_MODEL_ID, RemoteTtsSelection, WebRemoteTtsError, remote_client_python, remote_worker_scope,
@@ -60,6 +61,7 @@ def play_book(
         strictness: str | None = None, max_retries: int = PROJECT_MAX_RETRIES_DEFAULT,
         cancel_event: Event | None = None, runtime_settings: WebRuntimeSettings | None = None,
         remote_selection: RemoteTtsSelection | None = None,
+        on_console: Callable[[str], None] | None = None,
 ) -> Iterator[PlaybackChunk]:
     """Yield ordered WAV chunks while the selected environment prepares the range."""
     from tts_audiobook_tool.app_types.book_serialization import book_to_project_text_json_dict
@@ -73,7 +75,10 @@ def play_book(
         _check_cancelled(cancel)
     try:
         _check_cancelled(cancel)
-        with TemporaryDirectory(prefix="audiobook-playback-") as temp:
+        with (
+            TemporaryDirectory(prefix="audiobook-playback-") as temp,
+            capture_synthesis_console(Path(temp), on_console) as (console_options, publish_console),
+        ):
             directory = Path(temp)
             _write_json(directory / "input.json", {
                 "book": book_to_project_text_json_dict(session.book), "project_dir": session.project_dir,
@@ -93,8 +98,8 @@ def play_book(
                     raise WebPlaybackError("No installed remote speech client environment was found.")
                 process = subprocess.Popen(
                     [str(executable), "-m", "tts_audiobook_tool.web_playback", temp],
-                    cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    start_new_session=os.name == "posix",
+                    cwd=ROOT, stdin=subprocess.DEVNULL, start_new_session=os.name == "posix",
+                    **console_options,
                 )
             except (OSError, ModelRunError) as error:
                 raise WebPlaybackError("Could not start the selected speech environment.") from error
@@ -103,6 +108,7 @@ def play_book(
                     wave = _ready_path(directory, line)
                     while not wave.is_file():
                         _check_cancelled(cancel)
+                        publish_console()
                         if process.poll() is not None:
                             _verify_worker_result(directory)
                             if not wave.is_file():
@@ -110,11 +116,13 @@ def play_book(
                         else:
                             cancel.wait(0.1)
                     _check_cancelled(cancel)
+                    publish_console()
                     packet = wave.read_bytes()
                     wave.unlink()
                     yield PlaybackChunk(line, packet)
                 while process.poll() is None:
                     _check_cancelled(cancel)
+                    publish_console()
                     cancel.wait(0.1)
                 _verify_worker_result(directory)
             finally:
@@ -225,6 +233,7 @@ def wave_to_adts(wave: bytes) -> tuple[bytes, float]:
 def _run_playback(
     directory: Path, session: BookSession, voices: dict[str, RenderVoice], payload: dict, cancel: Event,
     *, remote_selection: RemoteTtsSelection | None = None,
+    on_console: Callable[[str], None] | None = None,
 ) -> None:
     from tts_audiobook_tool.app_types import Strictness
     from tts_audiobook_tool.reason_pauses import ReasonPauseTypes
@@ -298,7 +307,7 @@ def _run_playback(
     render_book(
         replace(session, project_dir=str(work)), voices, validate_audio=validate, batch_size=batch,
         model_options=options, strictness=strictness, max_retries=retries, first_line=next_line, last_line=last,
-        auto_concat=False, cancel_event=cancel, on_progress=report, **renderer_options,
+        auto_concat=False, cancel_event=cancel, on_progress=report, on_console=on_console, **renderer_options,
     )
     report(0, 0)
     if next_line <= last:
@@ -332,7 +341,10 @@ def _worker(directory: Path) -> None:
         data = payload.get("remote_selection")
         remote = RemoteTtsSelection(**data) if data is not None else None
         with remote_worker_scope(remote):
-            _run_playback(directory, session, voices, payload, cancel, remote_selection=remote)
+            _run_playback(
+                directory, session, voices, payload, cancel, remote_selection=remote,
+                on_console=relay_synthesis_console(directory),
+            )
     except (WebPlaybackError, WebRenderError, WebRuntimeSettingsError, WebRemoteTtsError) as error:
         _write_json(directory / "result.json", {"error": str(error)})
     except Exception:

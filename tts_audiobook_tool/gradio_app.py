@@ -17,6 +17,7 @@ from tts_audiobook_tool.constants_config import (
 )
 from tts_audiobook_tool.l import L
 from tts_audiobook_tool.web_abr_project import read_abr_project
+from tts_audiobook_tool.web_activity_panel import ACTIVITY_CSS, ActivityPanel
 from tts_audiobook_tool.web_backend import (
     DEFAULT_LLM_ENDPOINT,
     DEFAULT_OPENAI_MODEL,
@@ -84,7 +85,7 @@ CSS = """
                   border-radius: var(--radius-lg); padding: 16px; }
 #voice-settings h2 { font-size: 1.1rem; margin: 0; }
 #sample-players > div { flex: 1 1 275px; }
-"""
+""" + ACTIVITY_CSS
 
 
 def _book_summary(session: BookSession) -> str:
@@ -137,6 +138,7 @@ def build_app() -> gr.Blocks:
     profile_ids = {profile.model_id for profile in model_profiles()}
     running_jobs: dict[str | None, Event] = {}
     running_jobs_lock = Lock()
+    activity_panel = ActivityPanel()
 
     @contextmanager
     def running_job(request: gr.Request):
@@ -306,6 +308,7 @@ def build_app() -> gr.Blocks:
                                     "Generate or resume audiobook", variant="primary", interactive=False,
                                 )
                                 stop_book = gr.Button("Stop generation", variant="stop", interactive=False)
+                            book_progress = gr.HTML(visible=False)
                             book_status = gr.Textbox(label="Audiobook status", interactive=False, visible=False)
                             audiobook = gr.File(label="Download audiobook", interactive=False, visible=False)
                         create_book_output_panel(book, private_event=PRIVATE_EVENT)
@@ -353,6 +356,7 @@ def build_app() -> gr.Blocks:
                     with gr.Tab("Settings"):
                         runtime_panel = create_runtime_panel(book, private_event=PRIVATE_EVENT, app=app)
 
+        activity_panel.bind(app, book_progress)
         voice_panel.bind(app, cast_library_voice, event_options=PRIVATE_EVENT)
         text_import.bind(event_options=PRIVATE_EVENT)
         line_voice_panel.bind(app, book, event_options=PRIVATE_EVENT)
@@ -360,12 +364,13 @@ def build_app() -> gr.Blocks:
         chat_panel.bind(
             api_key=api_key, llm_model=llm_model, effort=effort, endpoint=llm_endpoint,
             voice_panel=voice_panel, model_settings=model_settings, runtime_panel=runtime_panel,
-            remote_panel=remote_panel,
+            remote_panel=remote_panel, console_for=activity_panel.console_for,
             event_options=PRIVATE_EVENT,
         )
         playback_panel.bind(
             book, cast, book_model, validate_audio, batch_size, model_settings, validation_strictness, max_retries,
             voice_panel, event_options=PRIVATE_EVENT, runtime_settings=runtime_panel, remote_panel=remote_panel,
+            console_for=activity_panel.console_for,
         )
 
         def present_book(session, voices, problem=None):
@@ -826,7 +831,7 @@ def build_app() -> gr.Blocks:
             strictness, retries, export, first, last, regenerate,
             force_cpu, whisper_model, whisper_device, save_generation_logs, aac_bitrate,
             remote_endpoint, remote_config,
-            request: gr.Request, progress=gr.Progress(), *narrator_fields,
+            request: gr.Request, *narrator_fields,
         ):
             if session is None or model not in model_labels:
                 yield (
@@ -842,16 +847,19 @@ def build_app() -> gr.Blocks:
                 yield voice_status(str(exc)), gr.skip(), gr.skip()
                 return
             with running_job(request) as cancel:
+                activity = activity_panel.session(request.session_hash)
+                activity.start_book()
+                activity.write(f"\nGenerating audiobook with {model_labels[model]}\n")
                 yield (
                     gr.update(value="Generating audiobook.", visible=True), gr.skip(), gr.update(interactive=True)
                 )
-                progress(0, desc="Preparing audiobook")
                 try:
                     result = render_model_book(
                         model,
                         session,
                         {**voices, "NARRATOR": narrator},
-                        on_progress=lambda done, total: progress((done, total), desc="Generating audiobook"),
+                        on_telemetry=activity.update_book,
+                        on_console=activity.write,
                         cancel_event=cancel,
                         validate_audio=validate,
                         batch_size=batch or PROJECT_BATCH_SIZE_DEFAULT,
@@ -868,12 +876,16 @@ def build_app() -> gr.Blocks:
                     message = "Could not generate the audiobook."
                 else:
                     message = "Audiobook ready." if cached_result else "Selected lines are ready to review or export."
+                    activity.finish_book(message)
+                    activity.write(message + "\n")
                     yield (
                         gr.update(value=message, visible=True),
                         gr.update(value=cached_result, visible=bool(cached_result)),
                         gr.update(interactive=False),
                     )
                     return
+            activity.finish_book("Generation stopped" if cancel.is_set() else "Generation failed")
+            activity.write(message + "\n")
             yield gr.update(value=message, visible=True), gr.skip(), gr.update(interactive=False)
 
         generate_book.click(
@@ -884,6 +896,7 @@ def build_app() -> gr.Blocks:
                 *runtime_panel.inputs, *remote_panel.selection_inputs, *voice_panel.inputs,
             ],
             [book_status, audiobook, stop_book],
+            show_progress="hidden",
             **PRIVATE_EVENT,
         )
 
@@ -908,6 +921,7 @@ def build_app() -> gr.Blocks:
                 yield [voice_status(str(exc)), gr.skip(), *[gr.skip() for _ in sample_players]]
                 return
             with running_job(request) as cancel:
+                console = activity_panel.console_for(request.session_hash)
                 yield [
                     gr.update(value="Generating text samples.", visible=True),
                     gr.update(interactive=True),
@@ -918,6 +932,7 @@ def build_app() -> gr.Blocks:
                     if cancel.is_set():
                         break
                     label = model_labels[model]
+                    console(f"\nGenerating text sample with {label}\n")
                     progress((index, len(selected)), desc=f"Generating with {label}")
                     updates = [gr.skip() for _ in sample_players]
                     try:
@@ -928,6 +943,7 @@ def build_app() -> gr.Blocks:
                             model, text, voice, language_code=language or "en", cancel_event=cancel,
                             model_options=settings.get(model),
                             runtime_settings=runtime,
+                            on_console=console,
                             **({"remote_selection": remote} if remote is not None else {}),
                         )
                     except (ModelRunError, WebRemoteTtsError) as exc:
@@ -939,9 +955,11 @@ def build_app() -> gr.Blocks:
                     else:
                         statuses.append(f"{label} — ready.")
                         updates[index] = gr.update(label=label, value=audio, visible=True)
+                    console(statuses[-1] + "\n")
                     yield [gr.update(value="\n".join(statuses), visible=True), gr.skip(), *updates]
                 if cancel.is_set():
                     statuses.append("Generation stopped.")
+                    console("Generation stopped.\n")
             yield [
                 gr.update(value="\n".join(statuses), visible=True),
                 gr.update(interactive=False),
@@ -978,13 +996,20 @@ def build_app() -> gr.Blocks:
         def install_selected_model(model_id, sample_selection, session, validate, settings, force_cpu,
                                    request: gr.Request, progress=gr.Progress()):
             unchanged = [gr.skip()] * 8
+            console = activity_panel.console_for(request.session_hash)
+
+            def report_setup(description):
+                progress(0, desc=description)
+                console(description + "\n")
+
             with running_job(request) as cancel:
+                console("\nInstalling speech model\n")
                 yield (
                     *unchanged, gr.update(value="Installing model.", visible=True),
                     gr.update(interactive=False), gr.update(interactive=True), gr.skip(),
                 )
                 try:
-                    install_model(model_id, on_progress=lambda desc: progress(0, desc=desc), cancel_event=cancel)
+                    install_model(model_id, on_progress=report_setup, cancel_event=cancel)
                     web_models.installed_model_choices.cache_clear()
                     local_choices[:] = installed_model_choices()
                     model_choices[:] = [*local_choices, remote_choice]
@@ -999,6 +1024,7 @@ def build_app() -> gr.Blocks:
                 else:
                     detail, available = model_panel.describe(model_id, model_labels)
                     samples = dict.fromkeys([*(sample_selection or []), model_id])
+                    console(f"{model_labels[model_id]} is installed.\n")
                     yield (
                         gr.update(choices=model_panel.choices(local_choices), value=model_id), detail,
                         gr.update(choices=model_choices, value=model_id),
@@ -1012,6 +1038,7 @@ def build_app() -> gr.Blocks:
                         gr.update(choices=chat_panel.model_choices(model_choices), value=model_id),
                     )
                     return
+            console(message + "\n")
             _, available = model_panel.describe(model_id, model_labels)
             yield (
                 *unchanged, gr.update(value=message, visible=True),

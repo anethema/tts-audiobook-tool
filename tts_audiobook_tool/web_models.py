@@ -17,6 +17,8 @@ from threading import Event, Lock
 from typing import TYPE_CHECKING
 
 from tts_audiobook_tool.constants_config import PROJECT_MAX_RETRIES_DEFAULT
+from tts_audiobook_tool.generation_events import BookRenderTelemetry
+from tts_audiobook_tool.web_console import capture_synthesis_console, relay_synthesis_console
 from tts_audiobook_tool.web_remote_models import REMOTE_MODEL_ID, WebRemoteTtsError, remote_client_python
 
 if TYPE_CHECKING:
@@ -58,6 +60,7 @@ def render_model_sample(
     cancel_event: Event | None = None, model_options: dict[str, object] | None = None,
     runtime_settings: WebRuntimeSettings | None = None,
     remote_selection: RemoteTtsSelection | None = None,
+    on_console: Callable[[str], None] | None = None,
 ) -> str:
     output = _run(
         model_id,
@@ -67,6 +70,7 @@ def render_model_sample(
             remote_selection=asdict(remote_selection) if remote_selection is not None else None,
         ),
         cancel_event=cancel_event,
+        on_console=on_console,
     )
     assert output is not None
     return output
@@ -96,11 +100,13 @@ def transcribe_model_reference(
 def render_model_book(
     model_id: str, session: BookSession, voices: dict[str, RenderVoice], *,
     on_progress: Callable[[int, int], None] | None = None, cancel_event: Event | None = None,
+    on_telemetry: Callable[[BookRenderTelemetry], None] | None = None,
     validate_audio: bool = True, batch_size: int = 1, model_options: dict[str, object] | None = None,
     first_line: int = 1, last_line: int | None = None, regenerate: bool = False, auto_concat: bool = True,
     strictness: str | None = None, max_retries: int = PROJECT_MAX_RETRIES_DEFAULT,
     runtime_settings: WebRuntimeSettings | None = None,
     remote_selection: RemoteTtsSelection | None = None,
+    on_console: Callable[[str], None] | None = None,
 ) -> str | None:
     from tts_audiobook_tool.app_types.book_serialization import book_to_project_text_json_dict
 
@@ -129,7 +135,9 @@ def render_model_book(
             remote_selection=asdict(remote_selection) if remote_selection is not None else None,
         ),
         on_progress=on_progress,
+        on_telemetry=on_telemetry,
         cancel_event=cancel_event,
+        on_console=on_console,
     )
 
 
@@ -152,8 +160,14 @@ def _stop(proc: subprocess.Popen) -> None:
 def _run(
     model_id: str | None, payload: dict, *,
     on_progress: Callable[[int, int], None] | None = None, cancel_event: Event | None = None,
+    on_telemetry: Callable[[BookRenderTelemetry], None] | None = None,
+    on_console: Callable[[str], None] | None = None,
 ) -> str | None:
-    with _RENDER_LOCK, TemporaryDirectory(prefix="audiobook-render-") as directory:
+    with (
+        _RENDER_LOCK,
+        TemporaryDirectory(prefix="audiobook-render-") as directory,
+        capture_synthesis_console(Path(directory), on_console) as (console_options, publish_console),
+    ):
         if cancel_event is not None and cancel_event.is_set():
             raise ModelRunError("Generation stopped.")
         remote = payload.get("remote_selection") is not None
@@ -169,23 +183,41 @@ def _run(
         (work / "input.json").write_text(json.dumps(payload), encoding="utf-8")
         proc = subprocess.Popen(
             [str(executable), "-m", "tts_audiobook_tool.web_models", directory],
-            cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, start_new_session=(os.name == "posix"),
+            cwd=ROOT, stdin=subprocess.DEVNULL, start_new_session=(os.name == "posix"),
+            **console_options,
         )
         previous = None
+        progress_path = work / "progress.json"
+
+        def publish_progress() -> None:
+            nonlocal previous
+            if on_progress is None and on_telemetry is None:
+                return
+            try:
+                update = BookRenderTelemetry(**json.loads(progress_path.read_text(encoding="utf-8")))
+            except FileNotFoundError:
+                return
+            if update == previous:
+                return
+            if on_progress is not None and (
+                previous is None or (update.processed, update.total) != (previous.processed, previous.total)
+            ):
+                on_progress(update.processed, update.total)
+            if on_telemetry is not None:
+                on_telemetry(update)
+            previous = update
+
         try:
             while proc.poll() is None:
                 if cancel_event is not None and cancel_event.is_set():
                     raise ModelRunError("Generation stopped.")
-                if on_progress is not None and (work / "progress.json").is_file():
-                    progress = json.loads((work / "progress.json").read_text(encoding="utf-8"))
-                    if progress != previous:
-                        on_progress(*progress)
-                        previous = progress
+                publish_console()
+                publish_progress()
                 try:
                     proc.wait(timeout=0.25)
                 except subprocess.TimeoutExpired:
                     continue
+            publish_progress()
             try:
                 result = json.loads((work / "result.json").read_text(encoding="utf-8"))
             except (OSError, ValueError):
@@ -242,6 +274,7 @@ def _worker(directory: Path) -> None:
             _write_json(directory / "result.json", {"text": transcript})
             return
         runtime_settings = WebRuntimeSettings(**(payload.get("runtime_settings") or {}))
+        on_console = relay_synthesis_console(directory)
         if payload.get("remote_selection") is not None:
             selection = RemoteTtsSelection(**payload["remote_selection"])
             scopes.enter_context(remote_worker_scope(selection))
@@ -252,6 +285,7 @@ def _worker(directory: Path) -> None:
                 language_code=payload["language_code"], cancel_event=cancelled,
                 model_options=payload.get("model_options"),
                 runtime_settings=runtime_settings,
+                on_console=on_console,
                 **remote_options,
             )
         elif payload["action"] == "book":
@@ -267,12 +301,12 @@ def _worker(directory: Path) -> None:
                 line_voices={int(slot): RenderVoice(**voice) for slot, voice in payload.get("line_voices", {}).items()},
             )
 
-            def report(current: int, total: int) -> None:
-                _write_json(directory / "progress.json", [current, total])
+            def report(telemetry: BookRenderTelemetry) -> None:
+                _write_json(directory / "progress.json", asdict(telemetry))
 
             voices = {name: RenderVoice(**voice) for name, voice in payload["voices"].items()}
             output = render_book(
-                session, voices, on_progress=report, cancel_event=cancelled,
+                session, voices, on_telemetry=report, cancel_event=cancelled,
                 validate_audio=payload["validate_audio"], batch_size=payload["batch_size"],
                 model_options=payload.get("model_options"),
                 first_line=payload.get("first_line", 1), last_line=payload.get("last_line"),
@@ -280,6 +314,7 @@ def _worker(directory: Path) -> None:
                 strictness=payload.get("strictness"),
                 max_retries=payload.get("max_retries", PROJECT_MAX_RETRIES_DEFAULT),
                 runtime_settings=runtime_settings,
+                on_console=on_console,
                 **remote_options,
             )
         else:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from contextlib import closing
 from io import BytesIO
 from pathlib import Path
@@ -53,6 +54,7 @@ class PlaybackPanel:
     def bind(
             self, book, cast, model, validate_audio, batch_size, model_settings, strictness, max_retries, voice_panel, *,
             event_options, runtime_settings=None, remote_panel=None,
+            console_for: Callable[[str | None], Callable[[str], None]] | None = None,
     ):
         active: dict[str | None, Event] = {}
         guard = Lock()
@@ -88,6 +90,9 @@ class PlaybackPanel:
             with guard:
                 active[request.session_hash] = cancel
             try:
+                on_console = console_for(request.session_hash) if console_for is not None else None
+                if on_console is not None:
+                    on_console("Realtime playback\n")
                 yield (
                     None, gr.update(value=None, visible=False), _status("Preparing playback…"),
                     gr.update(interactive=False), gr.update(interactive=True),
@@ -107,7 +112,7 @@ class PlaybackPanel:
                             selected, session, {**voices, "NARRATOR": narrator}, first=first, last=last,
                             validate_audio=validate, batch_size=batch or 1, model_options=(settings or {}).get(selected),
                             strictness=tolerance or None, max_retries=retries if retries is not None else PROJECT_MAX_RETRIES_DEFAULT,
-                            cancel_event=cancel, runtime_settings=runtime, remote_selection=remote,
+                            cancel_event=cancel, runtime_settings=runtime, remote_selection=remote, on_console=on_console,
                         )
                         with closing(chunks):
                             for take in chunks:
