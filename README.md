@@ -60,13 +60,13 @@ uv pip install --python venv-breeze/bin/python -r requirements-gradio.txt
 venv-breeze/bin/python -m tts_audiobook_tool.gradio_app
 ```
 
-Open http://127.0.0.1:7862 in your browser. The model picker discovers the same local environments as `launch.py`. Run a text sample with your reference audio or Breeze voice direction, then select multiple models to compare the same sample. The app runs model jobs one at a time on the GPU.
+Open http://127.0.0.1:7862 in your browser. **Speech Models** shows the local catalog, including models you can install through the interface on x86-64 Linux or WSL. Apply synthesis settings for each model there. **Text Sample** can render the same passage with multiple models for side-by-side playback. The audiobook batch recommendation uses the model's benchmark and current free GPU memory. You can override it under **Generation settings**.
 
-Upload an EPUB and save a named project to keep the book, voice assignments, and generation settings across restarts. Under **Saved projects**, use **Copy from console** to bring the console's current or last project into a new browser session. For casting, paste an OpenAI API key in the password field and run character identification and dialogue attribution. These actions send the imported book text to OpenAI and may use billed API credits. The key is sent with the request and is kept out of saved projects.
+Import an EPUB, upload a UTF-8 TXT file, or paste book text. Choose the segmentation settings before import, then review and edit individual lines. The voice library saves a name, reference audio, editable transcript, crop, delivery settings and audio effects. Uploading or recording a reference starts transcription with cached Whisper. Assign saved voices to characters or directly to selected lines.
 
-Generate the audiobook and download the M4B when it finishes. The app can use Whisper to validate generated segments. To continue an interrupted job, reopen the saved project and run generation with the same book, model, voices, and generation settings. Completed segments are reused.
+Save a named project to keep the book, voice assignments and generation settings. Under **Saved projects**, use **Copy from console** to import a recent console project or create a new project from settings embedded in an ABR audio export. For automatic casting, set a chat completions endpoint and paste its API key if required. Character analysis sends book text to that endpoint. Saved projects omit the API key.
 
-The browser interface is in development. The console remains available for the remaining tools, including voice chat, realtime playback, detailed text editing, and advanced exports.
+Generate selected lines or the entire audiobook. Reopen a saved project with the same generation settings to continue where you left off. **Review and export generated audio** lets you listen to takes, export M4B or FLAC, and open the synchronized reader. **Voice Chat**, **Tools**, and **Settings** include conversation and echo, standalone file processing, and speech and Whisper runtime controls.
 
 ### How to create an audiobook (quick summary)
 

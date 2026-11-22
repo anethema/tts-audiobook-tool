@@ -8,7 +8,7 @@ from tts_audiobook_tool.app_support.remote_tts_discovery import (
 )
 from tts_audiobook_tool.app_support.audio_cpp_util import AudioCppUtil
 from tts_audiobook_tool.project import Project
-from tts_audiobook_tool.tts import Tts, TtsRuntimeMode
+from tts_audiobook_tool.tts import Tts, TtsRuntimeMode, WEB_REMOTE_ENTRY_ID_ENV
 from tts_audiobook_tool.project_support.model_settings import REGISTRY
 from tts_audiobook_tool.tts_models.audio_cpp_configured import AudioCppBackendAdapter, AudioCppModelSupport
 from tts_audiobook_tool.tts_models.tts_model_type import TtsBackendKind, TtsModelType
@@ -89,6 +89,29 @@ def test_run_start_forces_probe_even_with_fresh_observation(remote_mode, monkeyp
     monkeypatch.setattr(RemoteTtsDiscovery, "_probe", fake_probe)
     readiness.refresh_remote_model_state(selected_project())
     assert probes == [RemoteTtsDiscovery._timeout]
+
+
+def test_web_worker_rebind_does_not_substitute_a_new_sgl_alias(remote_mode, monkeypatch):
+    model = TtsModelType.require_by_id("higgs_v3_sglomni")
+    project = Project(tts_model_type=model.id)
+    monkeypatch.setattr(Tts, "clear_tts_model", staticmethod(lambda: None))
+    monkeypatch.setenv(WEB_REMOTE_ENTRY_ID_ENV, "org/selected-higgs")
+    server_id = ["org/selected-higgs"]
+    monkeypatch.setattr(RemoteTtsDiscovery, "_probe", lambda *_args: RemoteTtsSnapshot(
+        TtsBackendKind.SGL_OMNI, candidates=((model, server_id[0]),),
+    ))
+
+    assert Tts.bind_project(project, refresh=True) is None
+    assert Tts._selected_server_model_id == "org/selected-higgs"
+    server_id[0] = "org/replacement-higgs"
+    issue = Tts.bind_project(project, refresh=True)
+    assert issue is not None and issue.kind == "entry_unavailable"
+    assert Tts._selected_server_model_id == ""
+    assert Tts.get_active_type().id == "none"
+
+    monkeypatch.delenv(WEB_REMOTE_ENTRY_ID_ENV)
+    assert Tts.bind_project(project, refresh=True) is None
+    assert Tts._selected_server_model_id == "org/replacement-higgs"
 
 
 def test_available_types_are_distinct_and_do_not_auto_bind(remote_mode, monkeypatch):

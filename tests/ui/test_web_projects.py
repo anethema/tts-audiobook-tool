@@ -1,22 +1,24 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 import logging
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import requests
 
-from tts_audiobook_tool import web_backend, web_projects
-from tts_audiobook_tool.app_types import Book, BookSection
+from tts_audiobook_tool import web_abr_project, web_backend, web_projects
+from tts_audiobook_tool.app_types import Book, BookSection, RoomReverb
 from tts_audiobook_tool.app_types.book_serialization import (
     book_to_project_text_json_dict,
     load_book_from_project_text_file,
 )
 from tts_audiobook_tool.app_types.phrase import Phrase, PhraseGroup, Reason
-from tts_audiobook_tool.constants import PROJECT_TEXT_FILE_NAME
+from tts_audiobook_tool.constants import PROJECT_JSON_FILE_NAME, PROJECT_TEXT_FILE_NAME
 from tts_audiobook_tool.l import L
 from tts_audiobook_tool.speaker_assign.attribution import AttributionsFile, RangeAttribution, UtteranceAttribution
 from tts_audiobook_tool.speaker_assign.roster import Roster, RosterCharacter
@@ -49,14 +51,76 @@ class TestWebProjects(unittest.TestCase):
             self.book, str(self.directory), ("Import warning",), self.roster, self.attributions,
         )
 
+    def test_creating_saved_project_preserves_completed_and_partial_render_work(self):
+        run_id = "a" * 64
+        run = self.directory / "renders" / run_id
+        segments = run / "segments"
+        segments.mkdir(parents=True)
+        (run / PROJECT_JSON_FILE_NAME).write_text("{}", encoding="utf-8")
+        (run / PROJECT_TEXT_FILE_NAME).write_text("{}", encoding="utf-8")
+        (segments / "take.flac").write_bytes(b"partial render")
+        (run / "audiobook.abr.m4b").write_bytes(b"complete render")
+        (run / "external-link").symlink_to(self.directory)
+
+        session = replace(self.session, project_language="", word_substitutions={"rue": "roo"})
+        summary = web_projects.create_project(
+            "Preserve audio", session, narrator=RenderVoice(), voices={},
+            model_id="venv-breeze", root=self.root,
+        )
+        opened = self._open(summary.project_id).session
+        self.assertEqual(opened.language_code, "")
+        self.assertEqual(opened.word_substitutions, {"rue": "roo"})
+        workspace = Path(opened.project_dir)
+        copied = workspace / "renders" / run_id
+        self.assertEqual((copied / "segments" / "take.flac").read_bytes(), b"partial render")
+        self.assertEqual((copied / "audiobook.abr.m4b").read_bytes(), b"complete render")
+        self.assertFalse((copied / "external-link").is_symlink())
+        self.assertFalse((copied / ".render.lock").exists())
+
+    def test_abr_settings_template_imports_into_an_empty_browser_project(self):
+        audio = self.directory / "book.m4b"
+        audio.write_bytes(b"audio")
+        snapshot = {
+            "language_code": "en",
+            "tts_model_type": "breeze_tts_2_local",
+            "gen_auto_concat": False,
+            "strictness": "high",
+            "max_retries": 3,
+            "word_substitutions_json_string": '{"rue": "roo"}',
+            "voice_references": [{"name": "Narrator", "file_name": "external.wav", "volume": 80}],
+        }
+        metadata = SimpleNamespace(title="ABR book", project_snapshot=snapshot)
+        with patch.object(web_abr_project.AppMetadata, "load_from_file", return_value=metadata):
+            template = web_abr_project.read_abr_project(str(audio), self.directory)
+        self.addCleanup(web_backend.close_book_session, template.session)
+        self.assertFalse(template.session.book.sections)
+        self.assertEqual(template.session.word_substitutions, {"rue": "roo"})
+        self.assertEqual(template.narrator.name, "Narrator")
+        self.assertIsNone(template.narrator.reference_path)
+        summary = web_projects.create_project(
+            "ABR test", template.session, narrator=template.narrator, voices={}, model_id=template.model_id,
+            strictness=template.strictness, max_retries=template.max_retries, auto_concat=template.auto_concat,
+            root=self.root,
+        )
+        opened = self._open(summary.project_id)
+        self.assertEqual(opened.model_id, "venv-breeze")
+        self.assertEqual((opened.strictness, opened.max_retries, opened.auto_concat), ("high", 3, False))
+        self.assertFalse(opened.session.book.sections)
+
     def test_saved_book_assets_and_analysis_round_trip(self):
         epub_path = self.directory / "uploaded.epub"
         audio_path = self.directory / "voice.wav"
         epub_path.write_bytes(b"EPUB upload")
         audio_path.write_bytes(b"audio upload")
+        rue = RenderVoice(
+            str(audio_path), "", "Quiet", name="Rue", trim_start=0.25, trim_end=4.5,
+            pan=0.4, volume=75, room_reverb=RoomReverb.SMALL_DRR22.id,
+            model_instructions=(("breeze_tts_2_local", "Read quietly"),),
+            presets=(("pocket_local", "alba"),), max_reference_silence=0.4,
+        )
         summary = web_projects.create_project(
             "  Adventures / at home\t ", self.session, narrator=RenderVoice(str(audio_path), "Hello."),
-            voices={"RUE": RenderVoice(str(audio_path), "", "Quiet")}, model_id="chatterbox",
+            voices={"RUE": rue}, model_id="chatterbox",
             source_epub=str(epub_path), validate_audio=False, batch_size=3, root=self.root,
         )
         self.assertEqual(summary.name, "Adventures at home")
@@ -74,7 +138,7 @@ class TestWebProjects(unittest.TestCase):
         self.assertEqual(saved.model_id, "chatterbox")
         self.assertFalse(saved.validate_audio)
         self.assertEqual(saved.batch_size, 3)
-        self.assertEqual(saved.voices["RUE"].instructions, "Quiet")
+        self.assertEqual(saved.voices["RUE"], replace(rue, reference_path=saved.voices["RUE"].reference_path))
         self.assertEqual(saved.narrator.reference_path, saved.voices["RUE"].reference_path)
         self.assertEqual(Path(saved.narrator.reference_path).read_bytes(), b"audio upload")
         self.assertEqual(Path(saved.source_epub).read_bytes(), b"EPUB upload")
@@ -93,6 +157,44 @@ class TestWebProjects(unittest.TestCase):
         self.assertTrue(Path(saved.session.project_dir).is_dir())
         self.assertTrue(Path(reopened.session.attribution_dir).is_dir())
         self.assertFalse(Path(saved.session.attribution_dir).exists())
+
+    def test_existing_web_snapshot_defaults_named_voice_fields(self):
+        summary = web_projects.create_project(
+            "Project", self.session, narrator=RenderVoice(), voices={}, model_id="", root=self.root,
+        )
+        path = self.root / summary.project_id / PROJECT_TEXT_FILE_NAME
+        snapshot = json.loads(path.read_text(encoding="utf-8"))
+        del snapshot["web_project"]["model_options"]
+        snapshot["web_project"]["narrator"] = {
+            "reference": None, "transcript": "Sample words.", "instructions": "Read gently.",
+        }
+        path.write_text(json.dumps(snapshot), encoding="utf-8")
+        saved = self._open(summary.project_id)
+        self.assertEqual(saved.narrator, RenderVoice(None, "Sample words.", "Read gently."))
+        self.assertEqual(saved.model_options, {})
+
+    def test_model_options_round_trip_for_each_environment_and_can_be_cleared(self):
+        options = {
+            "venv-breeze": {"temperature": 0.65, "top_k": 42},
+            "venv-qwen3": {"target": "Qwen/Qwen3-TTS-12Hz-1.7B-Base", "seed": 5},
+        }
+        summary = web_projects.create_project(
+            "Model options", self.session, narrator=RenderVoice(), voices={}, model_id="venv-breeze",
+            model_options=options, root=self.root,
+        )
+        self.assertEqual(self._open(summary.project_id).model_options, options)
+
+        web_projects.save_project(
+            summary.project_id, self.session, narrator=RenderVoice(), voices={}, model_id="venv-qwen3",
+            root=self.root,
+        )
+        self.assertEqual(self._open(summary.project_id).model_options, options)
+
+        web_projects.save_project(
+            summary.project_id, self.session, narrator=RenderVoice(), voices={}, model_id="venv-qwen3",
+            model_options={}, root=self.root,
+        )
+        self.assertEqual(self._open(summary.project_id).model_options, {})
 
     def test_failed_save_keeps_previous_snapshot_and_explicit_save_can_clear_assignments(self):
         summary = web_projects.create_project(

@@ -4,13 +4,21 @@ import argparse
 import logging
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import replace
 from threading import Event, Lock
 
 import gradio as gr
 
-from tts_audiobook_tool.constants_config import PROJECT_BATCH_SIZE_DEFAULT, PROJECT_BATCH_SIZE_MAX
+from tts_audiobook_tool import web_models
+from tts_audiobook_tool.app_types import Strictness
+from tts_audiobook_tool.constants_config import (
+    PROJECT_BATCH_SIZE_DEFAULT, PROJECT_BATCH_SIZE_MAX,
+    PROJECT_MAX_RETRIES_DEFAULT, PROJECT_MAX_RETRIES_MAX, PROJECT_MAX_RETRIES_MIN,
+)
 from tts_audiobook_tool.l import L
+from tts_audiobook_tool.web_abr_project import read_abr_project
 from tts_audiobook_tool.web_backend import (
+    DEFAULT_LLM_ENDPOINT,
     DEFAULT_OPENAI_MODEL,
     DEFAULT_REASONING_EFFORT,
     BookSession,
@@ -19,27 +27,41 @@ from tts_audiobook_tool.web_backend import (
     character_rows,
     close_book_session,
     identify_characters,
-    import_epub,
 )
+from tts_audiobook_tool.web_book_output_panel import create_book_output_panel
+from tts_audiobook_tool.web_chat_panel import VoiceChatPanel
 from tts_audiobook_tool.web_dialogue import correct_speaker, dialogue_rows, dialogue_sections, speaker_choices
 from tts_audiobook_tool.web_projects import (
     WebProjectError,
     create_project,
     list_projects,
     load_project,
+    open_project_folder,
     save_project,
 )
 from tts_audiobook_tool.web_legacy_project import (
     WebLegacyProjectError, list_console_projects, load_console_project,
 )
+from tts_audiobook_tool.web_line_voice_panel import LineVoicePanel
+from tts_audiobook_tool.web_model_panel import ModelPanel
+from tts_audiobook_tool.web_model_setup import WebModelSetupError, install_model, model_profiles
+from tts_audiobook_tool.web_playback_panel import PlaybackPanel
 from tts_audiobook_tool.web_models import (
     ModelRunError,
     installed_model_choices,
     render_model_book,
     render_model_sample,
-    transcribe_model_reference,
 )
-from tts_audiobook_tool.web_render import RenderVoice
+from tts_audiobook_tool.web_render import RenderVoice, WebRenderError
+from tts_audiobook_tool.web_reader import reader_mount
+from tts_audiobook_tool.web_remote_models import REMOTE_MODEL_ID, WebRemoteTtsError
+from tts_audiobook_tool.web_remote_panel import RemoteModelPanel
+from tts_audiobook_tool.web_runtime_panel import create_runtime_panel
+from tts_audiobook_tool.web_runtime_settings import WebRuntimeSettingsError
+from tts_audiobook_tool.web_text_panel import SectionTextPanel, TextImportPanel
+from tts_audiobook_tool.web_tools_panel import build_tools_panel
+from tts_audiobook_tool.web_voice_panel import VoicePanel, bind_transcription, voice_status
+from tts_audiobook_tool.web_voices import WebVoiceError, import_voices, load_voice
 
 
 TITLE = "TTS Audiobook Tool"
@@ -63,10 +85,6 @@ CSS = """
 #voice-settings h2 { font-size: 1.1rem; margin: 0; }
 #sample-players > div { flex: 1 1 275px; }
 """
-
-
-def _make_voice(reference: str | None, transcript: str, instructions: str) -> RenderVoice:
-    return RenderVoice(reference, (transcript or "").strip(), (instructions or "").strip())
 
 
 def _book_summary(session: BookSession) -> str:
@@ -96,8 +114,8 @@ def _review_components(
     for row in rows:
         if row.speaker_id in narrator_ids:
             voice_label = "Voice settings"
-        elif row.speaker_id in voices:
-            voice_label = "Custom voice"
+        elif voice := voices.get(row.speaker_id):
+            voice_label = voice.name or "Custom voice"
         else:
             voice_label = "Narrator"
         table.append([row.name, row.line_count, row.voice_hint, voice_label])
@@ -111,9 +129,12 @@ def build_app() -> gr.Blocks:
     """Build the loopback UI without loading models or opening a connection."""
     if not hasattr(L, "logger"):
         L.init("tts-audiobook-web", level=logging.WARNING)
-    model_choices = installed_model_choices()
+    local_choices = list(installed_model_choices())
+    remote_choice = ("Remote TTS server", REMOTE_MODEL_ID)
+    model_choices = [*local_choices, remote_choice]
     model_labels = {model_id: label for label, model_id in model_choices}
-    default_model = next(iter(model_labels), None)
+    default_model = local_choices[0][1] if local_choices else None
+    profile_ids = {profile.model_id for profile in model_profiles()}
     running_jobs: dict[str | None, Event] = {}
     running_jobs_lock = Lock()
 
@@ -136,45 +157,23 @@ def build_app() -> gr.Blocks:
         book = gr.State(None, delete_callback=close_book_session)
         cast = gr.State({})
         active_project = gr.State(None)
+        model_settings = gr.State({})
+        imported_epub = gr.State(None)
         gr.Markdown(f"# {TITLE}", elem_id="app-heading")
 
         with gr.Row(equal_height=False):
             with gr.Column(scale=1, min_width=275, elem_id="voice-settings"):
-                gr.Markdown("## Voice settings")
-                reference = gr.Audio(
-                    sources=["upload", "microphone"],
-                    type="filepath",
-                    label="Reference audio",
-                    buttons=[],
-                )
-                gr.Markdown("Used for the narrator and for all text samples.")
-                with gr.Accordion("Transcript and delivery instructions", open=False):
-                    transcript = gr.Textbox(
-                        label="Reference transcript",
-                        placeholder="What is spoken in the reference recording",
-                        lines=2,
-                    )
-                    with gr.Row():
-                        reference_language = gr.Textbox(value="en", label="Reference language code")
-                        transcribe_reference = gr.Button("Transcribe reference")
-                    transcript_status = gr.Textbox(label="Transcription status", interactive=False, visible=False)
-                    instructions = gr.Textbox(
-                        label="Delivery instructions",
-                        placeholder="For example, warm and unhurried",
-                        lines=2,
-                    )
-                    gr.Markdown("Transcript and delivery controls depend on the speech model.")
+                voice_panel = VoicePanel()
 
             with gr.Column(scale=3, min_width=345):
                 with gr.Tabs():
-                    with gr.Tab("EPUB Audiobook"):
+                    with gr.Tab("Audiobook"):
                         with gr.Group():
-                            epub = gr.File(label="DRM-free EPUB", file_types=[".epub"], height=100)
-                            book_language = gr.Textbox(value="en", label="Book language code")
-                            load = gr.Button("Import EPUB")
+                            text_import = TextImportPanel()
                             summary = gr.Textbox(
                                 label="Book summary", interactive=False, lines=4, max_lines=12, visible=False
                             )
+                        section_text = SectionTextPanel()
 
                         with gr.Accordion("Saved projects", open=False):
                             with gr.Row():
@@ -187,26 +186,35 @@ def build_app() -> gr.Blocks:
                                     label="Console project", choices=[], interactive=True, scale=3
                                 )
                                 copy_console = gr.Button("Copy from console")
+                                import_console_voices = gr.Button("Import console voices")
                             with gr.Row():
                                 project_name = gr.Textbox(label="New project name", scale=3)
                                 save_new = gr.Button("Save new project", interactive=False)
                             save_changes = gr.Button("Save changes", interactive=False)
+                            open_folder = gr.Button("Open current project folder", size="sm")
+                            with gr.Accordion("Create project from ABR settings", open=False):
+                                abr_file = gr.File(label="ABR audiobook", file_types=[".flac", ".m4a", ".m4b"])
+                                create_abr = gr.Button("Create project from ABR")
                             project_status = gr.Textbox(label="Project status", interactive=False, visible=False)
 
                         with gr.Accordion("Character voices", open=False):
                             gr.Markdown(
-                                "Character identification and dialog attribution send book text to OpenAI "
-                                "when you click their buttons. Audiobook synthesis runs locally."
+                                "Character identification and dialogue assignment send book text to the configured LLM."
                             )
                             api_key = gr.Textbox(
-                                label="OpenAI API key", type="password",
+                                label="LLM API key", type="password",
                                 html_attributes=gr.InputHTMLAttributes(autocomplete="off"),
                             )
                             with gr.Row():
-                                llm_model = gr.Textbox(value=DEFAULT_OPENAI_MODEL, label="OpenAI model")
+                                llm_model = gr.Textbox(value=DEFAULT_OPENAI_MODEL, label="LLM model")
                                 effort = gr.Dropdown(
                                     REASONING_EFFORTS, value=DEFAULT_REASONING_EFFORT, label="Reasoning effort",
-                                    info="Available levels vary by OpenAI model.", interactive=True,
+                                    info="Available levels vary by model.", interactive=True,
+                                )
+                            with gr.Accordion("LLM endpoint and request settings", open=False):
+                                llm_endpoint = gr.Textbox(value=DEFAULT_LLM_ENDPOINT, label="Chat completions URL")
+                                llm_extra_params = gr.Textbox(
+                                    label="Extra parameters for character analysis (JSON)", lines=3,
                                 )
                             with gr.Row():
                                 identify = gr.Button("Identify characters", interactive=False)
@@ -223,20 +231,25 @@ def build_app() -> gr.Blocks:
                                 label="Character to cast", choices=[], interactive=True, visible=False
                             )
                             with gr.Group(visible=False) as cast_editor:
-                                cast_reference = gr.Audio(
-                                    sources=["upload", "microphone"],
-                                    type="filepath",
-                                    label="Character reference audio",
-                                    buttons=[],
-                                )
-                                with gr.Accordion("Character transcript and delivery instructions", open=False):
-                                    cast_transcript = gr.Textbox(label="Reference transcript", lines=2)
-                                    transcribe_cast = gr.Button("Transcribe character reference")
-                                    cast_instructions = gr.Textbox(label="Delivery instructions", lines=2)
-                                with gr.Row():
-                                    save_cast = gr.Button("Save character voice")
-                                    clear_cast = gr.Button("Use narrator voice")
+                                cast_library_voice = gr.Dropdown(label="Assign a saved voice", choices=[], interactive=True)
+                                clear_cast = gr.Button("Use narrator voice", size="sm")
                                 cast_status = gr.Textbox(label="Casting status", interactive=False, visible=False)
+                                with gr.Accordion("Character reference and transcript", open=False):
+                                    cast_reference = gr.Audio(
+                                        sources=["upload", "microphone"], type="filepath", editable=False,
+                                        label="Character reference audio", buttons=[],
+                                    )
+                                    cast_transcript = gr.Textbox(
+                                        label="Character reference transcript", lines=2, interactive=True,
+                                    )
+                                    cast_transcription_status = gr.Textbox(
+                                        label="Character transcription status", interactive=False, visible=False,
+                                    )
+                                    transcribe_cast = gr.Button("Retry character transcription", size="sm")
+                                    cast_instructions = gr.Textbox(label="Default delivery instructions", lines=2)
+                                    save_cast = gr.Button("Save character voice")
+                                cast_draft = gr.State(RenderVoice())
+                                cast_draft_role = gr.State(None)
 
                             with gr.Accordion("Review dialogue assignments", open=False, visible=False) as review_panel:
                                 review_section = gr.Dropdown(label="Book section", choices=[], interactive=True)
@@ -258,6 +271,8 @@ def build_app() -> gr.Blocks:
                                     save_speaker = gr.Button("Save correction", visible=False)
                                 review_status = gr.Textbox(label="Dialogue review status", interactive=False, visible=False)
                                 gr.Markdown("For a saved project, use **Save changes** to keep your corrections.")
+                            line_voice_panel = LineVoicePanel()
+                            cast_language = gr.Textbox(value="en", visible=False)
 
                         with gr.Group():
                             book_model = gr.Dropdown(
@@ -265,10 +280,27 @@ def build_app() -> gr.Blocks:
                             )
                             with gr.Accordion("Generation settings", open=False):
                                 validate_audio = gr.Checkbox(value=True, label="Validate audio with Whisper")
-                                batch_size = gr.Number(
-                                    value=PROJECT_BATCH_SIZE_DEFAULT, precision=0, minimum=1,
-                                    maximum=PROJECT_BATCH_SIZE_MAX, label="Batch size",
-                                )
+                                with gr.Row():
+                                    validation_strictness = gr.Dropdown(
+                                        choices=[("Recommended", ""), *((item.label, item.id) for item in Strictness)],
+                                        value="", label="Validation tolerance", interactive=True,
+                                    )
+                                    max_retries = gr.Number(
+                                        value=PROJECT_MAX_RETRIES_DEFAULT, precision=0, minimum=PROJECT_MAX_RETRIES_MIN,
+                                        maximum=PROJECT_MAX_RETRIES_MAX, label="Maximum retries",
+                                    )
+                                    batch_size = gr.Number(
+                                        value=PROJECT_BATCH_SIZE_DEFAULT, precision=0, minimum=1,
+                                        maximum=PROJECT_BATCH_SIZE_MAX, label="Batch size",
+                                    )
+                                use_recommended_batch = gr.Button("Use recommended batch size", size="sm")
+                                auto_concat = gr.Checkbox(value=True, label="Export M4B when all lines are ready")
+                                with gr.Row():
+                                    first_line = gr.Number(value=1, precision=0, minimum=1, label="First line")
+                                    last_line = gr.Number(
+                                        value=None, precision=0, minimum=1, label="Last line", info="Blank for end of book.",
+                                    )
+                                regenerate_lines = gr.Checkbox(value=False, label="Generate new takes for this range")
                             with gr.Row():
                                 generate_book = gr.Button(
                                     "Generate or resume audiobook", variant="primary", interactive=False,
@@ -276,6 +308,8 @@ def build_app() -> gr.Blocks:
                                 stop_book = gr.Button("Stop generation", variant="stop", interactive=False)
                             book_status = gr.Textbox(label="Audiobook status", interactive=False, visible=False)
                             audiobook = gr.File(label="Download audiobook", interactive=False, visible=False)
+                        create_book_output_panel(book, private_event=PRIVATE_EVENT)
+                        playback_panel = PlaybackPanel()
 
                     with gr.Tab("Text Sample"):
                         sample_text = gr.Textbox(
@@ -306,11 +340,37 @@ def build_app() -> gr.Blocks:
                         with gr.Row(elem_id="sample-players"):
                             sample_players = [
                                 gr.Audio(interactive=False, visible=False, buttons=["download"])
-                                for _ in model_choices
+                                for _ in model_labels.keys() | profile_ids
                             ]
+
+                    with gr.Tab("Speech Models"):
+                        model_panel = ModelPanel(local_choices, default_model, model_settings, PRIVATE_EVENT)
+                        remote_panel = RemoteModelPanel()
+                    with gr.Tab("Voice Chat"):
+                        chat_panel = VoiceChatPanel(model_choices, default_model)
+                    with gr.Tab("Tools"):
+                        build_tools_panel(event_options=PRIVATE_EVENT)
+                    with gr.Tab("Settings"):
+                        runtime_panel = create_runtime_panel(book, private_event=PRIVATE_EVENT, app=app)
+
+        voice_panel.bind(app, cast_library_voice, event_options=PRIVATE_EVENT)
+        text_import.bind(event_options=PRIVATE_EVENT)
+        line_voice_panel.bind(app, book, event_options=PRIVATE_EVENT)
+        remote_panel.bind(event_options=PRIVATE_EVENT)
+        chat_panel.bind(
+            api_key=api_key, llm_model=llm_model, effort=effort, endpoint=llm_endpoint,
+            voice_panel=voice_panel, model_settings=model_settings, runtime_panel=runtime_panel,
+            remote_panel=remote_panel,
+            event_options=PRIVATE_EVENT,
+        )
+        playback_panel.bind(
+            book, cast, book_model, validate_audio, batch_size, model_settings, validation_strictness, max_retries,
+            voice_panel, event_options=PRIVATE_EVENT, runtime_settings=runtime_panel, remote_panel=remote_panel,
+        )
 
         def present_book(session, voices, problem=None):
             table, roles = _review_components(session, voices)
+            has_text = session is not None and bool(session.book.sections)
             return (
                 session,
                 voices,
@@ -319,47 +379,52 @@ def build_app() -> gr.Blocks:
                 roles,
                 gr.update(visible=False),
                 gr.update(value=None, visible=False),
-                gr.update(interactive=session is not None),
+                gr.update(interactive=has_text),
                 gr.update(interactive=session is not None and session.roster is not None),
-                gr.update(interactive=session is not None and bool(model_choices)),
+                gr.update(interactive=has_text and bool(model_choices)),
                 gr.update(value=None, visible=False),
                 gr.update(value=None, visible=False),
+                1, None, False,
             )
 
-        def load_book(path: str | None, language: str, previous: BookSession | None):
-            session = None
-            problem = None
-            if path is None:
-                problem = "Choose an EPUB to import."
+        def load_book(previous: BookSession | None, active_id: str | None, *fields):
+            try:
+                session = text_import.import_book(*fields)
+            except WebBackendError as exc:
+                problem = str(exc)
+            except Exception:
+                problem = "Could not import the book text."
             else:
-                try:
-                    session = import_epub(path, language_code=language or "")
-                except WebBackendError as exc:
-                    problem = str(exc)
-                except Exception:
-                    problem = "Could not import the EPUB."
-            close_book_session(previous)
+                using_template = previous is not None and not previous.book.sections
+                if using_template:
+                    session = replace(
+                        session, project_dir=previous.project_dir if active_id else session.project_dir,
+                        project_language=previous.project_language, word_substitutions=previous.word_substitutions,
+                    )
+                close_book_session(previous)
+                source = fields[1] if fields[0] == "epub" else None
+                project_id = active_id if using_template else None
+                return (
+                    *present_book(session, {}),
+                    project_id, gr.update(interactive=True), gr.update(interactive=bool(project_id)),
+                    gr.update(value=None, visible=False),
+                    source, gr.skip() if source else gr.update(value=None),
+                )
             return (
-                *present_book(session, {}, problem),
-                None, gr.update(interactive=session is not None), gr.update(interactive=False),
-                gr.update(value=None, visible=False),
-            )
-
-        def invalidate_book(previous: BookSession | None):
-            close_book_session(previous)
-            return (
-                *present_book(None, {}),
-                None, gr.update(interactive=False), gr.update(interactive=False), gr.update(value=None, visible=False),
+                *[gr.skip()] * (len(import_outputs) - 1),
+                gr.update(value=problem, visible=True), gr.skip(), gr.skip(),
             )
 
         book_outputs = [
             book, cast, summary, characters, cast_role, cast_editor, analysis_status,
-            identify, attribute, generate_book, book_status, audiobook,
+            identify, attribute, generate_book, book_status, audiobook, first_line, last_line, regenerate_lines,
         ]
         project_actions = [active_project, save_new, save_changes, project_status]
         import_outputs = [*book_outputs, *project_actions]
-        replaced_upload = gr.on([epub.upload, epub.clear], invalidate_book, [book], import_outputs, **PRIVATE_EVENT)
-        imported_book = load.click(load_book, [epub, book_language, book], import_outputs, **PRIVATE_EVENT)
+        imported_book = text_import.load.click(
+            load_book, [book, active_project, *text_import.inputs],
+            [*import_outputs, imported_epub, text_import.epub], **PRIVATE_EVENT,
+        )
 
         def refresh_projects(selected=None):
             choices = [(project.name, project.project_id) for project in list_projects()]
@@ -389,8 +454,8 @@ def build_app() -> gr.Blocks:
                 else:
                     loaded = load_project(project_id or "")
                     name, saved_id = loaded.summary.name, loaded.summary.project_id
-                source = epub.move_resource_to_block_cache(loaded.source_epub)
-                voice_reference = reference.move_resource_to_block_cache(loaded.narrator.reference_path)
+                source = text_import.epub.move_resource_to_block_cache(loaded.source_epub)
+                narrator_fields = voice_panel.show(loaded.narrator)
             except (WebProjectError, WebLegacyProjectError) as exc:
                 message = str(exc)
             except Exception:
@@ -401,39 +466,65 @@ def build_app() -> gr.Blocks:
                 message = f"Copied {name} from the console. Save it as a new browser project." if from_console else f"Opened {name}."
                 if not installed:
                     message += " Choose an installed speech model to generate audio."
+                source_kind = loaded.session.book.text_source_kind
+                if source_kind not in {"epub", "plain_text", "manual"}:
+                    source_kind = "epub" if source else "manual"
                 return (
                     *present_book(loaded.session, loaded.voices),
                     saved_id, gr.update(interactive=True), gr.update(interactive=saved_id is not None),
                     gr.update(value=message, visible=True),
-                    source,
-                    loaded.session.book.segmentation_settings.language_code or "en",
-                    voice_reference, loaded.narrator.transcript, loaded.narrator.instructions,
+                    source, source_kind,
+                    gr.update(value=source, visible=source_kind == "epub"),
+                    gr.update(value=None, visible=source_kind == "plain_text"),
+                    gr.update(value="", visible=source_kind == "manual"),
+                    *text_import.restore_settings(loaded.session),
+                    *narrator_fields, *voice_panel.reset_selection(), voice_status(),
                     loaded.model_id if installed else None,
                     loaded.validate_audio, loaded.batch_size, name,
+                    loaded.model_options,
+                    loaded.strictness, loaded.max_retries, loaded.auto_concat,
                 )
             if loaded is not None:
                 close_book_session(loaded.session)
             return (
                 *[gr.skip()] * (len(import_outputs) - 1),
                 gr.update(value=message, visible=True),
-                *[gr.skip()] * 9,
+                *[gr.skip()] * (len(opened_project_outputs) - len(import_outputs)),
             )
 
         def open_console_snapshot(project_id, previous):
             return open_project_snapshot(project_id, previous, from_console=True)
 
+        def import_console_library(project_id, selected, cast_selected):
+            loaded = None
+            try:
+                loaded = load_console_project(project_id or "", model_choices=model_choices)
+                summaries = import_voices(loaded.named_voices, upload_root=loaded.session.project_dir)
+                updates = voice_panel.refresh(selected, cast_selected)
+            except (WebLegacyProjectError, WebVoiceError) as exc:
+                return *[gr.skip()] * len(voice_library_outputs), voice_status(str(exc))
+            finally:
+                if loaded is not None:
+                    close_book_session(loaded.session)
+            count = len(summaries)
+            message = f"Imported {count} console {'voice' if count == 1 else 'voices'}." if count else "No named voices are available to import."
+            return *updates, voice_status(message)
+
         def store_project(
-            operation, destination, session, voices, model, source, ref, transcription, direction, validate, batch,
+            operation, destination, session, voices, model, source, validate, batch, settings,
+            strictness, retries, export, *narrator_fields,
         ):
             try:
                 if session is None:
-                    raise WebProjectError("Import an EPUB first.")
+                    raise WebProjectError("Import book text first.")
                 saved = operation(
-                    destination or "", session, narrator=_make_voice(ref, transcription, direction),
+                    destination or "", session, narrator=voice_panel.snapshot(*narrator_fields),
                     voices=voices, model_id=model or "", source_epub=source,
                     validate_audio=validate, batch_size=batch or PROJECT_BATCH_SIZE_DEFAULT,
+                    model_options=settings,
+                    strictness=strictness, max_retries=retries, auto_concat=export,
                 )
-            except WebProjectError as exc:
+            except (WebProjectError, WebRenderError) as exc:
                 message = str(exc)
             except Exception:
                 message = "Could not save the project."
@@ -460,8 +551,10 @@ def build_app() -> gr.Blocks:
         app.load(list_saved_projects, outputs=[saved_projects, open_project, project_status], **PRIVATE_EVENT)
         app.load(discover_console_projects, outputs=[console_projects_row, console_projects], **PRIVATE_EVENT)
         opened_project_outputs = [
-            *import_outputs, epub, book_language, reference, transcript, instructions, book_model,
-            validate_audio, batch_size, project_name,
+            *import_outputs, imported_epub, text_import.source, text_import.epub, text_import.text_file,
+            text_import.pasted_text, *text_import.settings_outputs, *voice_panel.outputs, *voice_panel.selection_outputs,
+            voice_panel.library_status, book_model,
+            validate_audio, batch_size, project_name, model_settings, validation_strictness, max_retries, auto_concat,
         ]
         opened_project = open_project.click(
             open_project_snapshot, [saved_projects, book], opened_project_outputs, **PRIVATE_EVENT,
@@ -469,8 +562,53 @@ def build_app() -> gr.Blocks:
         copied_console = copy_console.click(
             open_console_snapshot, [console_projects, book], opened_project_outputs, **PRIVATE_EVENT,
         )
+
+        def create_abr_project(path, name, previous):
+            template = None
+            try:
+                template = read_abr_project(path, abr_file.GRADIO_CACHE)
+                saved = create_project(
+                    name or "", template.session, narrator=template.narrator, voices={}, model_id=template.model_id,
+                    model_options=template.model_options, batch_size=template.batch_size, strictness=template.strictness,
+                    max_retries=template.max_retries, auto_concat=template.auto_concat,
+                )
+            except WebProjectError as exc:
+                updates = [gr.skip()] * len(opened_project_outputs)
+                updates[import_outputs.index(project_status)] = voice_status(str(exc))
+                return *updates, gr.skip(), gr.skip()
+            finally:
+                if template is not None:
+                    close_book_session(template.session)
+            updates = list(open_project_snapshot(saved.project_id, previous))
+            if isinstance(updates[0], BookSession):
+                updates[import_outputs.index(project_status)] = voice_status(
+                    f"Created {saved.name} from ABR settings. Import book text and select reference audio."
+                )
+            return *updates, *refresh_projects(saved.project_id)
+
+        created_from_abr = create_abr.click(
+            create_abr_project, [abr_file, project_name, book],
+            [*opened_project_outputs, saved_projects, open_project], **PRIVATE_EVENT,
+        )
+
+        def show_project_folder(project_id):
+            if not project_id:
+                return voice_status("Save or open a project first.")
+            try:
+                folder = open_project_folder(project_id)
+                return voice_status(f"Opened {folder}")
+            except WebProjectError as exc:
+                return voice_status(str(exc))
+
+        open_folder.click(show_project_folder, active_project, project_status, **PRIVATE_EVENT)
+        voice_library_outputs = [*voice_panel.selection_outputs, cast_library_voice]
+        import_console_voices.click(
+            import_console_library, [console_projects, voice_panel.selected, cast_library_voice],
+            [*voice_library_outputs, project_status], **PRIVATE_EVENT,
+        )
         persist_inputs = [
-            book, cast, book_model, epub, reference, transcript, instructions, validate_audio, batch_size,
+            book, cast, book_model, imported_epub, validate_audio, batch_size, model_settings,
+            validation_strictness, max_retries, auto_concat, *voice_panel.inputs,
         ]
         persist_outputs = [book, cast, active_project, saved_projects, open_project, save_changes, project_status]
         save_new.click(save_named_project, [project_name, *persist_inputs], persist_outputs, **PRIVATE_EVENT)
@@ -482,6 +620,8 @@ def build_app() -> gr.Blocks:
             key: str | None,
             model: str,
             reasoning: str,
+            endpoint: str,
+            settings_json: str,
             voices: dict[str, RenderVoice],
             role: str | None,
             *,
@@ -491,14 +631,15 @@ def build_app() -> gr.Blocks:
             secret = (key or "").strip()
             try:
                 if session is None:
-                    raise WebBackendError("Import an EPUB first.")
-                if not secret:
-                    raise WebBackendError("Enter an OpenAI API key.")
-                session = operation(session, secret, model, effort=reasoning, **kwargs)
+                    raise WebBackendError("Import book text first.")
+                session = operation(
+                    session, secret, model, effort=reasoning or "", endpoint=endpoint,
+                    settings_json=settings_json or "", **kwargs,
+                )
             except WebBackendError as exc:
                 message = str(exc).replace(secret, "[redacted]") if secret else str(exc)
             except Exception:
-                message = "OpenAI analysis failed. Check your settings and try again."
+                message = "Character analysis failed. Check your LLM settings and try again."
             else:
                 if new_roster:
                     voices = {}
@@ -514,81 +655,103 @@ def build_app() -> gr.Blocks:
                 )
             return (*[gr.skip()] * 5, gr.update(value=message, visible=True), gr.skip())
 
-        def find_characters(session, key, model, reasoning, voices, role, progress=gr.Progress()):
+        def find_characters(session, key, model, reasoning, endpoint, params, voices, role, progress=gr.Progress()):
             progress(0, desc="Identifying characters")
-            return analyze_book(identify_characters, session, key, model, reasoning, voices, role, new_roster=True)
+            return analyze_book(
+                identify_characters, session, key, model, reasoning, endpoint, params, voices, role, new_roster=True,
+            )
 
-        def find_speakers(session, key, model, reasoning, voices, role, progress=gr.Progress()):
+        def find_speakers(session, key, model, reasoning, endpoint, params, voices, role, progress=gr.Progress()):
             progress(0, desc="Assigning dialog")
             return analyze_book(
-                attribute_dialog, session, key, model, reasoning, voices, role,
+                attribute_dialog, session, key, model, reasoning, endpoint, params, voices, role,
                 on_progress=lambda done, total: progress((done, total), desc="Assigning dialog"),
             )
 
-        analysis_inputs = [book, api_key, llm_model, effort, cast, cast_role]
+        analysis_inputs = [book, api_key, llm_model, effort, llm_endpoint, llm_extra_params, cast, cast_role]
         analysis_outputs = [book, cast, summary, characters, cast_role, analysis_status, attribute]
         identified = identify.click(find_characters, analysis_inputs, analysis_outputs, **PRIVATE_EVENT)
         attributed = attribute.click(find_speakers, analysis_inputs, analysis_outputs, **PRIVATE_EVENT)
 
-        def show_voice(role: str | None, voices: dict[str, RenderVoice]):
-            voice = voices.get(role, RenderVoice())
+        def cast_fields_for(role, voice, selected=None):
             return (
-                gr.update(visible=role is not None),
                 cast_reference.move_resource_to_block_cache(voice.reference_path),
-                voice.transcript, voice.instructions,
-                gr.update(value=None, visible=False),
+                gr.update(value=voice.transcript, interactive=True), voice.instructions,
+                voice, role, gr.update(value=selected), voice_status(),
             )
 
-        cast_fields = [cast_editor, cast_reference, cast_transcript, cast_instructions, cast_status]
-        cast_role.change(show_voice, [cast_role, cast], cast_fields, **PRIVATE_EVENT)
+        def show_cast_voice(role: str | None, voices: dict[str, RenderVoice]):
+            return (
+                gr.update(visible=role is not None),
+                *cast_fields_for(role, voices.get(role, RenderVoice())), voice_status(),
+            )
 
-        def update_cast(session, voices, role, ref=None, transcription="", direction=""):
-            if session is None or role is None or session.roster is None or role not in session.roster.ids:
-                return (*[gr.skip()] * 5, gr.update(
-                    value="Choose a character from the roster.", visible=True
-                ))
+        cast_fields = [
+            cast_reference, cast_transcript, cast_instructions, cast_draft, cast_draft_role,
+            cast_library_voice, cast_transcription_status, cast_status,
+        ]
+        cast_role.change(show_cast_voice, [cast_role, cast], [cast_editor, *cast_fields], **PRIVATE_EVENT)
+
+        def cast_problem(message):
+            return (*[gr.skip()] * (len(cast_outputs) - 1), voice_status(message))
+
+        def update_cast(session, voices, role, voice, selected=None):
+            roster = session.roster if session is not None else None
+            narrator = roster.narrator if roster is not None else None
+            if roster is None or role not in roster.ids or role in {"NARRATOR", narrator.id if narrator else None}:
+                return cast_problem("Choose a character from the roster.")
             next_voices = dict(voices)
-            voice = _make_voice(ref, transcription, direction)
             if voice == RenderVoice():
                 next_voices.pop(role, None)
                 message = "This character will use the narrator voice."
             else:
                 next_voices[role] = voice
-                message = "Character voice saved."
+                message = f"Assigned {voice.name}." if voice.name else "Character voice saved."
             table, _ = _review_components(session, next_voices, role)
-            return (
-                next_voices, table, voice.reference_path, voice.transcript, voice.instructions,
-                gr.update(value=message, visible=True),
+            return next_voices, table, *cast_fields_for(role, voice, selected), voice_status(message)
+
+        def use_saved_cast_voice(session, voices, role, selected):
+            if not selected:
+                return tuple(gr.skip() for _ in cast_outputs)
+            try:
+                return update_cast(session, voices, role, load_voice(selected).voice, selected)
+            except WebVoiceError as exc:
+                return cast_problem(str(exc))
+
+        def save_direct_cast(session, voices, role, draft_role, draft, reference, transcript, instructions):
+            if role is None or role != draft_role:
+                return cast_problem("Wait for the selected character’s voice settings to load.")
+            voice = replace(
+                draft, reference_path=reference, transcript=(transcript or "").strip(),
+                instructions=(instructions or "").strip(), trim_start=draft.trim_start if reference else 0.0,
+                trim_end=draft.trim_end if reference else None,
             )
+            return update_cast(session, voices, role, voice)
 
         cast_inputs = [book, cast, cast_role]
-        cast_outputs = [cast, characters, cast_reference, cast_transcript, cast_instructions, cast_status]
+        cast_outputs = [cast, characters, *cast_fields]
+        cast_library_voice.input(use_saved_cast_voice, [*cast_inputs, cast_library_voice], cast_outputs, **PRIVATE_EVENT)
         save_cast.click(
-            update_cast,
-            [*cast_inputs, cast_reference, cast_transcript, cast_instructions],
+            save_direct_cast,
+            [*cast_inputs, cast_draft_role, cast_draft, cast_reference, cast_transcript, cast_instructions],
             cast_outputs,
             **PRIVATE_EVENT,
         )
-        clear_cast.click(update_cast, cast_inputs, cast_outputs, **PRIVATE_EVENT)
-
-        def transcribe_voice(path: str | None, language: str):
-            try:
-                if path is None:
-                    raise ModelRunError("Upload or record a reference clip first.")
-                text = transcribe_model_reference(path, language_code=language or "en")
-            except ModelRunError as exc:
-                message = str(exc)
-            except Exception:
-                message = "Could not transcribe the reference audio."
-            else:
-                return text, gr.update(value=None, visible=False)
-            return gr.skip(), gr.update(value=message, visible=True)
-
-        transcribe_reference.click(
-            transcribe_voice, [reference, reference_language], [transcript, transcript_status], **PRIVATE_EVENT,
+        clear_cast.click(
+            lambda session, voices, role: update_cast(session, voices, role, RenderVoice()),
+            cast_inputs, cast_outputs, **PRIVATE_EVENT,
         )
-        transcribe_cast.click(
-            transcribe_voice, [cast_reference, book_language], [cast_transcript, cast_status], **PRIVATE_EVENT,
+        bind_transcription(
+            cast_reference, cast_language, cast_transcript, cast_transcription_status, transcribe_cast,
+            event_options=PRIVATE_EVENT, draft=cast_draft, reset=((cast_draft, RenderVoice()),),
+        )
+        book.change(
+            lambda session: session.language_code if session else "en", book, cast_language,
+            show_progress="hidden", **PRIVATE_EVENT,
+        )
+        cast_reference.clear(
+            lambda: (gr.update(value="", interactive=True), voice_status()),
+            outputs=[cast_transcript, cast_transcription_status], trigger_mode="multiple", **PRIVATE_EVENT,
         )
 
         def update_review_sections(session, section=None):
@@ -622,7 +785,7 @@ def build_app() -> gr.Blocks:
         def update_dialogue_speaker(session, voices, role, section, line, speaker):
             try:
                 if session is None:
-                    raise WebBackendError("Import an EPUB first.")
+                    raise WebBackendError("Import book text first.")
                 session = correct_speaker(session, section, line, speaker)
             except WebBackendError as exc:
                 return (*[gr.skip()] * 6, gr.update(value=str(exc), visible=True))
@@ -632,11 +795,20 @@ def build_app() -> gr.Blocks:
                 gr.update(value="Speaker assignment updated.", visible=True),
             )
 
-        for event in (replaced_upload, imported_book, opened_project, copied_console):
+        for event in (imported_book, opened_project, copied_console, created_from_abr):
+            event.then(
+                section_text.refresh, book, section_text.refresh_outputs,
+                show_progress="hidden", **PRIVATE_EVENT,
+            )
             event.then(
                 update_review_sections, [book], [review_panel, review_section],
                 show_progress="hidden", **PRIVATE_EVENT,
             )
+        section_text.bind(
+            book, book_changed=lambda session, voices: (*present_book(session, voices), *update_review_sections(session, None)),
+            changed_inputs=[cast], changed_outputs=[*book_outputs, review_panel, review_section],
+            event_options=PRIVATE_EVENT, source_epub=imported_epub,
+        )
         for event in (identified, attributed):
             event.then(
                 update_review_sections, [book, review_section], [review_panel, review_section],
@@ -650,14 +822,24 @@ def build_app() -> gr.Blocks:
         )
 
         def generate_audiobook(
-            session, voices, model, ref, transcription, direction, validate, batch, request: gr.Request,
-            progress=gr.Progress(),
+            session, voices, model, validate, batch, settings,
+            strictness, retries, export, first, last, regenerate,
+            force_cpu, whisper_model, whisper_device, save_generation_logs, aac_bitrate,
+            remote_endpoint, remote_config,
+            request: gr.Request, progress=gr.Progress(), *narrator_fields,
         ):
             if session is None or model not in model_labels:
                 yield (
-                    gr.update(value="Import an EPUB and choose an installed speech model.", visible=True),
+                    gr.update(value="Import book text and choose an installed speech model.", visible=True),
                     gr.skip(), gr.skip(),
                 )
+                return
+            try:
+                narrator = voice_panel.snapshot(*narrator_fields)
+                runtime = runtime_panel.snapshot(force_cpu, whisper_model, whisper_device, save_generation_logs, aac_bitrate)
+                remote = remote_panel.selection_for(remote_endpoint, remote_config) if model == REMOTE_MODEL_ID else None
+            except (WebRenderError, WebRuntimeSettingsError, WebRemoteTtsError) as exc:
+                yield voice_status(str(exc)), gr.skip(), gr.skip()
                 return
             with running_job(request) as cancel:
                 yield (
@@ -668,21 +850,27 @@ def build_app() -> gr.Blocks:
                     result = render_model_book(
                         model,
                         session,
-                        {**voices, "NARRATOR": _make_voice(ref, transcription, direction)},
+                        {**voices, "NARRATOR": narrator},
                         on_progress=lambda done, total: progress((done, total), desc="Generating audiobook"),
                         cancel_event=cancel,
                         validate_audio=validate,
                         batch_size=batch or PROJECT_BATCH_SIZE_DEFAULT,
+                        model_options=settings.get(model),
+                        strictness=strictness or None, max_retries=retries, auto_concat=export,
+                        first_line=first, last_line=last, regenerate=regenerate,
+                        runtime_settings=runtime,
+                        **({"remote_selection": remote} if remote is not None else {}),
                     )
-                    cached_result = audiobook.move_resource_to_block_cache(result)
+                    cached_result = audiobook.move_resource_to_block_cache(result) if result else None
                 except ModelRunError as exc:
                     message = str(exc)
                 except Exception:
                     message = "Could not generate the audiobook."
                 else:
+                    message = "Audiobook ready." if cached_result else "Selected lines are ready to review or export."
                     yield (
-                        gr.update(value="Audiobook ready.", visible=True),
-                        gr.update(value=cached_result, visible=True),
+                        gr.update(value=message, visible=True),
+                        gr.update(value=cached_result, visible=bool(cached_result)),
                         gr.update(interactive=False),
                     )
                     return
@@ -690,13 +878,20 @@ def build_app() -> gr.Blocks:
 
         generate_book.click(
             generate_audiobook,
-            [book, cast, book_model, reference, transcript, instructions, validate_audio, batch_size],
+            [
+                book, cast, book_model, validate_audio, batch_size, model_settings,
+                validation_strictness, max_retries, auto_concat, first_line, last_line, regenerate_lines,
+                *runtime_panel.inputs, *remote_panel.selection_inputs, *voice_panel.inputs,
+            ],
             [book_status, audiobook, stop_book],
             **PRIVATE_EVENT,
         )
 
         def compare_samples(
-            models, text, language, ref, transcription, direction, request: gr.Request, progress=gr.Progress(),
+            models, text, language, settings, force_cpu, whisper_model, whisper_device, save_generation_logs,
+            aac_bitrate,
+            remote_endpoint, remote_config,
+            request: gr.Request, progress=gr.Progress(), *narrator_fields,
         ):
             selected = list(dict.fromkeys(models or []))
             if not selected or any(model not in model_labels for model in selected) or not (text or "").strip():
@@ -706,7 +901,12 @@ def build_app() -> gr.Blocks:
                 ]
                 return
 
-            voice = _make_voice(ref, transcription, direction)
+            try:
+                voice = voice_panel.snapshot(*narrator_fields)
+                runtime = runtime_panel.snapshot(force_cpu, whisper_model, whisper_device, save_generation_logs, aac_bitrate)
+            except (WebRenderError, WebRuntimeSettingsError) as exc:
+                yield [voice_status(str(exc)), gr.skip(), *[gr.skip() for _ in sample_players]]
+                return
             with running_job(request) as cancel:
                 yield [
                     gr.update(value="Generating text samples.", visible=True),
@@ -721,10 +921,16 @@ def build_app() -> gr.Blocks:
                     progress((index, len(selected)), desc=f"Generating with {label}")
                     updates = [gr.skip() for _ in sample_players]
                     try:
+                        remote = remote_panel.selection_for(
+                            remote_endpoint, remote_config,
+                        ) if model == REMOTE_MODEL_ID else None
                         audio = render_model_sample(
                             model, text, voice, language_code=language or "en", cancel_event=cancel,
+                            model_options=settings.get(model),
+                            runtime_settings=runtime,
+                            **({"remote_selection": remote} if remote is not None else {}),
                         )
-                    except ModelRunError as exc:
+                    except (ModelRunError, WebRemoteTtsError) as exc:
                         if cancel.is_set():
                             break
                         statuses.append(f"{label} — {exc}")
@@ -744,13 +950,84 @@ def build_app() -> gr.Blocks:
 
         generate_samples.click(
             compare_samples,
-            [sample_models, sample_text, sample_language, reference, transcript, instructions],
+            [
+                sample_models, sample_text, sample_language, model_settings, *runtime_panel.inputs,
+                *remote_panel.selection_inputs, *voice_panel.inputs,
+            ],
             [sample_status, stop_samples, *sample_players],
             **PRIVATE_EVENT,
         )
         stop_options = {"api_visibility": "private", "queue": False, "show_progress": "hidden"}
         stop_book.click(stop_generation, **stop_options)
         stop_samples.click(stop_generation, **stop_options)
+        model_panel.cancel.click(stop_generation, **stop_options)
+
+        def show_model(model_id):
+            detail, available = model_panel.describe(model_id, model_labels)
+            return detail, gr.update(interactive=available), gr.update(value=None, visible=False)
+
+        model_panel.selected.input(
+            show_model, [model_panel.selected], [model_panel.details, model_panel.install, model_panel.setup_status],
+            **PRIVATE_EVENT,
+        )
+        force_cpu_option = runtime_panel.inputs[0]
+        batch_inputs = [book_model, validate_audio, model_settings, force_cpu_option]
+        for event in (app.load, book_model.input, use_recommended_batch.click):
+            event(model_panel.recommended_batch, batch_inputs, batch_size, show_progress="hidden", **PRIVATE_EVENT)
+
+        def install_selected_model(model_id, sample_selection, session, validate, settings, force_cpu,
+                                   request: gr.Request, progress=gr.Progress()):
+            unchanged = [gr.skip()] * 8
+            with running_job(request) as cancel:
+                yield (
+                    *unchanged, gr.update(value="Installing model.", visible=True),
+                    gr.update(interactive=False), gr.update(interactive=True), gr.skip(),
+                )
+                try:
+                    install_model(model_id, on_progress=lambda desc: progress(0, desc=desc), cancel_event=cancel)
+                    web_models.installed_model_choices.cache_clear()
+                    local_choices[:] = installed_model_choices()
+                    model_choices[:] = [*local_choices, remote_choice]
+                    model_labels.clear()
+                    model_labels.update((name, label) for label, name in model_choices)
+                    if model_id not in model_labels:
+                        raise WebModelSetupError("Setup finished, but the launcher could not find the model environment.")
+                except WebModelSetupError as exc:
+                    message = str(exc)
+                except Exception:
+                    message = "Could not install the model."
+                else:
+                    detail, available = model_panel.describe(model_id, model_labels)
+                    samples = dict.fromkeys([*(sample_selection or []), model_id])
+                    yield (
+                        gr.update(choices=model_panel.choices(local_choices), value=model_id), detail,
+                        gr.update(choices=model_choices, value=model_id),
+                        gr.update(choices=model_choices, value=[item for item in samples if item in model_labels]),
+                        model_panel.recommended_batch(model_id, validate, settings, force_cpu),
+                        gr.update(interactive=session is not None and bool(session.book.sections)),
+                        gr.update(interactive=True),
+                        gr.update(value=None, visible=False),
+                        gr.update(value=f"{model_labels[model_id]} is installed and selected.", visible=True),
+                        gr.update(interactive=available), gr.update(interactive=False),
+                        gr.update(choices=chat_panel.model_choices(model_choices), value=model_id),
+                    )
+                    return
+            _, available = model_panel.describe(model_id, model_labels)
+            yield (
+                *unchanged, gr.update(value=message, visible=True),
+                gr.update(interactive=available), gr.update(interactive=False), gr.skip(),
+            )
+
+        model_panel.install.click(
+            install_selected_model,
+            [model_panel.selected, sample_models, book, validate_audio, model_settings, force_cpu_option],
+            [
+                model_panel.selected, model_panel.details, book_model, sample_models,
+                batch_size, generate_book, generate_samples, sample_status,
+                model_panel.setup_status, model_panel.install, model_panel.cancel, chat_panel.speech_model,
+            ],
+            **PRIVATE_EVENT,
+        )
 
     return app.queue(default_concurrency_limit=1)
 
@@ -767,10 +1044,11 @@ def main() -> None:
         share=False,
         show_error=False,
         footer_links=[],
-        max_file_size="100mb",
+        max_file_size="2gb",
         enable_monitoring=False,
         ssr_mode=False,
         mcp_server=False,
+        app_kwargs={"routes": [reader_mount()]},
         css=CSS,
         theme=gr.themes.Soft(
             primary_hue="indigo",

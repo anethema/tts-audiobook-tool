@@ -4,11 +4,14 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+import json
 from pathlib import Path
 import re
 import shutil
 import tempfile
 from time import monotonic
+from urllib.parse import urlsplit
+from typing import TYPE_CHECKING
 
 import requests
 
@@ -29,10 +32,13 @@ from tts_audiobook_tool.speaker_assign.roster_util import ROSTER_SYSTEM_PROMPT, 
 from tts_audiobook_tool.speaker_assign.speaker_assign_file_util import SpeakerAssignFileUtil
 from tts_audiobook_tool.text_ops.epub_extractor import EpubExtractor
 
+if TYPE_CHECKING:
+    from tts_audiobook_tool.web_render import RenderVoice
+
 
 DEFAULT_OPENAI_MODEL = "gpt-6.1-terra"
 DEFAULT_REASONING_EFFORT = "low"
-_OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions"
+DEFAULT_LLM_ENDPOINT = "https://api.openai.com/v1/chat/completions"
 _REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 _FINISH_REASONS = ("stop", "length", "content_filter", "tool_calls", "function_call")
 _WORKSPACE = tempfile.TemporaryDirectory(prefix="tts-audiobook-web-", ignore_cleanup_errors=True)
@@ -42,8 +48,10 @@ class WebBackendError(ValueError):
     """An error whose message can be shown in the browser."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class BookSession:
+    """A book revision with identity-based change tracking in the browser."""
+
     book: Book
     project_dir: str
     warnings: tuple[str, ...] = ()
@@ -51,6 +59,15 @@ class BookSession:
     attributions: AttributionsFile = field(default_factory=AttributionsFile)
     attribution_notice: str = ""
     attribution_dir: str | None = None
+    project_language: str | None = None
+    word_substitutions: dict[str, str] = field(default_factory=dict)
+    line_voices: dict[int, RenderVoice] = field(default_factory=dict)
+
+    @property
+    def language_code(self) -> str:
+        if self.project_language is not None:
+            return self.project_language
+        return self.book.segmentation_settings.language_code or "en"
 
     def summary(self) -> str:
         return (
@@ -99,6 +116,9 @@ def new_book_session(
         warnings: tuple[str, ...] = (),
         roster: Roster | None = None,
         attributions: AttributionsFile | None = None,
+        project_language: str | None = None,
+        word_substitutions: dict[str, str] | None = None,
+        line_voices: dict[int, RenderVoice] | None = None,
 ) -> BookSession:
     """Create an isolated analysis workspace, optionally opening a saved book."""
     workspace = tempfile.mkdtemp(dir=_WORKSPACE.name)
@@ -110,6 +130,9 @@ def new_book_session(
         roster=roster,
         attributions=loaded,
         attribution_dir=workspace,
+        project_language=project_language,
+        word_substitutions=dict(word_substitutions or {}),
+        line_voices=dict(line_voices or {}),
     )
     if loaded.ranges and SpeakerAssignFileUtil.save_attributions_file(workspace, loaded):
         close_book_session(session)
@@ -157,21 +180,23 @@ def identify_characters(
         model: str = DEFAULT_OPENAI_MODEL,
         *,
         effort: str = DEFAULT_REASONING_EFFORT,
+        endpoint: str = DEFAULT_LLM_ENDPOINT,
+        settings_json: str = "",
 ) -> BookSession:
-    api_key, prefs = _request_settings(api_key, model, effort)
+    api_key, prefs = _request_settings(api_key, model, effort, endpoint, settings_json)
     if not session.book.dialog_line_indices():
-        raise WebBackendError("This EPUB has no dialogue lines to identify.")
+        raise WebBackendError("This book has no dialogue lines to identify.")
 
     llm = _make_session(prefs, api_key, ROSTER_SYSTEM_PROMPT)
     result = _send(llm, RosterUtil.build_message(session.book))
     if result.error is not None:
         raise WebBackendError(_request_error_message(result.error))
     if result.hit_output_limit:
-        raise WebBackendError("OpenAI reached its output limit. Try lower reasoning effort or a shorter EPUB.")
+        raise WebBackendError("The model reached its output limit. Try lower reasoning effort or a shorter book.")
     try:
         roster = RosterUtil.normalize_roster(AttributionReplyUtil.extract_json(result.reply)).roster
     except ValueError:
-        raise WebBackendError("OpenAI did not return a readable character roster. Try again.") from None
+        raise WebBackendError("The model did not return a readable character roster. Try again.") from None
     if SpeakerAssignFileUtil.delete_attributions_file(session.attribution_dir or session.project_dir):
         raise WebBackendError("The previous dialogue assignments could not be cleared from the session workspace.")
     return replace(session, roster=roster, attributions=AttributionsFile(), attribution_notice="")
@@ -183,11 +208,13 @@ def attribute_dialog(
         model: str = DEFAULT_OPENAI_MODEL,
         *,
         effort: str = DEFAULT_REASONING_EFFORT,
+        endpoint: str = DEFAULT_LLM_ENDPOINT,
+        settings_json: str = "",
         on_progress: Callable[[int, int], None] | None = None,
 ) -> BookSession:
     if session.roster is None:
         raise WebBackendError("Identify the characters before attributing dialogue.")
-    api_key, prefs = _request_settings(api_key, model, effort)
+    api_key, prefs = _request_settings(api_key, model, effort, endpoint, settings_json)
 
     attribution_dir = session.attribution_dir or session.project_dir
     attributions = _read_attributions(attribution_dir)
@@ -254,19 +281,38 @@ def _read_attributions(project_dir: str) -> AttributionsFile:
     return saved
 
 
-def _request_settings(api_key: str, model: str, effort: str) -> tuple[str, Prefs]:
+def _request_settings(api_key: str, model: str, effort: str, endpoint: str, settings_json: str) -> tuple[str, Prefs]:
+    endpoint = (endpoint or "").strip()
+    try:
+        address = urlsplit(endpoint)
+        if (address.scheme not in ("http", "https") or not address.hostname
+                or address.username is not None or address.fragment
+                or (address.hostname == "api.openai.com" and address.scheme != "https")):
+            raise ValueError
+    except ValueError:
+        raise WebBackendError("Enter a full HTTP or HTTPS chat completions endpoint URL.") from None
+
     api_key = api_key.strip()
-    if not re.fullmatch(r"[A-Za-z0-9._~+/=-]+", api_key):
+    if (address.hostname == "api.openai.com" or api_key) and not re.fullmatch(r"[A-Za-z0-9._~+/=-]+", api_key):
         raise WebBackendError("Paste a valid OpenAI API key.")
     model = model.strip()
-    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", model) or api_key in model:
-        raise WebBackendError("Enter an OpenAI model ID.")
+    if not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,200}", model) or (api_key and api_key in model):
+        raise WebBackendError("Enter a model ID.")
     effort = effort.strip()
     if effort and effort not in _REASONING_EFFORTS:
         raise WebBackendError("Choose a supported reasoning effort.")
-    extra_params = {"reasoning_effort": effort} if effort else {}
+    try:
+        extra_params = json.loads(settings_json.strip() or "{}")
+        if not isinstance(extra_params, dict):
+            raise ValueError
+    except ValueError:
+        raise WebBackendError("Enter additional request parameters as a JSON object.") from None
+    if extra_params.keys() & {"messages", "model", "store", "stream"}:
+        raise WebBackendError("The app sets messages, model, store and stream for character analysis.")
+    if effort:
+        extra_params.setdefault("reasoning_effort", effort)
     return api_key, Prefs(
-        llm_url=_OPENAI_ENDPOINT,
+        llm_url=endpoint,
         llm_model=model,
         llm_speaker_assign_extra_params=extra_params,
     )
@@ -274,9 +320,10 @@ def _request_settings(api_key: str, model: str, effort: str) -> tuple[str, Prefs
 
 def _make_session(prefs: Prefs, api_key: str, system_prompt: str) -> LlmSession:
     return _WebOpenAISession(
-        api_endpoint_url=_OPENAI_ENDPOINT,
+        api_endpoint_url=prefs.llm_url,
         token=api_key,
         model=prefs.llm_model,
+        api_type="openai",
         system_prompt=system_prompt,
         extra_params=prefs.llm_speaker_assign_extra_params,
         timeout=SPEAKER_ASSIGN_LLM_TIMEOUT,
@@ -328,17 +375,19 @@ class _WebOpenAISession(LlmSession):
     """Use the upstream chat state with a transport scoped to a pasted key."""
 
     def call_openai(self, payload, on_chunk, interrupt_event=None, on_reasoning=None) -> str:
-        payload.pop("temperature", None)
-        payload["store"] = False
-        if any(self.token in message["content"] for message in payload["messages"]):
+        if "temperature" not in self.extra_params:
+            payload.pop("temperature", None)
+        if urlsplit(self.api_endpoint_url).hostname == "api.openai.com":
+            payload["store"] = False
+        if self.token and any(self.token in message["content"] for message in payload["messages"]):
             raise WebBackendError("The request text contains the API key. Remove it from the text before retrying.")
         try:
             with requests.Session() as http:
                 # Disable .netrc auth overrides and ambient proxy configuration.
                 http.trust_env = False
                 with http.post(
-                    _OPENAI_ENDPOINT,
-                    headers={"Authorization": f"Bearer {self.token}"},
+                    self.api_endpoint_url,
+                    headers={"Authorization": f"Bearer {self.token}"} if self.token else {},
                     json=payload,
                     timeout=self.timeout,
                     allow_redirects=False,
@@ -359,7 +408,7 @@ class _WebOpenAISession(LlmSession):
             raise WebBackendError("OpenAI returned an invalid response.") from None
         if content is None:
             return ""
-        if not isinstance(content, str) or self.token in content:
+        if not isinstance(content, str) or (self.token and self.token in content):
             raise WebBackendError("OpenAI returned an invalid response.")
         return content
 

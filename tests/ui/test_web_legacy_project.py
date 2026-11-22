@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from copy import deepcopy
+
 import json
 import logging
 from pathlib import Path
@@ -7,7 +9,7 @@ import tempfile
 import unittest
 
 from tts_audiobook_tool import web_legacy_project
-from tts_audiobook_tool.app_types import Book, BookSection, BookSegmentationSettings
+from tts_audiobook_tool.app_types import Book, BookSection, BookSegmentationSettings, RoomReverb
 from tts_audiobook_tool.app_types.book_serialization import book_to_project_text_json_dict
 from tts_audiobook_tool.app_types.phrase import Phrase, PhraseGroup, Reason
 from tts_audiobook_tool.constants import PROJECT_JSON_FILE_NAME, PROJECT_SPEC_VERSION, PROJECT_TEXT_EPUB_FILE_NAME, PROJECT_TEXT_FILE_NAME
@@ -37,7 +39,7 @@ class TestWebLegacyProject(unittest.TestCase):
             sections=[BookSection(
                 title="Chapter",
                 phrase_groups=[
-                    PhraseGroup([Phrase("Milo shut the door. ", Reason.SENTENCE)]),
+                    PhraseGroup([Phrase("Milo shut the door. ", Reason.SENTENCE)], voice_index=2),
                     PhraseGroup(
                         [Phrase("“Not today.”", Reason.SECTION_BREAK)], voice_index=1, is_dialog=True,
                     ),
@@ -52,10 +54,14 @@ class TestWebLegacyProject(unittest.TestCase):
             "version": PROJECT_SPEC_VERSION,
             "tts_model_type": model.id,
             "voice_references": [
-                {"file_name": "narrator.wav", "transcript": "Full narrator text.", "crop_file_name": "trim.flac",
-                 "crop_start": 1, "crop_end": 4, "crop_transcript": "Narrator crop."},
-                {"file_name": "milo.flac", "transcript": "Milo transcript.",
-                 "instructions": {model.id: "Quiet."}},
+                {"name": "Narrator", "file_name": "narrator.wav", "transcript": "Full narrator text.",
+                 "crop_file_name": "trim.flac", "crop_start": 1, "crop_end": 4,
+                 "crop_transcript": "Narrator crop.", "pan": 0.3, "volume": 70,
+                 "room_reverb": RoomReverb.MEDIUM_DRR21.id},
+                {"name": "Milo", "file_name": "milo.flac", "transcript": "Milo transcript.",
+                 "instructions": {model.id: "Quiet.", "breeze_tts_2_local": "Speak slowly."}},
+                {"name": "Extra", "file_name": "missing.wav", "crop_file_name": "trim.flac",
+                 "crop_start": 1, "crop_end": 4, "crop_transcript": "Available crop only."},
             ],
         })
         self._write(self.project / PROJECT_TEXT_FILE_NAME, book_to_project_text_json_dict(self.book))
@@ -80,7 +86,9 @@ class TestWebLegacyProject(unittest.TestCase):
 
         opened = self._load(model_choices=[(model.value.ui["proper_name"], "venv-local")])
         self.assertEqual(opened.name, self.project.name)
-        self.assertEqual(book_to_project_text_json_dict(opened.session.book), book_to_project_text_json_dict(self.book))
+        expected = deepcopy(self.book)
+        expected.phrase_groups[1].voice_index = 0
+        self.assertEqual(book_to_project_text_json_dict(opened.session.book), book_to_project_text_json_dict(expected))
         self.assertEqual(opened.model_id, "venv-local")
         self.assertEqual(opened.session.roster, roster)
         self.assertEqual(opened.session.attributions.speaker_of_each_line(opened.session.book), {1: "MILO"})
@@ -88,9 +96,21 @@ class TestWebLegacyProject(unittest.TestCase):
         self.assertEqual(opened.session.attributions.ranges[0].llm, {})
         self.assertFalse(Path(opened.session.project_dir).is_relative_to(self.project))
         self.assertEqual(opened.narrator.transcript, "Narrator crop.")
-        self.assertEqual(Path(opened.narrator.reference_path).read_bytes(), b"trim")
+        self.assertEqual((opened.narrator.trim_start, opened.narrator.trim_end), (1.0, 4.0))
+        self.assertEqual(Path(opened.narrator.reference_path).read_bytes(), b"narrator")
+        self.assertEqual((opened.narrator.pan, opened.narrator.volume), (0.3, 70))
+        self.assertEqual(opened.narrator.room_reverb, RoomReverb.MEDIUM_DRR21.id)
         self.assertEqual(Path(opened.voices["MILO"].reference_path).read_bytes(), b"legacy root voice")
-        self.assertEqual(opened.voices["MILO"].instructions, "Quiet.")
+        self.assertEqual(dict(opened.voices["MILO"].model_instructions), {
+            model.id: "Quiet.", "breeze_tts_2_local": "Speak slowly.",
+        })
+        self.assertEqual([voice.name for voice in opened.named_voices], ["Narrator", "Milo", "Extra"])
+        self.assertEqual(opened.named_voices[:2], (opened.narrator, opened.voices["MILO"]))
+        self.assertEqual(opened.session.line_voices, {2: opened.named_voices[2]})
+        extra = opened.named_voices[2]
+        self.assertEqual((extra.trim_start, extra.trim_end), (0.0, None))
+        self.assertEqual(extra.transcript, "Available crop only.")
+        self.assertEqual(Path(extra.reference_path).read_bytes(), b"trim")
         self.assertEqual(Path(opened.source_epub).read_bytes(), b"project source")
         self.assertEqual(self._contents(), original)
         close_book_session(opened.session)
@@ -127,6 +147,25 @@ class TestWebLegacyProject(unittest.TestCase):
         previous = web_legacy_project.load_console_project(projects[1].project_id, prefs_path=self.prefs)
         self.addCleanup(close_book_session, previous.session)
         self.assertEqual(len(previous.session.book.phrase_groups), 2)
+
+    def test_import_keeps_native_preset_speaker_and_selected_checkpoint(self):
+        from tts_audiobook_tool.tts_models.qwen3_base_model import Qwen3BaseModel
+
+        model = TtsModelType.require_by_id("qwen3tts_local")
+        target = next(item for item in Qwen3BaseModel.PRESET_REPO_IDS if item.endswith("-CustomVoice"))
+        self._write(self.project / PROJECT_JSON_FILE_NAME, {
+            "version": PROJECT_SPEC_VERSION,
+            "tts_model_type": model.id,
+            "voice_references": [{"file_name": "", "name": "Speaker", "presets": {model.id: "vivian"}}],
+            "model_settings": {"models": {model.id: {"parameters": {
+                "target": target, "model_type": "custom_voice", "temperature": 0.66,
+            }}}},
+        })
+        self._write(self.project / PROJECT_TEXT_FILE_NAME, book_to_project_text_json_dict(self.book))
+        opened = self._load(model_choices=[(model.value.ui["proper_name"], "venv-qwen3tts")])
+        self.assertEqual(opened.narrator.presets, ((model.id, "vivian"),))
+        self.assertEqual(opened.named_voices, (opened.narrator,))
+        self.assertEqual(opened.model_options, {"venv-qwen3tts": {"target": target, "temperature": 0.66}})
 
     def test_symlinked_reference_and_epub_and_path_traversal_are_skipped(self):
         outside = self.root / "external.wav"

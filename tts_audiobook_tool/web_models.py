@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import asdict
 from functools import lru_cache
 import json
@@ -15,9 +16,14 @@ from tempfile import TemporaryDirectory
 from threading import Event, Lock
 from typing import TYPE_CHECKING
 
+from tts_audiobook_tool.constants_config import PROJECT_MAX_RETRIES_DEFAULT
+from tts_audiobook_tool.web_remote_models import REMOTE_MODEL_ID, WebRemoteTtsError, remote_client_python
+
 if TYPE_CHECKING:
     from tts_audiobook_tool.web_backend import BookSession
+    from tts_audiobook_tool.web_remote_models import RemoteTtsSelection
     from tts_audiobook_tool.web_render import RenderVoice
+    from tts_audiobook_tool.web_runtime_settings import WebRuntimeSettings
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,25 +55,53 @@ def _python_for(model_id: str) -> Path:
 
 def render_model_sample(
     model_id: str, text: str, voice: RenderVoice, *, language_code: str = "en",
-    cancel_event: Event | None = None,
+    cancel_event: Event | None = None, model_options: dict[str, object] | None = None,
+    runtime_settings: WebRuntimeSettings | None = None,
+    remote_selection: RemoteTtsSelection | None = None,
 ) -> str:
-    return _run(
+    output = _run(
         model_id,
-        dict(action="sample", text=text, voice=asdict(voice), language_code=language_code),
+        dict(
+            action="sample", text=text, voice=asdict(voice), language_code=language_code, model_options=model_options,
+            runtime_settings=asdict(runtime_settings) if runtime_settings is not None else None,
+            remote_selection=asdict(remote_selection) if remote_selection is not None else None,
+        ),
         cancel_event=cancel_event,
     )
+    assert output is not None
+    return output
 
 
-def transcribe_model_reference(path: str, *, language_code: str = "en") -> str:
+def preview_model_reference(path: str, *, trim_start: float = 0.0, trim_end: float | None = None) -> str:
+    """Prepare the selected reference audio range without starting a model."""
+    from tts_audiobook_tool.web_render import WebRenderError, preview_reference
+
+    try:
+        return preview_reference(path, trim_start=trim_start, trim_end=trim_end)
+    except WebRenderError as error:
+        raise ModelRunError(str(error)) from error
+
+
+def transcribe_model_reference(
+    path: str, *, language_code: str = "en", trim_start: float = 0.0, trim_end: float | None = None,
+) -> str:
     """Run the cached local speech recognizer without using GPU memory."""
-    return _run(None, dict(action="transcribe", path=path, language_code=language_code))
+    transcript = _run(None, dict(
+        action="transcribe", path=path, language_code=language_code, trim_start=trim_start, trim_end=trim_end,
+    ))
+    assert transcript is not None
+    return transcript
 
 
 def render_model_book(
     model_id: str, session: BookSession, voices: dict[str, RenderVoice], *,
     on_progress: Callable[[int, int], None] | None = None, cancel_event: Event | None = None,
-    validate_audio: bool = True, batch_size: int = 1,
-) -> str:
+    validate_audio: bool = True, batch_size: int = 1, model_options: dict[str, object] | None = None,
+    first_line: int = 1, last_line: int | None = None, regenerate: bool = False, auto_concat: bool = True,
+    strictness: str | None = None, max_retries: int = PROJECT_MAX_RETRIES_DEFAULT,
+    runtime_settings: WebRuntimeSettings | None = None,
+    remote_selection: RemoteTtsSelection | None = None,
+) -> str | None:
     from tts_audiobook_tool.app_types.book_serialization import book_to_project_text_json_dict
 
     return _run(
@@ -78,9 +112,21 @@ def render_model_book(
             project_dir=session.project_dir,
             roster=session.roster.to_dict() if session.roster else None,
             attributions=session.attributions.to_dict(),
+            project_language=session.project_language,
+            word_substitutions=session.word_substitutions,
             voices={name: asdict(voice) for name, voice in voices.items()},
+            line_voices={slot: asdict(voice) for slot, voice in session.line_voices.items()},
             validate_audio=validate_audio,
             batch_size=batch_size,
+            model_options=model_options,
+            first_line=first_line,
+            last_line=last_line,
+            regenerate=regenerate,
+            auto_concat=auto_concat,
+            strictness=strictness,
+            max_retries=max_retries,
+            runtime_settings=asdict(runtime_settings) if runtime_settings is not None else None,
+            remote_selection=asdict(remote_selection) if remote_selection is not None else None,
         ),
         on_progress=on_progress,
         cancel_event=cancel_event,
@@ -106,15 +152,23 @@ def _stop(proc: subprocess.Popen) -> None:
 def _run(
     model_id: str | None, payload: dict, *,
     on_progress: Callable[[int, int], None] | None = None, cancel_event: Event | None = None,
-) -> str:
+) -> str | None:
     with _RENDER_LOCK, TemporaryDirectory(prefix="audiobook-render-") as directory:
         if cancel_event is not None and cancel_event.is_set():
             raise ModelRunError("Generation stopped.")
+        remote = payload.get("remote_selection") is not None
+        if remote != (model_id == REMOTE_MODEL_ID):
+            raise ModelRunError("Choose a verified remote model before selecting remote synthesis.")
+        if remote:
+            executable = remote_client_python(ROOT)
+            if executable is None:
+                raise ModelRunError("No installed remote speech client environment was found.")
+        else:
+            executable = _python_for(model_id) if model_id else sys.executable
         work = Path(directory)
         (work / "input.json").write_text(json.dumps(payload), encoding="utf-8")
         proc = subprocess.Popen(
-            [str(_python_for(model_id)) if model_id else sys.executable,
-             "-m", "tts_audiobook_tool.web_models", directory],
+            [str(executable), "-m", "tts_audiobook_tool.web_models", directory],
             cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=(os.name == "posix"),
         )
@@ -135,6 +189,8 @@ def _run(
             try:
                 result = json.loads((work / "result.json").read_text(encoding="utf-8"))
             except (OSError, ValueError):
+                if remote:
+                    raise ModelRunError(f"The remote speech client exited with code {proc.returncode}.") from None
                 raise ModelRunError(
                     f"The speech model exited with code {proc.returncode}. Check available GPU memory."
                 ) from None
@@ -142,6 +198,8 @@ def _run(
                 raise ModelRunError(result["error"])
             if payload["action"] == "transcribe":
                 return result["text"]
+            if payload["action"] == "book" and result["output"] is None:
+                return None
             output = Path(result["output"])
             if not output.is_file():
                 raise ModelRunError("The speech model did not produce an audio file.")
@@ -164,22 +222,37 @@ def _worker(directory: Path) -> None:
     from tts_audiobook_tool.speaker_assign.attribution import AttributionsFile
     from tts_audiobook_tool.speaker_assign.roster import Roster
     from tts_audiobook_tool.web_backend import BookSession
+    from tts_audiobook_tool.web_remote_models import RemoteTtsSelection, remote_worker_scope
     from tts_audiobook_tool.web_render import RenderVoice, WebRenderError, render_book, render_sample
+    from tts_audiobook_tool.web_runtime_settings import WebRuntimeSettings, WebRuntimeSettingsError
 
     payload = json.loads((directory / "input.json").read_text(encoding="utf-8"))
     cancelled = Event()
     signal.signal(signal.SIGTERM, lambda *_: cancelled.set())
+    scopes = ExitStack()
+    remote_options = {}
     try:
         if payload["action"] == "transcribe":
             from tts_audiobook_tool.web_render import transcribe_reference
 
-            transcript = transcribe_reference(payload["path"], language_code=payload["language_code"])
+            transcript = transcribe_reference(
+                payload["path"], language_code=payload["language_code"],
+                trim_start=payload.get("trim_start", 0.0), trim_end=payload.get("trim_end"),
+            )
             _write_json(directory / "result.json", {"text": transcript})
             return
+        runtime_settings = WebRuntimeSettings(**(payload.get("runtime_settings") or {}))
+        if payload.get("remote_selection") is not None:
+            selection = RemoteTtsSelection(**payload["remote_selection"])
+            scopes.enter_context(remote_worker_scope(selection))
+            remote_options["remote_selection"] = selection
         if payload["action"] == "sample":
             output = render_sample(
                 payload["text"], RenderVoice(**payload["voice"]),
                 language_code=payload["language_code"], cancel_event=cancelled,
+                model_options=payload.get("model_options"),
+                runtime_settings=runtime_settings,
+                **remote_options,
             )
         elif payload["action"] == "book":
             book = book_from_project_text_json_dict(payload["book"])
@@ -189,6 +262,9 @@ def _worker(directory: Path) -> None:
                 book=book, project_dir=payload["project_dir"],
                 roster=Roster.from_dict(payload["roster"]) if payload["roster"] else None,
                 attributions=AttributionsFile.from_dict(payload["attributions"]),
+                project_language=payload.get("project_language"),
+                word_substitutions=payload.get("word_substitutions", {}),
+                line_voices={int(slot): RenderVoice(**voice) for slot, voice in payload.get("line_voices", {}).items()},
             )
 
             def report(current: int, total: int) -> None:
@@ -198,14 +274,24 @@ def _worker(directory: Path) -> None:
             output = render_book(
                 session, voices, on_progress=report, cancel_event=cancelled,
                 validate_audio=payload["validate_audio"], batch_size=payload["batch_size"],
+                model_options=payload.get("model_options"),
+                first_line=payload.get("first_line", 1), last_line=payload.get("last_line"),
+                regenerate=payload.get("regenerate", False), auto_concat=payload.get("auto_concat", True),
+                strictness=payload.get("strictness"),
+                max_retries=payload.get("max_retries", PROJECT_MAX_RETRIES_DEFAULT),
+                runtime_settings=runtime_settings,
+                **remote_options,
             )
         else:
             raise ModelRunError("Unknown generation request.")
         result = {"output": output}
-    except (WebRenderError, ModelRunError) as error:
+    except (WebRenderError, ModelRunError, WebRuntimeSettingsError, WebRemoteTtsError) as error:
         result = {"error": str(error)}
     finally:
-        ModelWorker.shutdown()
+        try:
+            ModelWorker.shutdown()
+        finally:
+            scopes.close()
     _write_json(directory / "result.json", result)
 
 

@@ -156,6 +156,27 @@ class TestWebBackend(unittest.TestCase):
                         web_backend.identify_characters(session, f"{KEY}\n-injected")
                 post.assert_not_called()
 
+    def test_character_analysis_accepts_custom_chat_completions_settings(self):
+        endpoint = "http://127.0.0.1:11434/v1/chat/completions"
+        with tempfile.TemporaryDirectory() as directory:
+            session = self._book_session(directory)
+            with patch.object(requests.Session, "post", return_value=_response(reply=CHARACTERS_REPLY)) as post:
+                result = web_backend.identify_characters(
+                    session, "", "local/model", endpoint=endpoint, effort="",
+                    settings_json='{"temperature": 0.2, "max_tokens": 100}',
+                )
+                self.assertEqual(post.call_args.args, (endpoint,))
+                self.assertEqual(post.call_args.kwargs["headers"], {})
+                self.assertEqual(post.call_args.kwargs["json"]["temperature"], 0.2)
+                self.assertEqual(post.call_args.kwargs["json"]["max_tokens"], 100)
+                self.assertNotIn("store", post.call_args.kwargs["json"])
+                self.assertEqual(result.roster.narrator.id, "FIONA")
+                with self.assertRaises(web_backend.WebBackendError):
+                    web_backend.identify_characters(session, KEY, endpoint="http://api.openai.com/v1/chat/completions")
+                with self.assertRaises(web_backend.WebBackendError):
+                    web_backend.identify_characters(session, "", endpoint=endpoint, settings_json='{"stream": true}')
+                post.assert_called_once()
+
     @staticmethod
     def _book_session(directory: str, sections: int = 1) -> web_backend.BookSession:
         words = "A word " * 1300 if sections > 1 else "Fiona waved. "

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
 import json
 import os
@@ -10,7 +10,7 @@ from pathlib import Path
 import shutil
 
 from tts_audiobook_tool.app_support import path_norm
-from tts_audiobook_tool.app_types import Book, BookSegmentationSettings, SegmentationStrategy
+from tts_audiobook_tool.app_types import Book, BookSegmentationSettings, SegmentationStrategy, Strictness
 from tts_audiobook_tool.app_types.book_serialization import (
     book_from_json_dict,
     book_from_project_text_json_dict,
@@ -25,10 +25,13 @@ from tts_audiobook_tool.constants import (
     PROJECT_TEXT_FILE_NAME,
     PROJECT_VOICE_SUBDIR,
 )
-from tts_audiobook_tool.constants_config import PROJECT_BATCH_SIZE_MAX
+from tts_audiobook_tool.constants_config import (
+    PROJECT_BATCH_SIZE_MAX, PROJECT_MAX_RETRIES_DEFAULT, PROJECT_MAX_RETRIES_MAX, PROJECT_MAX_RETRIES_MIN,
+)
 from tts_audiobook_tool.prefs import PREFS_FILE_NAME
 from tts_audiobook_tool.project_support.model_settings import REGISTRY
 from tts_audiobook_tool.project_support.project_load_util import ProjectLoadUtil
+from tts_audiobook_tool.project_support.project_util import ProjectUtil
 from tts_audiobook_tool.project_support.voice_reference_migration import (
     VoiceReferenceMigrationRequired,
     prepare_project_voice_references,
@@ -39,6 +42,7 @@ from tts_audiobook_tool.speaker_assign.speaker_assign_file_util import SpeakerAs
 from tts_audiobook_tool.speaker_assign.voice_map import VoiceMapFile
 from tts_audiobook_tool.tts_models.tts_model_type import TtsModelType
 from tts_audiobook_tool.web_backend import BookSession, WebBackendError, close_book_session, new_book_session
+from tts_audiobook_tool.web_model_options import model_options_for, validate_model_options
 from tts_audiobook_tool.web_render import RenderVoice
 
 
@@ -65,6 +69,11 @@ class ImportedConsoleProject:
     source_epub: str | None
     validate_audio: bool = True
     batch_size: int = 1
+    named_voices: tuple[RenderVoice, ...] = ()
+    strictness: str = ""
+    max_retries: int = PROJECT_MAX_RETRIES_DEFAULT
+    auto_concat: bool = True
+    model_options: dict[str, dict[str, object]] = field(default_factory=dict)
 
 
 def list_console_projects(*, prefs_path: str | os.PathLike[str] | None = None) -> list[ConsoleProject]:
@@ -98,14 +107,19 @@ def load_console_project(
 
     warnings = []
     raw_references = settings.get("voice_references")
+    if isinstance(raw_references, list):
+        # Keep slots in place for the stored cast mapping, even if a reference
+        # path cannot be used inside the console project.
+        safe_references = []
+        for raw in raw_references:
+            file_name = raw.get("file_name") if isinstance(raw, dict) else None
+            if isinstance(file_name, str) and file_name and not path_norm.normalize_stored_relative_path(file_name)[0]:
+                raw = {**raw, "file_name": ""}
+                warnings.append("Some console voice slots contain unavailable reference clips.")
+            safe_references.append(raw)
+        settings["voice_references"] = safe_references
     try:
         settings = prepare_project_voice_references(settings)
-        if isinstance(raw_references, list) and len(raw_references) != len(settings["voice_references"]):
-            settings["voice_references"] = [
-                Voice.from_dict(raw, index=index) or Voice()
-                for index, raw in enumerate(raw_references)
-            ]
-            warnings.append("Some console voice slots contain unavailable reference clips.")
     except VoiceReferenceMigrationRequired:
         warnings.append("Open this project in the console to choose its voice list before importing voices.")
         ProjectLoadUtil.remap_legacy_keys(settings)
@@ -124,6 +138,12 @@ def load_console_project(
     language = settings.get("language_code")
     if not book.segmentation_settings.language_code and isinstance(language, str):
         book.segmentation_settings = book.segmentation_settings._replace(language_code=language)
+    substitutions = {}
+    raw_substitutions = settings.get("word_substitutions_json_string")
+    if isinstance(raw_substitutions, str):
+        parsed = ProjectUtil.parse_word_substitutions_json_string(raw_substitutions)
+        if isinstance(parsed, dict):
+            substitutions = {key: value for key, value in parsed.items() if key and value}
 
     roster, attributions, voice_map = _load_speakers(folder, book, warnings)
     tts_id = settings.get("tts_model_type")
@@ -131,9 +151,13 @@ def load_console_project(
     model_id = _installed_model(tts_id, model_choices)
     if tts_id not in ("", "none") and not model_id:
         warnings.append("The console project’s speech model is unavailable in the browser. Choose an installed model.")
+    model_options = _model_options(settings, tts_id, model_id, warnings)
 
     try:
-        session = new_book_session(book, roster=roster, attributions=attributions)
+        session = new_book_session(
+            book, roster=roster, attributions=attributions,
+            project_language=language if isinstance(language, str) else None, word_substitutions=substitutions,
+        )
     except (OSError, WebBackendError):
         raise WebLegacyProjectError("Could not open a workspace for the imported project.") from None
     staged = Path(session.project_dir)
@@ -144,14 +168,28 @@ def load_console_project(
         speaker: index for speaker, index in voice_map.items()
         if roster and speaker in roster.ids and speaker != narrator_id and index < len(references)
     }
+    speakers_by_line = attributions.speaker_of_each_line(book)
+    manual_slots = set()
+    for index, group in enumerate(book.phrase_groups):
+        slot = group.voice_index
+        if not slot:
+            continue
+        if slot == cast_slots.get(speakers_by_line.get(index, "")):
+            group.voice_index = 0
+        elif 0 < slot < len(references):
+            manual_slots.add(slot)
+        else:
+            group.voice_index = 0
+            warnings.append("Some lines referred to a missing console voice and will use the default cast.")
     try:
-        narrator = RenderVoice()
-        if references:
-            narrator = _stage_voice(folder, staged, references[0], tts_id, copied, warnings)
-        voices = {
-            speaker: _stage_voice(folder, staged, references[index], tts_id, copied, warnings)
-            for speaker, index in cast_slots.items()
+        assigned_slots = set(cast_slots.values()) | manual_slots | {0}
+        staged_voices = {
+            index: _stage_voice(folder, staged, voice, copied, warnings)
+            for index, voice in enumerate(references) if index in assigned_slots or voice.name
         }
+        narrator = staged_voices.get(0, RenderVoice())
+        voices = {speaker: staged_voices[index] for speaker, index in cast_slots.items()}
+        named_voices = tuple(voice for voice in staged_voices.values() if voice.name)
         source = _contained_file(folder, PROJECT_TEXT_EPUB_FILE_NAME)
         source_epub = None
         if source is not None:
@@ -161,16 +199,21 @@ def load_console_project(
         close_book_session(session)
         raise WebLegacyProjectError("Could not copy the console project’s book or voice files.") from None
 
-    speakers_by_line = attributions.speaker_of_each_line(book)
-    if any(
-        group.voice_index != 0 and cast_slots.get(speakers_by_line.get(index, ""), 0) != group.voice_index
-        for index, group in enumerate(book.phrase_groups)
-    ):
-        warnings.append("The browser uses its character cast for voice assignment. Review the imported voices before generating.")
+    strictness = Strictness.get_by_id(settings.get("strictness"))
+    max_retries = settings.get("max_retries")
+    if type(max_retries) is not int or not PROJECT_MAX_RETRIES_MIN <= max_retries <= PROJECT_MAX_RETRIES_MAX:
+        max_retries = PROJECT_MAX_RETRIES_DEFAULT
+    auto_concat = settings.get("gen_auto_concat")
 
     return ImportedConsoleProject(
-        folder.name, replace(session, warnings=tuple(dict.fromkeys(warnings))), narrator, voices, model_id, source_epub,
-        batch_size=_batch_size(settings, tts_id),
+        folder.name,
+        replace(session, warnings=tuple(dict.fromkeys(warnings)),
+                line_voices={slot: staged_voices[slot] for slot in manual_slots}),
+        narrator, voices, model_id, source_epub,
+        batch_size=_batch_size(settings, tts_id), named_voices=named_voices,
+        strictness=strictness.id if strictness else "", max_retries=max_retries,
+        auto_concat=auto_concat if type(auto_concat) is bool else True,
+        model_options=model_options,
     )
 
 
@@ -282,33 +325,67 @@ def _batch_size(settings: dict, tts_id: str) -> int:
     return min(value, PROJECT_BATCH_SIZE_MAX) if type(value) is int and value > 0 else 1
 
 
+def _model_options(settings: dict, catalog_id: str, model_id: str, warnings: list[str]) -> dict[str, dict[str, object]]:
+    if not model_id:
+        return {}
+    try:
+        stored = REGISTRY.reconcile(settings.get("model_settings"), settings)
+    except ValueError:
+        warnings.append("Review the speech model settings for this imported project.")
+        return {}
+    sections = stored.models.get(catalog_id, {})
+    overrides = {}
+    for option in model_options_for(catalog_id):
+        if option.key == "lora_target":
+            continue
+        binding = REGISTRY.get(catalog_id, option.key)
+        value = sections.get(binding.section, {}).get(binding.name)
+        if value is None:
+            continue
+        try:
+            validated = validate_model_options(catalog_id, {option.key: value})
+        except ValueError:
+            if option.key in {"target", "type", "model_code"}:
+                warnings.append("Choose a supported browser variant for the imported speech model.")
+            continue
+        if option.key in validated:
+            overrides[option.key] = validated[option.key]
+    return {model_id: overrides} if overrides else {}
+
+
 def _stage_voice(
-        folder: Path, staged: Path, voice: Voice, tts_id: str, copied: dict[Path, str], warnings: list[str],
+        folder: Path, staged: Path, voice: Voice, copied: dict[Path, str], warnings: list[str],
 ) -> RenderVoice:
     reference = None
     transcript = voice.transcript
-    if voice.crop is not None:
-        reference = _contained_file(folder, f"{PROJECT_VOICE_SUBDIR}/{VOICE_CROP_SUBDIR}/{voice.crop.file_name}")
-        if reference is not None:
-            transcript = voice.crop.transcript
-    if reference is None and voice.file_name:
+    trim_start, trim_end = 0.0, None
+    if voice.file_name:
         for candidate in (f"{PROJECT_VOICE_SUBDIR}/{voice.file_name}", voice.file_name):
             reference = _contained_file(folder, candidate)
             if reference is not None and reference.suffix.lower() in _AUDIO_SUFFIXES:
                 break
             reference = None
-    instructions = voice.instructions.get(tts_id, "")
-    if voice.presets.get(tts_id):
-        warnings.append("Console preset voices require a new voice selection in the browser.")
+    if voice.crop is not None:
+        transcript = voice.crop.transcript
+        if reference is not None:
+            trim_start, trim_end = voice.crop.start, voice.crop.end
+        else:
+            reference = _contained_file(folder, f"{PROJECT_VOICE_SUBDIR}/{VOICE_CROP_SUBDIR}/{voice.crop.file_name}")
+            if reference is not None:
+                warnings.append("Some console voices have cropped audio only. Their original clips are unavailable.")
     if reference is None:
         if voice.file_name or voice.crop is not None:
             warnings.append("Some console reference clips are unavailable inside the project folder.")
-        return RenderVoice(instructions=instructions)
-    if reference not in copied:
+    elif reference not in copied:
         destination = staged / f"console-voice-{len(copied)}{reference.suffix.lower()}"
         shutil.copyfile(reference, destination)
         copied[reference] = str(destination)
-    return RenderVoice(copied[reference], transcript, instructions)
+    return RenderVoice(
+        reference_path=copied.get(reference), transcript=transcript, name=voice.name,
+        trim_start=trim_start, trim_end=trim_end, pan=voice.pan, volume=voice.volume,
+        room_reverb=voice.room_reverb.id, model_instructions=tuple(voice.instructions.items()),
+        presets=tuple(voice.presets.items()),
+    )
 
 
 def _contained_file(folder: Path, relative: str) -> Path | None:

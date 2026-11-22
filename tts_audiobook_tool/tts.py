@@ -50,6 +50,9 @@ from tts_audiobook_tool.seed_util import resolve_max_random_seed
 from tts_audiobook_tool.util import *
 
 
+WEB_REMOTE_ENTRY_ID_ENV = "TTS_AUDIOBOOK_WEB_REMOTE_ENTRY_ID"
+
+
 class TtsRuntimeMode(Enum):
     LOCAL = "local"
     REMOTE_CLIENT = "remote_client"
@@ -1011,7 +1014,22 @@ class Tts:
                 issue = ReadinessIssue("Remote TTS server", snapshot.issue.message)
             else:
                 candidates = [pair for pair in snapshot.candidates if pair[0] == selected]
-                if selected.value.backend_kind is TtsBackendKind.AUDIO_CPP and project.audio_cpp_model_id:
+                required_entry = os.environ.get(WEB_REMOTE_ENTRY_ID_ENV)
+                if required_entry:
+                    # A web render worker must bind the exact advertised entry even
+                    # if a refreshed SGL-Omni server now offers one different alias.
+                    exact_pair = (selected, required_entry) in candidates
+                    unique_id = sum(model.get("id") == required_entry for model in snapshot.models) <= 1
+                    audio_cpp_match = (selected.value.backend_kind is not TtsBackendKind.AUDIO_CPP
+                                       or project.audio_cpp_model_id in ("", required_entry))
+                    if exact_pair and unique_id and audio_cpp_match:
+                        new_id = required_entry
+                    else:
+                        issue = TtsBindingIssue(
+                            "TTS model", "The selected remote server model is unavailable. Refresh its model list.",
+                            kind="entry_unavailable", status="unavailable",
+                        )
+                elif selected.value.backend_kind is TtsBackendKind.AUDIO_CPP and project.audio_cpp_model_id:
                     if (selected, project.audio_cpp_model_id) in candidates:
                         new_id = project.audio_cpp_model_id
                     else:
