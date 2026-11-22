@@ -28,6 +28,9 @@ from tts_audiobook_tool.web_projects import (
     load_project,
     save_project,
 )
+from tts_audiobook_tool.web_legacy_project import (
+    WebLegacyProjectError, list_console_projects, load_console_project,
+)
 from tts_audiobook_tool.web_models import (
     ModelRunError,
     installed_model_choices,
@@ -178,6 +181,11 @@ def build_app() -> gr.Blocks:
                                     label="Saved project", choices=[], interactive=True, scale=3
                                 )
                                 open_project = gr.Button("Open project", interactive=False)
+                            with gr.Row(visible=False) as console_projects_row:
+                                console_projects = gr.Dropdown(
+                                    label="Console project", choices=[], interactive=True, scale=3
+                                )
+                                copy_console = gr.Button("Copy from console")
                             with gr.Row():
                                 project_name = gr.Textbox(label="New project name", scale=3)
                                 save_new = gr.Button("Save new project", interactive=False)
@@ -365,36 +373,53 @@ def build_app() -> gr.Blocks:
             except WebProjectError as exc:
                 return gr.skip(), gr.skip(), gr.update(value=str(exc), visible=True)
 
-        def open_saved_project(project_id, previous):
+        def discover_console_projects():
+            choices = [(item.name, item.project_id) for item in list_console_projects()]
+            return gr.update(visible=bool(choices)), gr.update(
+                choices=choices, value=choices[0][1] if choices else None,
+            )
+
+        def open_project_snapshot(project_id, previous, *, from_console=False):
+            loaded = None
             try:
-                saved = load_project(project_id or "")
-                saved_source = epub.move_resource_to_block_cache(saved.source_epub)
-                saved_reference = reference.move_resource_to_block_cache(saved.narrator.reference_path)
-            except WebProjectError as exc:
+                if from_console:
+                    loaded = load_console_project(project_id or "", model_choices=model_choices)
+                    name, saved_id = loaded.name, None
+                else:
+                    loaded = load_project(project_id or "")
+                    name, saved_id = loaded.summary.name, loaded.summary.project_id
+                source = epub.move_resource_to_block_cache(loaded.source_epub)
+                voice_reference = reference.move_resource_to_block_cache(loaded.narrator.reference_path)
+            except (WebProjectError, WebLegacyProjectError) as exc:
                 message = str(exc)
             except Exception:
-                message = "Could not open the saved project."
+                message = "Could not open the project."
             else:
                 close_book_session(previous)
-                installed = saved.model_id in model_labels
-                message = f"Opened {saved.summary.name}."
+                installed = loaded.model_id in model_labels
+                message = f"Copied {name} from the console. Save it as a new browser project." if from_console else f"Opened {name}."
                 if not installed:
                     message += " Choose an installed speech model to generate audio."
                 return (
-                    *present_book(saved.session, saved.voices),
-                    saved.summary.project_id, gr.update(interactive=True), gr.update(interactive=True),
+                    *present_book(loaded.session, loaded.voices),
+                    saved_id, gr.update(interactive=True), gr.update(interactive=saved_id is not None),
                     gr.update(value=message, visible=True),
-                    saved_source,
-                    saved.session.book.segmentation_settings.language_code or "en",
-                    saved_reference, saved.narrator.transcript, saved.narrator.instructions,
-                    saved.model_id if installed else None,
-                    saved.validate_audio, saved.batch_size,
+                    source,
+                    loaded.session.book.segmentation_settings.language_code or "en",
+                    voice_reference, loaded.narrator.transcript, loaded.narrator.instructions,
+                    loaded.model_id if installed else None,
+                    loaded.validate_audio, loaded.batch_size, name,
                 )
+            if loaded is not None:
+                close_book_session(loaded.session)
             return (
                 *[gr.skip()] * (len(import_outputs) - 1),
                 gr.update(value=message, visible=True),
-                *[gr.skip()] * 8,
+                *[gr.skip()] * 9,
             )
+
+        def open_console_snapshot(project_id, previous):
+            return open_project_snapshot(project_id, previous, from_console=True)
 
         def store_project(
             operation, destination, session, voices, model, source, ref, transcription, direction, validate, batch,
@@ -432,14 +457,16 @@ def build_app() -> gr.Blocks:
             return store_project(save_project, destination, *values)
 
         app.load(list_saved_projects, outputs=[saved_projects, open_project, project_status], **PRIVATE_EVENT)
+        app.load(discover_console_projects, outputs=[console_projects_row, console_projects], **PRIVATE_EVENT)
+        opened_project_outputs = [
+            *import_outputs, epub, book_language, reference, transcript, instructions, book_model,
+            validate_audio, batch_size, project_name,
+        ]
         opened_project = open_project.click(
-            open_saved_project,
-            [saved_projects, book],
-            [
-                *import_outputs, epub, book_language, reference, transcript, instructions, book_model,
-                validate_audio, batch_size,
-            ],
-            **PRIVATE_EVENT,
+            open_project_snapshot, [saved_projects, book], opened_project_outputs, **PRIVATE_EVENT,
+        )
+        copied_console = copy_console.click(
+            open_console_snapshot, [console_projects, book], opened_project_outputs, **PRIVATE_EVENT,
         )
         persist_inputs = [
             book, cast, book_model, epub, reference, transcript, instructions, validate_audio, batch_size,
@@ -604,7 +631,7 @@ def build_app() -> gr.Blocks:
                 gr.update(value="Speaker assignment updated.", visible=True),
             )
 
-        for event in (replaced_upload, imported_book, opened_project):
+        for event in (replaced_upload, imported_book, opened_project, copied_console):
             event.then(
                 update_review_sections, [book], [review_panel, review_section],
                 show_progress="hidden", **PRIVATE_EVENT,
