@@ -12,6 +12,7 @@ from tts_audiobook_tool.constants_config import PROJECT_BATCH_SIZE_DEFAULT, PROJ
 from tts_audiobook_tool.l import L
 from tts_audiobook_tool.web_backend import (
     DEFAULT_OPENAI_MODEL,
+    DEFAULT_REASONING_EFFORT,
     BookSession,
     WebBackendError,
     attribute_dialog,
@@ -204,7 +205,7 @@ def build_app() -> gr.Blocks:
                             with gr.Row():
                                 llm_model = gr.Textbox(value=DEFAULT_OPENAI_MODEL, label="OpenAI model")
                                 effort = gr.Dropdown(
-                                    REASONING_EFFORTS, value="", label="Reasoning effort",
+                                    REASONING_EFFORTS, value=DEFAULT_REASONING_EFFORT, label="Reasoning effort",
                                     info="Available levels vary by OpenAI model.", interactive=True,
                                 )
                             with gr.Row():

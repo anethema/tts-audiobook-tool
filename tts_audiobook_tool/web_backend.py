@@ -31,6 +31,7 @@ from tts_audiobook_tool.text_ops.epub_extractor import EpubExtractor
 
 
 DEFAULT_OPENAI_MODEL = "gpt-6.1-terra"
+DEFAULT_REASONING_EFFORT = "low"
 _OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions"
 _REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 _FINISH_REASONS = ("stop", "length", "content_filter", "tool_calls", "function_call")
@@ -151,7 +152,11 @@ def character_rows(session: BookSession) -> list[CharacterRow]:
 
 
 def identify_characters(
-        session: BookSession, api_key: str, model: str = DEFAULT_OPENAI_MODEL, *, effort: str = "",
+        session: BookSession,
+        api_key: str,
+        model: str = DEFAULT_OPENAI_MODEL,
+        *,
+        effort: str = DEFAULT_REASONING_EFFORT,
 ) -> BookSession:
     api_key, prefs = _request_settings(api_key, model, effort)
     if not session.book.dialog_line_indices():
@@ -177,7 +182,7 @@ def attribute_dialog(
         api_key: str,
         model: str = DEFAULT_OPENAI_MODEL,
         *,
-        effort: str = "",
+        effort: str = DEFAULT_REASONING_EFFORT,
         on_progress: Callable[[int, int], None] | None = None,
 ) -> BookSession:
     if session.roster is None:

@@ -86,7 +86,7 @@ class TestWebBackend(unittest.TestCase):
             # Stop any accidental real requests by patching the Requests boundary.
             with patch.object(requests.Session, "post", autospec=True, side_effect=responses) as post:
                 with self.assertLogs(L.logger, logging.INFO) as logs:
-                    identified = web_backend.identify_characters(session, KEY, effort="low")
+                    identified = web_backend.identify_characters(session, KEY)
                     progress = []
                     partial = web_backend.attribute_dialog(
                         identified, KEY, on_progress=lambda done, total: progress.append((done, total)),
@@ -94,7 +94,7 @@ class TestWebBackend(unittest.TestCase):
                     self.assertEqual(progress, [(0, 2), (1, 2)])
                     self.assertIn("1 of 2", partial.attribution_notice)
                     self.assertIn("API key", partial.attribution_notice)
-                    complete = web_backend.attribute_dialog(partial, KEY)
+                    complete = web_backend.attribute_dialog(partial, KEY, "custom-model", effort="")
                     self.assertEqual(post.call_count, 4)
                     for call in post.call_args_list:
                         http, url = call.args
@@ -106,8 +106,13 @@ class TestWebBackend(unittest.TestCase):
                         self.assertNotIn("temperature", payload)
                         self.assertFalse(payload["store"])
                         self.assertNotIn(KEY, json.dumps(payload))
-                    self.assertEqual(post.call_args_list[0].kwargs["json"]["reasoning_effort"], "low")
-                    self.assertNotIn("reasoning_effort", post.call_args_list[1].kwargs["json"])
+                    for call in post.call_args_list[:3]:
+                        payload = call.kwargs["json"]
+                        self.assertEqual(payload["model"], "gpt-6.1-terra")
+                        self.assertEqual(payload["reasoning_effort"], "low")
+                    override_payload = post.call_args.kwargs["json"]
+                    self.assertEqual(override_payload["model"], "custom-model")
+                    self.assertNotIn("reasoning_effort", override_payload)
 
             self.assertEqual(len(complete.attributions.ranges), 2)
             self.assertEqual([(row.speaker_id, row.line_count) for row in web_backend.character_rows(complete)],
