@@ -1,0 +1,2 @@
+# Optional browser interface. Install into one of the app's model environments.
+gradio==6.17.3

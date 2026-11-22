@@ -51,6 +51,23 @@ It also includes a realtime audiobook playback mode and a voice chat feature, us
 The app uses a plain-text, hotkey-based console interface.
 
 
+### Gradio browser interface
+
+The fork adds a local browser interface. Install the normal dependencies for at least one speech model, then install Gradio into one environment to host the interface. The other model environments only need their usual dependencies.
+
+```bash
+uv pip install --python venv-breeze/bin/python -r requirements-gradio.txt
+venv-breeze/bin/python -m tts_audiobook_tool.gradio_app
+```
+
+Open http://127.0.0.1:7862 in your browser. The model picker discovers the same local environments as `launch.py`. Run a text sample with your reference audio or Breeze voice direction, then select multiple models to compare the same sample. The app runs model jobs one at a time on the GPU.
+
+Upload an EPUB and save a named project to keep the book, voice assignments, and generation settings across restarts. For casting, paste an OpenAI API key in the password field and run character identification and dialogue attribution. These actions send the imported book text to OpenAI and may use billed API credits. The key is sent with the request and is kept out of saved projects.
+
+Generate the audiobook and download the M4B when it finishes. The app can use Whisper to validate generated segments. To continue an interrupted job, reopen the saved project and run generation with the same book, model, voices, and generation settings. Completed segments are reused.
+
+The browser interface is in development. The console remains available for the remaining tools, including voice chat, realtime playback, detailed text editing, and advanced exports.
+
 ### How to create an audiobook (quick summary)
 
 1. Assign a working project directory.
