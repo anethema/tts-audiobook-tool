@@ -35,7 +35,14 @@ from tts_audiobook_tool.constants_config import (
     PROJECT_MAX_RETRIES_MIN,
     VOICE_CLONE_TRANSCRIBE_MIN_PROBABILITY,
 )
-from tts_audiobook_tool.generation_events import BookRenderTelemetry, GenerationProgress, GenerationTimedOut, ModelUnhealthy
+from tts_audiobook_tool.generation_events import (
+    BookRenderTelemetry,
+    GenerationPhase,
+    GenerationProgress,
+    GenerationStats,
+    GenerationTimedOut,
+    ModelUnhealthy,
+)
 from tts_audiobook_tool.l import L
 from tts_audiobook_tool.model_runtime import mark_interactive_main
 from tts_audiobook_tool.model_worker import ModelWorker, ModelWorkerUnavailable
@@ -57,6 +64,7 @@ from tts_audiobook_tool.state import State
 from tts_audiobook_tool.tts import Tts
 from tts_audiobook_tool.tts_models.model_spec import TtsBackendKind
 from tts_audiobook_tool.tts_models.tts_model_type import TtsModelType
+from tts_audiobook_tool.web_backend import UNIDENTIFIED_CAST_ROLES, canonical_cast_role
 from tts_audiobook_tool.web_runtime_settings import WebRuntimeSettings, WebRuntimeSettingsError
 
 if TYPE_CHECKING:
@@ -160,15 +168,19 @@ def get_local_model_label() -> str:
 
 
 def _validated_model_options(model_id: str, options: dict[str, object] | None) -> dict[str, object]:
-    if options is None or options == {}:
+    if model_id != "pocket_local" and (options is None or options == {}):
         return {}
 
-    from tts_audiobook_tool.web_model_options import validate_model_options
+    from tts_audiobook_tool.web_model_options import POCKET_DEFAULT_MODEL_CODE, validate_model_options
 
     try:
-        return validate_model_options(model_id, options)
+        validated = validate_model_options(model_id, options)
     except ValueError as error:
         raise WebRenderError(str(error)) from error
+    if model_id == "pocket_local":
+        # The native project requires a concrete code, including for the browser default.
+        validated.setdefault("model_code", POCKET_DEFAULT_MODEL_CODE)
+    return validated
 
 
 def _check_cancelled(cancel_event: threading.Event | None) -> None:
@@ -190,10 +202,16 @@ def _render_job(cancel_event: threading.Event | None) -> Iterator[None]:
         _render_lock.release()
 
 
-def _build_voice(project: Project, index: int, settings: RenderVoice) -> Voice:
+def _voice_label(index: int, name: str) -> str:
+    name = " ".join(name.split())
+    return f'Voice "{name}"' if name else f"Voice {index + 1}"
+
+
+def _build_voice(project: Project, index: int, settings: RenderVoice, *, label: str | None = None) -> Voice:
     from tts_audiobook_tool.sound.sound_file_util import SoundFileUtil
     from tts_audiobook_tool.sound.sound_pipeline import SoundPipeline
 
+    label = label or _voice_label(index, settings.name)
     support = Tts.get_model_support(project)
     model_id = project.tts_model_type
     presets = dict(settings.presets)
@@ -205,7 +223,7 @@ def _build_voice(project: Project, index: int, settings: RenderVoice) -> Voice:
         if known_presets:
             normalized = active_preset.casefold()
             if normalized not in known_presets:
-                raise WebRenderError(f"Choose a built-in voice for voice {index + 1} in the selected model.")
+                raise WebRenderError(f"{label} needs a built-in voice from the selected model.")
             presets[model_id] = normalized
     instructions_by_model = {model: text.strip() for model, text in settings.model_instructions}
     if support.can_instructions(project):
@@ -218,18 +236,18 @@ def _build_voice(project: Project, index: int, settings: RenderVoice) -> Voice:
     if settings.reference_path and not active_preset and support.can_voice_clone(project):
         sound = _load_reference_audio(
             settings.reference_path, settings.trim_start, settings.trim_end,
-            label=f"Voice {index + 1} reference audio",
+            label=f"{label} reference audio",
         )
         sound = SoundPipeline.apply_voice_clone_post_processing(sound, max_silence_gap=settings.max_reference_silence)
         if not sound.data.size:
-            raise WebRenderError(f"Voice {index + 1} reference audio contains no audible sound.")
+            raise WebRenderError(f"{label} reference audio contains no audible sound.")
         voice_dir = Path(ProjectVoiceUtil.get_voice_dir_path(project))
         voice_dir.mkdir(exist_ok=True)
         file_name = f"voice-{index + 1}.flac"
         error = SoundFileUtil.save_flac(sound, str(voice_dir / file_name))
         if error:
             L.w(error)
-            raise WebRenderError(f"Voice {index + 1} reference audio could not be prepared.")
+            raise WebRenderError(f"{label} reference audio could not be prepared.")
     return Voice(
         file_name=file_name,
         transcript=settings.transcript.strip() if file_name else "",
@@ -258,9 +276,12 @@ def _project_state(
     max_retries: int = PROJECT_MAX_RETRIES_DEFAULT,
     runtime_settings: WebRuntimeSettings = WebRuntimeSettings(),
     remote_selection: RemoteTtsSelection | None = None,
+    voice_labels: list[str] | None = None,
+    on_console: Callable[[str], None] | None = None,
 ) -> Iterator[State]:
     from tts_audiobook_tool.menus.voice.voice_menu_shared import VoiceMenuShared
 
+    labels = voice_labels or [_voice_label(index, voice.name) for index, voice in enumerate(voices)]
     project = None
     try:
         if (project_dir / PROJECT_JSON_FILE_NAME).is_file():
@@ -287,7 +308,7 @@ def _project_state(
             if book is not None:
                 project.book = book
             project.voice_references = [
-                _build_voice(project, index, voice) for index, voice in enumerate(voices)
+                _build_voice(project, index, voice, label=labels[index]) for index, voice in enumerate(voices)
             ]
             if book is not None and (error := ProjectTextIOUtil.save_book(project)):
                 L.w(error)
@@ -315,12 +336,36 @@ def _project_state(
             indices = range(len(book.phrase_groups)) if generation_indices is None else generation_indices
             voice_indices = {book.phrase_groups[index].voice_index or 0 for index in indices}
         if problems := VoiceMenuShared.get_voice_problems(state, voice_indices=voice_indices):
-            raise WebRenderError(problems[0])
+            raise WebRenderError(_describe_voice_problem(project, problems[0], voice_indices, labels))
+        if on_console is not None:
+            on_console("Voice reference checks passed.\n")
         yield state
     finally:
         if project is not None:
             project.kill()
             project.sound_segments.observer.join()
+
+
+def _describe_voice_problem(project: Project, problem: str, indices: set[int], labels: list[str]) -> str:
+    for index in sorted(indices):
+        if not 0 <= index < len(labels):
+            continue
+        label = labels[index]
+        numbered_label = f"Voice {index + 1} "
+        if problem.startswith(numbered_label):
+            return f"{label} {problem[len(numbered_label):]}"
+        if index >= len(project.voice_references):
+            continue
+        voice = project.voice_references[index]
+        file_label = (
+            f"Trimmed voice file for {voice.file_name}" if voice.crop is not None else f"Voice file {voice.file_name}"
+        )
+        if voice.file_name and problem.startswith(f"{file_label} "):
+            detail = problem[len(file_label) + 1:]
+            if detail == "has no transcript":
+                return f"{label} is missing its reference transcript. Add the transcript and save the voice assignment."
+            return f"{label} reference audio {detail}."
+    return problem
 
 
 def _wait_for_job(
@@ -329,10 +374,19 @@ def _wait_for_job(
     cancel_event: threading.Event | None,
     on_progress: Callable[[GenerationProgress], None] | None = None,
     *,
+    on_stats: Callable[[GenerationStats], None] | None = None,
     transcript: GenerationTranscript | None = None,
     on_console: Callable[[str], None] | None = None,
 ) -> GenerationFinished | TtsPreviewFinished:
     cancellation_deadline = None
+    reported_phases: set[str] = set()
+
+    def relay_output(event: ConsoleOutput) -> None:
+        if transcript is not None:
+            transcript.write_chunk(event.text, event.stream)
+        if on_console is not None:
+            on_console(event.text)
+
     try:
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -346,11 +400,15 @@ def _wait_for_job(
             if getattr(event, "operation_id", None) != operation_id:
                 continue
             if isinstance(event, ConsoleOutput):
-                if transcript is not None:
-                    transcript.write_chunk(event.text, event.stream)
-                if on_console is not None:
-                    on_console(event.text)
+                relay_output(event)
             if isinstance(event, result_type):
+                if isinstance(event, GenerationFinished) and (on_console is not None or transcript is not None):
+                    from tts_audiobook_tool.textual.worker_session import FINAL_OUTPUT_SETTLE_SECONDS
+
+                    time.sleep(FINAL_OUTPUT_SETTLE_SECONDS)
+                    for trailing in ModelWorker.drain_events():
+                        if isinstance(trailing, ConsoleOutput) and trailing.operation_id == operation_id:
+                            relay_output(trailing)
                 _check_cancelled(cancel_event)
                 if event.status is GenerationTerminalStatus.COMPLETED:
                     return event
@@ -371,8 +429,13 @@ def _wait_for_job(
                 if isinstance(update, ModelUnhealthy):
                     L.w(update.reason)
                     raise WebRenderError("The model could not continue rendering.")
+                if on_console is not None and isinstance(update, GenerationPhase) and update.label not in reported_phases:
+                    reported_phases.add(update.label)
+                    on_console(f"{update.label}\n")
                 if on_progress is not None and isinstance(update, GenerationProgress):
                     on_progress(update)
+                if on_stats is not None and isinstance(update, GenerationStats):
+                    on_stats(update)
     finally:
         if ModelWorker.is_busy():
             # End a hung or cancelled job before removing its temporary project.
@@ -536,21 +599,38 @@ def transcribe_reference(
 def _cast_book(session: BookSession, voices: dict[str, RenderVoice]) -> tuple[Book, list[RenderVoice]]:
     narrator = session.roster.narrator if session.roster else None
     narrator_id = narrator.id if narrator else _NARRATOR
-    narrator_voice = voices.get(narrator_id, voices.get(_NARRATOR, RenderVoice()))
+    default_voice = RenderVoice()
+    narrator_voice = voices.get(narrator_id, voices.get(_NARRATOR, default_voice))
     speakers = session.attributions.speaker_of_each_line(session.book)
     book = deepcopy(session.book)
     references = [narrator_voice]
     voice_indices = {narrator_voice: 0}
     for index, group in enumerate(book.phrase_groups):
-        speaker = speakers.get(index, narrator_id)
         settings = session.line_voices.get(group.voice_index) if group.voice_index > 0 else None
         if settings is None:
-            settings = voices.get(speaker, narrator_voice)
+            speaker = canonical_cast_role(speakers.get(index, narrator_id))
+            settings = voices.get(speaker, default_voice)
+            if settings == default_voice:
+                settings = narrator_voice
         if settings not in voice_indices:
             voice_indices[settings] = len(references)
             references.append(settings)
         group.voice_index = voice_indices[settings]
     return book, references
+
+
+def _cast_voice_labels(session: BookSession, cast: dict[str, RenderVoice], references: list[RenderVoice]) -> list[str]:
+    characters = session.roster.characters if session.roster else ()
+    character_names = {character.id: character.name for character in characters}
+    character_names.update(UNIDENTIFIED_CAST_ROLES)
+    roles_by_voice: dict[RenderVoice, list[str]] = {}
+    for role, voice in cast.items():
+        roles_by_voice.setdefault(voice, []).append(character_names.get(canonical_cast_role(role), role))
+    labels = []
+    for index, voice in enumerate(references):
+        fallback = "Narrator" if index == 0 else " / ".join(roles_by_voice.get(voice, ()))
+        labels.append(_voice_label(index, voice.name.strip() or fallback))
+    return labels
 
 
 def _checkpoint_id(
@@ -567,6 +647,7 @@ def _checkpoint_id(
     max_retries: int = PROJECT_MAX_RETRIES_DEFAULT,
     runtime_settings: WebRuntimeSettings | None = None,
     remote_selection: RemoteTtsSelection | None = None,
+    voice_labels: list[str] | None = None,
 ) -> str:
     voice_settings = []
     defaults = asdict(RenderVoice())
@@ -581,7 +662,8 @@ def _checkpoint_id(
                 with Path(voice.reference_path).open("rb") as clip:
                     clip_digest = hashlib.file_digest(clip, "sha256").hexdigest()
             except OSError as error:
-                raise WebRenderError(f"Voice {index + 1} reference audio is unavailable.") from error
+                label = voice_labels[index] if voice_labels is not None else _voice_label(index, voice.name)
+                raise WebRenderError(f"{label} reference audio is unavailable.") from error
         settings = asdict(voice)
         del settings["reference_path"]
         voice_key = [clip_digest, settings.pop("transcript").strip(), settings.pop("instructions").strip()]
@@ -696,11 +778,25 @@ def render_book(
             batch_size = 1
         book, references = _cast_book(session, voices)
         language_code = session.language_code if language_code is None else language_code
+        voice_labels = _cast_voice_labels(session, voices, references)
+        if on_console is not None:
+            on_console(f"Audiobook lines {first_line}–{last_line} of {line_count} (inclusive). Batch size {batch_size}.\n")
+            validation = "off"
+            if validate_audio:
+                variant = runtime_settings.whisper_variant or SttVariant.get_default().id
+                device = runtime_settings.whisper_device or "automatic device"
+                validation = f"on ({variant}, {device})"
+            effective_tolerance = tolerance or Strictness.get_recommended_default(language_code)
+            on_console(
+                f"Whisper validation {validation}. "
+                f"Word error tolerance {effective_tolerance.label.lower()}. Max retries {max_retries}.\n"
+            )
         checkpoint = _checkpoint_id(
             book, references, model.id, language_code, validate_audio, batch_size, model_options=options,
             word_substitutions=session.word_substitutions, strictness=tolerance, max_retries=max_retries,
             runtime_settings=runtime_settings,
             remote_selection=remote_selection,
+            voice_labels=voice_labels,
         )
         work = Path(session.project_dir) / "renders" / checkpoint
         work.mkdir(parents=True, exist_ok=True)
@@ -715,6 +811,7 @@ def render_book(
                     auto_concat=auto_concat, strictness=tolerance, max_retries=max_retries,
                     runtime_settings=runtime_settings,
                     remote_selection=remote_selection,
+                    voice_labels=voice_labels,
                     on_console=on_console,
                 )
         except Timeout as error:
@@ -741,36 +838,55 @@ def _render_book_checkpoint(
     strictness: Strictness | None,
     max_retries: int,
     runtime_settings: WebRuntimeSettings,
+    voice_labels: list[str],
     remote_selection: RemoteTtsSelection | None = None,
     on_console: Callable[[str], None] | None = None,
 ) -> str | None:
     _check_cancelled(cancel_event)
     total = len(selected)
-    speed_multiplier = None
+    processed = 0
+    synthesis_seconds = 0.0
+    audio_seconds = 0.0
+    eta_seconds = None
     previous_telemetry = None
 
-    def report_progress(processed: int) -> None:
+    def report_telemetry() -> None:
         nonlocal previous_telemetry
-        if on_progress is not None:
-            on_progress(processed, total)
         if on_telemetry is not None:
-            telemetry = BookRenderTelemetry(processed, total, speed_multiplier)
+            rate = audio_seconds / synthesis_seconds if synthesis_seconds else None
+            telemetry = BookRenderTelemetry(processed, total, rate, eta_seconds if processed < total else None)
             if telemetry != previous_telemetry:
                 on_telemetry(telemetry)
                 previous_telemetry = telemetry
 
+    def report_progress(completed: int) -> None:
+        nonlocal processed
+        processed = completed
+        if on_progress is not None:
+            on_progress(processed, total)
+        report_telemetry()
+
     output = work / "audiobook.abr.m4b"
     if auto_concat and not regenerate and _automatic_export_matches(output, runtime_settings.aac_bitrate):
+        if on_console is not None:
+            on_console("Reusing the completed M4B export. No segments need rendering.\n")
         report_progress(total)
         return str(output)
 
+    if on_console is not None:
+        voice_indices = {book.phrase_groups[index].voice_index or 0 for index in selected}
+        checked_voices = ", ".join(voice_labels[index] for index in sorted(voice_indices))
+        on_console(f"Checking voice references for the selected lines ({checked_voices}).\n")
     with _project_state(
         work, language_code, references, book, model=model, model_options=model_options, validate_audio=validate_audio,
         word_substitutions=word_substitutions, generation_indices=selected, strictness=strictness,
         max_retries=max_retries, runtime_settings=runtime_settings,
         remote_selection=remote_selection,
+        voice_labels=voice_labels, on_console=on_console,
     ) as state:
         remaining = selected if regenerate else _missing_segments(state.project, selected)
+        if on_console is not None:
+            on_console(f"Selected segments include {total - len(remaining)} reused and {len(remaining)} to render.\n")
         report_progress(total - len(remaining))
         _check_cancelled(cancel_event)
         if remaining:
@@ -780,21 +896,30 @@ def _render_book_checkpoint(
                 raise WebRenderError(str(error)) from error
 
             def report_generation_progress(update: GenerationProgress) -> None:
-                nonlocal speed_multiplier
-                speed_multiplier = update.speed_multiplier
+                nonlocal eta_seconds
+                eta_seconds = update.eta_seconds
                 report_progress(total - update.total + update.processed)
+
+            def report_generation_stats(update: GenerationStats) -> None:
+                nonlocal synthesis_seconds, audio_seconds
+                if update.generation_seconds > 0 and update.audio_seconds > 0:
+                    synthesis_seconds += update.generation_seconds
+                    audio_seconds += update.audio_seconds
+                    report_telemetry()
 
             staging = tempfile.TemporaryDirectory(dir=work, prefix=".regeneration-") if regenerate else nullcontext("")
             with staging as staging_dir, _generation_log(work, state.prefs.save_gen_log) as transcript:
                 try:
                     operation_id = ModelWorker.submit_generation(
                         state=state, indices=remaining, batch_size=batch_size, is_regen=regenerate, staging_dir=staging_dir,
+                        suppress_validation_passes=True,
                     )
                 except ModelWorkerUnavailable as error:
                     L.w(str(error))
                     raise WebRenderError("The model worker could not start.") from error
                 _wait_for_job(
                     operation_id, GenerationFinished, cancel_event, report_generation_progress,
+                    on_stats=report_generation_stats if on_telemetry is not None else None,
                     transcript=transcript, on_console=on_console,
                 )
                 _check_cancelled(cancel_event)
@@ -804,11 +929,21 @@ def _render_book_checkpoint(
                     raise WebRenderError(
                         f"The model did not produce audio for {len(missing)} of {total} text segments."
                     )
+            if on_console is not None:
+                on_console("Generation completed.\n")
             report_progress(total)
 
         _check_cancelled(cancel_event)
-        if not auto_concat or _missing_segments(state.project, set(range(len(book.phrase_groups))) - selected):
+        if not auto_concat:
+            if on_console is not None:
+                on_console("Automatic export is off.\n")
             return None
+        if unrendered := _missing_segments(state.project, set(range(len(book.phrase_groups))) - selected):
+            if on_console is not None:
+                on_console(f"Automatic export pending. {len(unrendered)} segments elsewhere in the book need audio.\n")
+            return None
+        if on_console is not None:
+            on_console("Proceeding to concatenation...\n")
         return _export_checkpoint(state, output, len(book.phrase_groups), cancel_event)
 
 

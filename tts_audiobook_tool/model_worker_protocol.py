@@ -73,6 +73,7 @@ class GenerateCommand:
     # When set, output goes here for review instead of the project's segments
     # directory, and the project's generation range is left untouched.
     staging_dir: str = ""
+    suppress_validation_passes: bool = False
 
 
 @dataclass(frozen=True)

@@ -64,6 +64,26 @@ def load_voice(voice_id: str, *, root: str | os.PathLike[str] | None = None) -> 
     return SavedVoice(record.summary, voice)
 
 
+def matching_voice_id(voice: RenderVoice, *, root: str | os.PathLike[str] | None = None) -> str | None:
+    """Find a library entry equal to a voice snapshot, including its reference clip."""
+    try:
+        if voice.reference_path is not None:
+            path = Path(voice.reference_path)
+            if not _CLIP_NAME.fullmatch(path.name) or path.is_symlink() or not path.is_file():
+                return None
+            # The library and saved projects both store clips by content under different roots.
+            voice = replace(voice, reference_path=path.name)
+        directory = _library_root(root)
+        for record in _read_index(directory):
+            if record.voice == voice:
+                if voice.reference_path is not None:
+                    _read_clip(directory / "clips", voice.reference_path)
+                return record.voice_id
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 def create_voice(
         voice: RenderVoice, *, root: str | os.PathLike[str] | None = None,
         upload_root: str | os.PathLike[str] | None = None,

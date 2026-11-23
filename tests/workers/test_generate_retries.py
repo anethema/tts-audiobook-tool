@@ -2,13 +2,19 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock, call, patch
 
+import numpy as np
+import pytest
+
 from tts_audiobook_tool import generate_util
+from tts_audiobook_tool.app_types import Sound
 from tts_audiobook_tool.app_types.phrase import Phrase, PhraseGroup, Reason
+from tts_audiobook_tool.app_types.validation_findings import ValidationFindings
+from tts_audiobook_tool.app_types.validation_result import WordErrorResult
 from tts_audiobook_tool.generate_util import GenerateUtil
 from tts_audiobook_tool.state import State
 from tts_audiobook_tool.tts_models.tts_model_type import TtsModelType
 
-from generate_files_test_support import StubValidationResult, generate_files_mock_stack
+from generate_files_test_support import StubValidationResult, generate_files_mock_stack, make_generate_state
 
 
 def test_batch_heading_can_omit_the_leading_divider(monkeypatch) -> None:
@@ -21,6 +27,48 @@ def test_batch_heading_can_omit_the_leading_divider(monkeypatch) -> None:
     assert "Processing line 1" in output[0]
     assert output[1] == ""
     assert not any("---" in line for line in output)
+
+
+@pytest.mark.parametrize("quiet", (True, False))
+def test_routine_validation_pass_output_is_optional(monkeypatch, quiet: bool) -> None:
+    output: list[str] = []
+    monkeypatch.setattr(generate_util, "printt", lambda text="": output.append(text))
+    monkeypatch.setattr(generate_util, "print_accent_separator", output.append)
+    state = make_generate_state(num_groups=4, max_retries=1)
+    sound = Sound(np.zeros(8, dtype=np.float32), 24000)
+    passed = WordErrorResult(sound, [], num_words=3, threshold=0)
+    failed = WordErrorResult(sound, [], num_words=3, threshold=0, findings=ValidationFindings(["missing word"]))
+    warning = WordErrorResult(sound, [], num_words=3, threshold=1, findings=ValidationFindings(possible_truncation=True))
+    results = iter([passed, failed, passed, passed, warning])
+    transcripts = generate_util.SegmentTranscriptUtil
+    options = {"suppress_validation_passes": True} if quiet else {}
+
+    with (
+        generate_files_mock_stack(lambda **_: [next(results)]),
+        patch.object(transcripts, "from_validation_result", side_effect=lambda **kwargs: f"STT line {kwargs['index'] + 1}"),
+        patch.object(transcripts, "make_stt_details_lines", side_effect=lambda info, **_: [info]),
+    ):
+        save = cast(MagicMock, GenerateUtil.save_sound_and_timing_json)
+
+        def save_segment(_state, _group, index, _result, **_):
+            return ("disk full" if index == 2 else "", "saved.wav")
+
+        save.side_effect = save_segment
+        assert not GenerateUtil.generate_files(state, {0, 1, 2, 3}, batch_size=1, is_regen=False, **options)
+        assert [item.kwargs["stt_info"] for item in save.call_args_list] == [
+            "STT line 1", "STT line 2", "STT line 2", "STT line 3", "STT line 4",
+        ]
+
+    console = "\n".join(output)
+    assert ("STT line 1" in console) is not quiet
+    assert ("Line 1:" in console) is not quiet
+    assert console.count("STT line 2") == 2
+    assert "Word error fail" in console and "will retry" in console
+    assert "Passed on retry" in console
+    assert "Couldn't save file: disk full" in console
+    assert "last word may be truncated" in console
+    assert "Processing line 1" in console
+    assert "Elapsed:" in console and "Lines saved:" in console
 
 
 def test_clean_quick_generation_retries_then_omits_metrics_summary(monkeypatch) -> None:

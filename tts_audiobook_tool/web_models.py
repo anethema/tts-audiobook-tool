@@ -114,6 +114,7 @@ def render_model_book(
         model_id,
         dict(
             action="book",
+            include_progress_eta=True,
             book=book_to_project_text_json_dict(session.book),
             project_dir=session.project_dir,
             roster=session.roster.to_dict() if session.roster else None,
@@ -302,7 +303,11 @@ def _worker(directory: Path) -> None:
             )
 
             def report(telemetry: BookRenderTelemetry) -> None:
-                _write_json(directory / "progress.json", asdict(telemetry))
+                snapshot = asdict(telemetry)
+                if not payload.get("include_progress_eta"):
+                    # An already running browser server may use the old telemetry schema.
+                    snapshot.pop("eta_seconds", None)
+                _write_json(directory / "progress.json", snapshot)
 
             voices = {name: RenderVoice(**voice) for name, voice in payload["voices"].items()}
             output = render_book(

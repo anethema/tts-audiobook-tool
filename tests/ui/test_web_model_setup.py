@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import os
 from pathlib import Path
 import shutil
@@ -91,9 +92,14 @@ class TestModelInstallation(unittest.TestCase):
 
     def test_publishes_only_after_verification_and_checkpoint(self):
         progress = []
+
+        def record_progress(update):
+            self.assertEqual(self.link.is_symlink(), update.completed == update.total)
+            progress.append(update)
+
         with patch.object(setup, "_run_step", side_effect=self._record_step):
             with patch.object(setup, "_qualified", return_value=True) as qualified:
-                result = setup.install_model("venv-breeze", on_progress=progress.append)
+                result = setup.install_model("venv-breeze", on_progress=record_progress)
         self.assertEqual(result, self.link)
         self.assertEqual(self.link.resolve(), self.stage)
         self.assertEqual(self.stage.parent, self.private)
@@ -107,8 +113,48 @@ class TestModelInstallation(unittest.TestCase):
         self.assertEqual(self.steps[2][-6:-2], ["--only-binary", "av", "--only-binary", "soundfile"])
         self.assertEqual(self.steps[4][-2:], ["3.12", "2.8.0+cu126"])
         self.assertEqual(self.steps[-1][-2], "BreezeBlue/Breeze-TTS-2")
-        self.assertEqual(len(progress), len(self.steps))
+        total = len(self.steps) + 1
+        self.assertEqual([(item.completed, item.total) for item in progress], [(i, total) for i in range(total + 1)])
+        self.assertIn("Download", progress[-3].stage)
+        self.assertIn("Publish", progress[-2].stage)
         self.assertEqual(qualified.call_args.args[0], self.stage)
+
+    def test_recipe_counts_access_check_and_each_checkpoint(self):
+        profile = next(item for item in setup.model_profiles() if item.model_id == "venv-breeze")
+        checkpoint = replace(profile.checkpoints[0], repo_id="example/second-checkpoint")
+        profile = replace(profile, gated_repo="example/gated", checkpoints=(*profile.checkpoints, checkpoint))
+        progress = []
+        with (
+            patch.dict(setup._BY_MODEL_ID, {profile.model_id: profile}),
+            patch.object(setup, "_run_step", side_effect=self._record_step),
+            patch.object(setup, "_qualified", return_value=True),
+        ):
+            setup.install_model(profile.model_id, on_progress=progress.append)
+
+        total = len(self.steps) + 1
+        self.assertEqual([(item.completed, item.total) for item in progress], [(i, total) for i in range(total + 1)])
+        self.assertIn("example/gated", progress[0].stage)
+        self.assertIn(checkpoint.repo_id, progress[-3].stage)
+
+    def test_cancellation_before_publication_does_not_report_completion(self):
+        cancelled = Event()
+        progress = []
+
+        def record_progress(update):
+            progress.append(update)
+            if update.stage.startswith("Publish"):
+                cancelled.set()
+
+        with (
+            patch.object(setup, "_run_step", side_effect=self._record_step),
+            patch.object(setup, "_qualified", return_value=True),
+        ):
+            with self.assertRaisesRegex(setup.WebModelSetupError, "stopped"):
+                setup.install_model("venv-breeze", on_progress=record_progress, cancel_event=cancelled)
+
+        self.assertEqual(progress[-1].completed, progress[-1].total - 1)
+        self.assertFalse(self.link.exists())
+        self.assertFalse(self.stage.exists())
 
     def test_failed_qualification_cleans_stage_and_allows_retry(self):
         with patch.object(setup, "_run_step", side_effect=self._record_step):
@@ -157,14 +203,18 @@ class TestModelInstallation(unittest.TestCase):
         self.assertEqual(staged_manifests, [(marker / "pyproject.toml").read_bytes()] * 2)
         self.assertFalse((self.stage / ".remote-client-marker").exists())
         self.assertFalse((self.stage / ".upstream-requirements.txt").exists())
-        self.assertEqual(len(progress), 8)
+        self.assertEqual([item.completed for item in progress], [*range(4), *range(6)])
+        self.assertTrue(all(item.total == 5 for item in progress))
         self.assertTrue(all("snapshot_download" not in " ".join(step) for step in self.steps))
         self.assertEqual(self.steps[-1][-1], "3.12")
 
     def test_remote_install_reuses_an_existing_marked_environment(self):
         existing = self.repo / "venv-client" / "bin" / "python"
+        progress = []
         with patch.object(setup, "remote_client_python", return_value=existing):
-            self.assertEqual(setup.install_remote_client(), existing.parent.parent)
+            self.assertEqual(setup.install_remote_client(on_progress=progress.append), existing.parent.parent)
+        self.assertEqual(len(progress), 1)
+        self.assertEqual(progress[0].completed, progress[0].total)
         self.find_uv.assert_not_called()
         self.assertFalse(self.private.exists())
 

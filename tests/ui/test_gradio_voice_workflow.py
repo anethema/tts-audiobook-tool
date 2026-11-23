@@ -14,7 +14,9 @@ from tts_audiobook_tool import gradio_app, web_projects, web_voice_panel, web_vo
 from tts_audiobook_tool.app_types import Book, BookSection, RoomReverb
 from tts_audiobook_tool.app_types.phrase import Phrase, PhraseGroup, Reason
 from tts_audiobook_tool.generation_events import BookRenderTelemetry
+from tts_audiobook_tool.speaker_assign.attribution import AttributionsFile, RangeAttribution, UtteranceAttribution
 from tts_audiobook_tool.speaker_assign.roster import Roster, RosterCharacter
+from tts_audiobook_tool.speaker_assign.utterance_util import UtteranceUtil
 from tts_audiobook_tool.web_backend import BookSession
 from tts_audiobook_tool.web_models import ModelRunError
 from tts_audiobook_tool.web_render import RenderVoice
@@ -86,6 +88,19 @@ def test_live_console_and_overall_audio_speed_update_before_render_finishes(tmp_
     generate = ui.event("generate_audiobook")
     refresh = ui.event("refresh_activity")
     assert refresh.queue is False
+    workspace_row = next(
+        node for node in ui.app.config["layout"]["children"]
+        if any(
+            getattr(ui.app.blocks[child["id"]], "elem_id", None) == "voice-settings"
+            for child in node.get("children", [])
+        )
+    )
+    _, workspace = workspace_row["children"]
+    tabs, console_form, *_ = workspace["children"]
+    console = refresh.outputs[0]
+    assert isinstance(ui.app.blocks[tabs["id"]], gr.Tabs)
+    assert console._id in {node["id"] for node in console_form["children"]}
+    assert console.visible and console.label and console.placeholder
     book = Book([BookSection([PhraseGroup([Phrase(f"Line {i}.", Reason.SENTENCE)]) for i in range(4)])])
     ui.state[generate.inputs[0]._id] = BookSession(book, str(tmp_path))
 
@@ -186,11 +201,12 @@ def test_library_selection_reaches_samples_cast_and_saved_project(tmp_path, monk
     monkeypatch.setattr(web_voice_panel, "list_voices", partial(web_voices.list_voices, root=voice_root))
     monkeypatch.setattr(web_voice_panel, "load_voice", partial(web_voices.load_voice, root=voice_root))
     monkeypatch.setattr(gradio_app, "load_voice", partial(web_voices.load_voice, root=voice_root))
+    monkeypatch.setattr(gradio_app, "matching_voice_id", partial(web_voices.matching_voice_id, root=voice_root))
     for method in ("create_project", "list_projects", "load_project"):
         monkeypatch.setattr(gradio_app, method, partial(getattr(web_projects, method), root=project_root))
 
     narrator = RenderVoice(
-        reference["path"], "Edited reference.", name="Narrator", trim_start=0.1, trim_end=0.8,
+        reference["path"], "Edited reference.", name="Library narrator", trim_start=0.1, trim_end=0.8,
         pan=-0.45, volume=85, room_reverb=RoomReverb.SMALL_DRR22.id,
         model_instructions=(("breeze_tts_2_local", "Read gently."), ("future_model", "Keep this instruction.")),
         presets=(("qwen3tts_local", "vivian"), ("pocket_local", "alba"), ("future_model", "future-speech")),
@@ -199,18 +215,42 @@ def test_library_selection_reaches_samples_cast_and_saved_project(tmp_path, monk
     actor = replace(narrator, name="Rue voice", pan=0.4)
     saved_narrator = web_voices.create_voice(narrator, root=voice_root, upload_root=upload_dir)
     saved_actor = web_voices.create_voice(actor, root=voice_root, upload_root=upload_dir)
-    book = Book([BookSection([PhraseGroup([Phrase("Hello, Rue.", Reason.SECTION_BREAK)])])])
-    session = BookSession(book, str(tmp_path), roster=Roster((RosterCharacter("RUE", "Rue"),)))
+    book = Book([BookSection([
+        PhraseGroup([Phrase("Hello, Aya.", Reason.PARAGRAPH)], is_dialog=True),
+        PhraseGroup([Phrase("Time to go.", Reason.PARAGRAPH)], is_dialog=True),
+        PhraseGroup([Phrase("I'll be right there.", Reason.SECTION_BREAK)], is_dialog=True),
+    ])])
+    session = BookSession(book, str(tmp_path))
+    roster = Roster((RosterCharacter("AYA", "Aya", is_narrator=True), RosterCharacter("RUE", "Rue"), RosterCharacter("MINA", "Mina")))
+    unidentified_female = "OTHER:unidentified female"
+    unidentified_male = "OTHER:unidentified male"
     epub = upload_dir / "book.epub"
     epub.write_bytes(b"test EPUB")
     monkeypatch.setattr(gradio_app.TextImportPanel, "import_book", staticmethod(lambda *_: session))
+    monkeypatch.setattr(gradio_app, "identify_characters", lambda session, *_args, **_kwargs: replace(session, roster=roster))
     rendered = []
+    attributions = []
+    rendered_books = []
+
+    def assign_dialogue(session, *_args, on_progress, **_kwargs):
+        attributions.append(session)
+        on_progress(1, 1)
+        assigned_range = RangeAttribution(0, 3, UtteranceUtil.range_text_hash(book, 0, 3), (
+            UtteranceAttribution((0,), "RUE"), UtteranceAttribution((1,), "MINA"),
+            UtteranceAttribution((2,), unidentified_female),
+        ))
+        return replace(session, attributions=AttributionsFile((assigned_range,)))
 
     def render_sample(model, text, voice, **kwargs):
         rendered.append(voice)
         return reference["path"]
 
+    def render_book(model, session, voices, **kwargs):
+        rendered_books.append(voices)
+
+    monkeypatch.setattr(gradio_app, "attribute_dialog", assign_dialogue)
     monkeypatch.setattr(gradio_app, "render_model_sample", render_sample)
+    monkeypatch.setattr(gradio_app, "render_model_book", render_book)
     monkeypatch.setattr(
         web_voice_panel, "transcribe_model_reference", lambda *_args, **_kw: pytest.fail("New media is required."),
     )
@@ -218,18 +258,91 @@ def test_library_selection_reaches_samples_cast_and_saved_project(tmp_path, monk
 
     async def exercise():
         await ui.run(ui.event("refresh_library"))
-        await ui.run(ui.event("select_voice"), saved_narrator.voice_id, None)
+        select = ui.event("select_voice")
+        await ui.run(select, saved_actor.voice_id, None)
         compare = ui.event("compare_samples")
         await ui.run(compare, ["venv-breeze"], "A preview.", "en", *[ui.values[c._id] for c in compare.inputs[3:]])
-        assert rendered == [replace(narrator, reference_path=rendered[0].reference_path)]
+        assert rendered == [replace(actor, reference_path=rendered[0].reference_path)]
 
         load = ui.event("load_book")
         fields = [ui.values[component._id] for component in load.inputs]
         fields[3] = {"path": str(epub), "meta": {"_type": "gradio.FileData"}}
-        await ui.run(load, *fields)
-        await ui.run(ui.event("show_cast_voice"), "RUE", None)
-        (assignment,) = await ui.run(ui.event("use_saved_cast_voice"), None, None, "RUE", saved_actor.voice_id)
-        assert any(row[0] == "Rue" and row[-1] == "Rue voice" for row in assignment[1]["value"]["data"])
+        (loaded,) = await ui.run(load, *fields)
+        assert loaded[4]["choices"] == [["Narrator", "NARRATOR"]]
+        identify = ui.event("find_characters")
+        arguments = [ui.values[component._id] for component in identify.inputs]
+        arguments[1] = "fixture-key"
+        _, identified = await ui.run(identify, *arguments)
+        assert identified[2]["value"] == {"headers": ["Character"], "data": [["Aya"], ["Rue"], ["Mina"]], "metadata": None}
+        assert identified[3]["choices"] == [
+            ["Narrator", "AYA"], ["Rue", "RUE"], ["Mina", "MINA"],
+            ["Unidentified female", unidentified_female], ["Unidentified male", unidentified_male],
+        ]
+        assert identified[4]["value"].startswith("Identified 3 characters.")
+
+        show_cast = ui.event("show_cast_voice")
+        save_assignment = ui.event("save_cast_assignment")
+        generate = ui.event("generate_audiobook")
+        cast_state = save_assignment.inputs[1]._id
+        cast_role = show_cast.inputs[0]._id
+        voice_picker = next(component for component in save_assignment.inputs if getattr(component, "label", None) == "Choose a saved voice")
+        cast_status = next(component for component in save_assignment.outputs if getattr(component, "label", None) == "Casting status")
+        assert all((voice_picker._id, "input") not in fn.targets for fn in ui.app.fns.values())
+
+        async def pick_role(role):
+            ui.values[cast_role] = role
+            await ui.run(show_cast)
+
+        await pick_role("RUE")
+        assert ui.values[cast_status._id] == "Rue uses the narrator voice by default."
+        ui.values[voice_picker._id] = saved_actor.voice_id
+        assert ui.state[cast_state] == {}
+        await ui.run(save_assignment)
+        assert ui.state[cast_state]["RUE"].name == actor.name
+        assert ui.values[cast_status._id] == "Saved Rue voice for Rue."
+
+        await pick_role("MINA")
+        assert ui.values[cast_status._id] == "Mina uses the narrator voice by default."
+        assert "MINA" not in ui.state[cast_state]
+        await pick_role(unidentified_male)
+        assert ui.values[cast_status._id] == "Unidentified male uses the narrator voice by default."
+        await pick_role(unidentified_female)
+        assert ui.values[cast_status._id] == "Unidentified female uses the narrator voice by default."
+        ui.values[voice_picker._id] = saved_actor.voice_id
+        await ui.run(save_assignment)
+        assert ui.values[cast_status._id] == "Saved Rue voice for Unidentified female."
+        assert ui.state[cast_state][unidentified_female].name == actor.name
+        await pick_role("RUE")
+        assert ui.values[cast_status._id] == "Rue uses Rue voice."
+        assert ui.values[voice_picker._id] == saved_actor.voice_id
+
+        await pick_role("AYA")
+        ui.values[voice_picker._id] = saved_narrator.voice_id
+        assert ui.values[select.inputs[0]._id] == saved_actor.voice_id
+        await ui.run(save_assignment)
+        assert ui.values[cast_status._id] == "Saved Library narrator for the narrator."
+        assert ui.values[select.inputs[0]._id] == saved_narrator.voice_id
+        assert not attributions
+        (blocked,) = await ui.run(generate)
+        assert "Run Assign dialogue" in blocked[0]["value"]
+        assert not rendered_books
+
+        saved_cast = dict(ui.state[cast_state])
+        assign_dialogue_event = ui.event("find_speakers")
+        arguments = [ui.values[component._id] for component in assign_dialogue_event.inputs]
+        arguments[1] = "fixture-key"
+        await ui.run(assign_dialogue_event, *arguments)
+        assert ui.state[cast_state] == saved_cast
+        assert ui.values[cast_role] == "AYA"
+        assert ui.values[voice_picker._id] == saved_narrator.voice_id
+        await ui.run(generate)
+        assert len(attributions) == len(rendered_books) == 1
+        assert rendered_books[0] == {
+            "NARRATOR": replace(narrator, reference_path=rendered_books[0]["NARRATOR"].reference_path),
+            "RUE": saved_cast["RUE"], unidentified_female: saved_cast[unidentified_female],
+        }
+        await ui.run(compare, ["venv-breeze"], "A narrator preview.", "en", *[ui.values[c._id] for c in compare.inputs[3:]])
+        assert rendered[-1] == replace(narrator, reference_path=rendered[-1].reference_path)
 
         save = ui.event("save_named_project")
         values = [ui.values[component._id] for component in save.inputs]
@@ -237,17 +350,40 @@ def test_library_selection_reaches_samples_cast_and_saved_project(tmp_path, monk
         (result,) = await ui.run(save, *values)
         assert result[-1]["value"] == "Saved Voice workflow."
         project = web_projects.list_projects(root=project_root)[0]
+        open_project = ui.event("open_project_snapshot")
+        (reopened,) = await ui.run(open_project, project.project_id, None)
+        assert len(reopened) == len(open_project.outputs)
+        project_actor = ui.state[cast_state]["RUE"]
+        assert project_actor.reference_path != saved_cast["RUE"].reference_path
+        for role in ("RUE", unidentified_female):
+            await pick_role(role)
+            assert ui.values[voice_picker._id] == saved_actor.voice_id
+
+        web_voices.save_voice(
+            saved_actor.voice_id, replace(actor, transcript="Edited in the library only."),
+            root=voice_root, upload_root=upload_dir,
+        )
+        await pick_role("RUE")
+        assert ui.values[voice_picker._id] is None
+        assert ui.values[cast_status._id] == "Rue uses a saved copy of Rue voice."
+        assert ui.state[cast_state]["RUE"] == project_actor
+
         web_voices.delete_voice(saved_actor.voice_id, root=voice_root)
-        (reopened,) = await ui.run(ui.event("open_project_snapshot"), project.project_id, None)
-        assert len(reopened) == len(ui.event("open_project_snapshot").outputs)
+        await ui.run(open_project, project.project_id, None)
+        await pick_role("RUE")
+        assert ui.values[voice_picker._id] is None
+        assert ui.values[cast_status._id] == "Rue uses a saved copy of Rue voice."
+        assert ui.state[cast_state]["RUE"] == project_actor
         await ui.run(compare, ["venv-breeze"], "A second preview.", "en", *[ui.values[c._id] for c in compare.inputs[3:]])
-        assert len(rendered) == 2
+        assert len(rendered) == 3
         assert rendered[-1] == replace(narrator, reference_path=rendered[-1].reference_path)
 
         opened = web_projects.load_project(project.project_id, root=project_root)
         try:
             assert opened.narrator == replace(narrator, reference_path=opened.narrator.reference_path)
             assert opened.voices["RUE"] == replace(actor, reference_path=opened.voices["RUE"].reference_path)
+            assert opened.voices[unidentified_female] == replace(actor, reference_path=opened.voices[unidentified_female].reference_path)
+            assert "MINA" not in opened.voices
             assert Path(opened.voices["RUE"].reference_path).is_file()
         finally:
             gradio_app.close_book_session(opened.session)
@@ -264,13 +400,15 @@ def test_model_install_settings_and_batch_reach_render_callbacks(tmp_path, monke
     monkeypatch.setattr("tts_audiobook_tool.web_model_panel.recommended_batch_size",
                         lambda name, **_: 5 if name == "venv-qwen3tts" else 10)
     setup = []
+    setup_progress = []
     rendered = []
 
     def install(model, *, on_progress, cancel_event):
         assert not cancel_event.is_set()
-        on_progress("Verifying.")
+        on_progress(gradio_app.ModelSetupProgress(3, 5, "Verify the environment"))
         setup.append(model)
         installed.append(("Qwen3-TTS", model))
+        on_progress(gradio_app.ModelSetupProgress(5, 5, "Setup complete"))
 
     def render_book(model, session, voices, **kwargs):
         rendered.append((model, kwargs["model_options"], kwargs["batch_size"]))
@@ -281,12 +419,15 @@ def test_model_install_settings_and_batch_reach_render_callbacks(tmp_path, monke
         return reference["path"]
 
     monkeypatch.setattr(gradio_app, "install_model", install)
+    monkeypatch.setattr(gr.Progress, "__call__", lambda _self, value, *, desc: setup_progress.append((value, desc)))
     monkeypatch.setattr(gradio_app, "render_model_book", render_book)
     monkeypatch.setattr(gradio_app, "render_model_sample", render_sample)
     ui = VoiceApp()
 
     async def exercise():
         install_event = ui.event("install_selected_model")
+        assert install_event.show_progress_on == [install_event.outputs[8]]
+        assert install_event.show_progress_on[0].label == "Installation status"
         sample = Book([BookSection([PhraseGroup([Phrase("Hello.", Reason.SENTENCE)])])])
         ui.state[install_event.inputs[2]._id] = BookSession(sample, str(tmp_path))
         _, changed = await ui.run(install_event, "venv-qwen3tts", ["venv-breeze"], None, True, None, False)
@@ -317,6 +458,10 @@ def test_model_install_settings_and_batch_reach_render_callbacks(tmp_path, monke
 
     asyncio.run(exercise())
     assert setup == ["venv-qwen3tts"]
+    assert setup_progress[:2] == [
+        ((3, 5), "Verify the environment (3/5 steps complete)"),
+        ((5, 5), "Setup complete (5/5 steps complete)"),
+    ]
     assert rendered == [
         ("venv-qwen3tts", {"temperature": 0.7}, 5),
         ("venv-breeze", None),

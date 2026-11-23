@@ -39,6 +39,19 @@ if TYPE_CHECKING:
 DEFAULT_OPENAI_MODEL = "gpt-6.1-terra"
 DEFAULT_REASONING_EFFORT = "low"
 DEFAULT_LLM_ENDPOINT = "https://api.openai.com/v1/chat/completions"
+UNIDENTIFIED_CAST_ROLES: dict[str, str] = {
+    "OTHER:unidentified female": "Unidentified female",
+    "OTHER:unidentified male": "Unidentified male",
+}
+_WEB_ATTRIBUTION_SYSTEM_PROMPT = ATTRIBUTION_SYSTEM_PROMPT + """
+
+Use a named roster character's ID whenever you can identify the speaker. If
+the speaker is unnamed or their identity is unresolved and the text indicates
+their gender, use exactly "OTHER:unidentified female" or "OTHER:unidentified male"
+as appropriate. Use "UNKNOWN" when the evidence is insufficient to identify
+the speaker or place them in either group. Use "NOT_SPEECH" for quoted text
+that is not spoken dialogue.
+"""
 _REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 _FINISH_REASONS = ("stop", "length", "content_filter", "tool_calls", "function_call")
 _WORKSPACE = tempfile.TemporaryDirectory(prefix="tts-audiobook-web-", ignore_cleanup_errors=True)
@@ -82,6 +95,17 @@ class CharacterRow:
     name: str
     line_count: int
     voice_hint: str
+
+
+def canonical_cast_role(speaker: str) -> str:
+    """Normalize the two browser casting groups while preserving other speaker IDs."""
+    prefix, separator, name = speaker.partition(":")
+    if separator and prefix.strip().casefold() == "other":
+        normalized = " ".join(name.casefold().replace("_", " ").split())
+        role = f"OTHER:{normalized}"
+        if role in UNIDENTIFIED_CAST_ROLES:
+            return role
+    return speaker
 
 
 def import_epub(upload_path: str, *, language_code: str = "en") -> BookSession:
@@ -174,6 +198,33 @@ def character_rows(session: BookSession) -> list[CharacterRow]:
     ]
 
 
+def book_cast_problem(
+    session: BookSession, *, first_line: int = 1, last_line: int | None = None,
+) -> str | None:
+    """Check unattributed dialogue in an inclusive, one-based render range."""
+    if session.roster is None:
+        return None
+    groups = session.book.phrase_groups
+    last_line = len(groups) if last_line is None else last_line
+    if type(first_line) is not int or type(last_line) is not int or not 1 <= first_line <= last_line <= len(groups):
+        return None
+
+    speakers = session.attributions.speaker_of_each_line(session.book)
+    unattributed = {
+        index for index in range(first_line - 1, last_line)
+        if groups[index].is_dialog and index not in speakers
+        and not (groups[index].voice_index > 0 and groups[index].voice_index in session.line_voices)
+    }
+    if unattributed:
+        for chunk in AssignPlan.make(session.book, session.attributions).chunks:
+            if chunk.done:
+                unattributed.difference_update(range(max(first_line - 1, chunk.start), min(last_line, chunk.end)))
+        if unattributed:
+            return "Run Assign dialogue for the selected lines before generating audio."
+
+    return None
+
+
 def identify_characters(
         session: BookSession,
         api_key: str,
@@ -234,7 +285,7 @@ def attribute_dialog(
         attributions=attributions,
         project_dir=attribution_dir,
         prefs=prefs,
-        make_session=lambda: _make_session(prefs, api_key, ATTRIBUTION_SYSTEM_PROMPT),
+        make_session=lambda: _make_session(prefs, api_key, _WEB_ATTRIBUTION_SYSTEM_PROMPT),
         send=send,
         listener=progress,
     )

@@ -40,6 +40,7 @@ class BookRenderTelemetry:
     processed: int
     total: int
     speed_multiplier: float | None = None
+    eta_seconds: float | None = None
 
 
 @dataclass(frozen=True)

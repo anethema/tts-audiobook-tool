@@ -9,10 +9,11 @@ from tts_audiobook_tool.speaker_assign.assign_plan import AssignPlan
 from tts_audiobook_tool.speaker_assign.speaker_assign_file_util import SpeakerAssignFileUtil
 from tts_audiobook_tool.speaker_assign.speaker_assign_types import NOT_SPEECH, OTHER, UNKNOWN
 from tts_audiobook_tool.speaker_assign.utterance_util import UtteranceUtil
-from tts_audiobook_tool.web_backend import BookSession, WebBackendError
+from tts_audiobook_tool.web_backend import BookSession, UNIDENTIFIED_CAST_ROLES, WebBackendError, canonical_cast_role
 
 
 _RESERVED_NAMES = {
+    **UNIDENTIFIED_CAST_ROLES,
     OTHER: "Other speaker",
     UNKNOWN: "Unknown speaker",
     NOT_SPEECH: "Not spoken dialogue",
@@ -60,7 +61,7 @@ def dialogue_rows(session: BookSession, section: int) -> list[DialogueRow]:
         DialogueRow(
             line,
             UtteranceUtil.range_text(session.book, line, utterance.lines[-1] + 1).strip(),
-            names.get(utterance.speaker, utterance.speaker),
+            names.get(canonical_cast_role(utterance.speaker), utterance.speaker),
             utterance.uncertain,
         )
         for line, utterance in sorted(assignments.items())
@@ -74,6 +75,8 @@ def correct_speaker(session: BookSession, section: int, first_line: int, speaker
     start, end = _section_range(session, section)
     if type(first_line) is not int or not start <= first_line < end:
         raise WebBackendError("Choose a dialogue line in the current section.")
+    if isinstance(speaker, str):
+        speaker = canonical_cast_role(speaker)
     if speaker not in {speaker_id for _, speaker_id in speaker_choices(session)}:
         raise WebBackendError("Choose a speaker from the list.")
 

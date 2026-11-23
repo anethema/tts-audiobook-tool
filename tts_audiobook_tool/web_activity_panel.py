@@ -1,6 +1,7 @@
 """Session-scoped console output and audiobook progress for the browser."""
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import dataclass
 from html import escape
 import math
@@ -8,6 +9,8 @@ from threading import Lock
 from typing import TYPE_CHECKING
 
 import gradio as gr
+
+from tts_audiobook_tool.util import duration_string
 
 if TYPE_CHECKING:
     from tts_audiobook_tool.generation_events import BookRenderTelemetry
@@ -33,28 +36,37 @@ class BookActivity:
 
     def html(self) -> str:
         progress = self.telemetry
+        estimate = ""
         if progress is not None and progress.total > 0:
             done = min(max(0, progress.processed), progress.total)
             counts = f"{done:,} of {progress.total:,} segments · {done / progress.total:.0%}"
             bar_values = f'max="{progress.total}" value="{done}"'
+            eta = progress.eta_seconds
+            if not self.ended and done < progress.total and eta is not None and math.isfinite(eta) and eta > 0:
+                duration = duration_string(math.ceil(eta), pad_seconds=True).replace("h", "h ").replace("m", "m ")
+                estimate = f' · <span title="Estimated time to finish generating audio">ETA {duration}</span>'
         else:
             counts = ""
             bar_values = 'max="1" value="0"' if self.ended else ""
         rate = progress.speed_multiplier if progress is not None else None
         speed = ""
         if rate is not None and math.isfinite(rate) and rate >= 0:
-            speed = f'<strong class="book-progress-rate" title="Audio generated per second of elapsed time">{rate:.1f}x</strong>'
+            speed = (
+                '<output class="book-progress-rate" aria-label="Synthesis speed" '
+                f'title="Audio seconds generated per second of synthesis"><strong>{rate:.1f}x</strong></output>'
+            )
         return (
             '<div class="book-progress-details">'
-            f'<span>{escape(self.label)}</span><span>{counts}</span></div>'
+            f'<span>{escape(self.label)}</span><span>{counts}{estimate}</span></div>'
             '<div class="book-progress-track">'
             f'<progress aria-label="Overall audiobook progress" {bar_values}></progress>{speed}</div>'
         )
 
 
 class SessionActivity:
-    def __init__(self):
+    def __init__(self, *, terminal_log: bool = False):
         self._lock = Lock()
+        self._terminal_log = terminal_log
         self._console = ""
         self._book: BookActivity | None = None
         self._console_version = 0
@@ -65,6 +77,9 @@ class SessionActivity:
             with self._lock:
                 self._console = (self._console + text[-CONSOLE_LIMIT:])[-CONSOLE_LIMIT:]
                 self._console_version += 1
+            if self._terminal_log:
+                with suppress(OSError, UnicodeError):
+                    print(text, end="", flush=True)
 
     def start_book(self) -> None:
         with self._lock:
@@ -95,14 +110,15 @@ class SessionActivity:
 
 
 class ActivityPanel:
-    def __init__(self):
+    def __init__(self, *, terminal_log: bool = False):
         self._lock = Lock()
+        self._terminal_log = terminal_log
         self._sessions: dict[str | None, SessionActivity] = {}
 
     def session(self, session_id: str | None) -> SessionActivity:
         with self._lock:
             if session_id not in self._sessions:
-                self._sessions[session_id] = SessionActivity()
+                self._sessions[session_id] = SessionActivity(terminal_log=self._terminal_log)
             return self._sessions[session_id]
 
     def console_for(self, session_id: str | None):
@@ -110,7 +126,8 @@ class ActivityPanel:
 
     def bind(self, app: gr.Blocks, progress: gr.HTML) -> None:
         console = gr.Textbox(
-            label="Console output", lines=12, max_lines=12, interactive=False, buttons=["copy"],
+            label="Console output", placeholder="No output yet. Generation activity will appear here.",
+            lines=12, max_lines=12, interactive=False, buttons=["copy"],
             elem_id="console-output",
         )
         timer = gr.Timer(0.75)

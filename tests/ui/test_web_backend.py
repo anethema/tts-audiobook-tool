@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import logging
 import os
@@ -11,10 +12,15 @@ from unittest.mock import patch
 from ebooklib import epub
 import requests
 
-from tts_audiobook_tool import web_backend
+from tts_audiobook_tool import web_backend, web_dialogue
 from tts_audiobook_tool.app_types import Book, BookSection
 from tts_audiobook_tool.app_types.phrase import Phrase, PhraseGroup, Reason
 from tts_audiobook_tool.l import L
+from tts_audiobook_tool.speaker_assign.attribution import AttributionsFile, RangeAttribution, UtteranceAttribution
+from tts_audiobook_tool.speaker_assign.roster import Roster, RosterCharacter
+from tts_audiobook_tool.speaker_assign.speaker_assign_file_util import SpeakerAssignFileUtil
+from tts_audiobook_tool.speaker_assign.utterance_util import UtteranceUtil
+from tts_audiobook_tool.web_render import RenderVoice
 
 
 KEY = "sk-test-request-only"
@@ -112,6 +118,11 @@ class TestWebBackend(unittest.TestCase):
                         self.assertEqual(payload["reasoning_effort"], "low")
                     override_payload = post.call_args.kwargs["json"]
                     self.assertEqual(override_payload["model"], "custom-model")
+                    roster_prompt = post.call_args_list[0].kwargs["json"]["messages"][0]["content"]
+                    attribution_prompt = override_payload["messages"][0]["content"]
+                    for role in web_backend.UNIDENTIFIED_CAST_ROLES:
+                        self.assertIn(role, attribution_prompt)
+                        self.assertNotIn(role, roster_prompt)
                     self.assertNotIn("reasoning_effort", override_payload)
 
             self.assertEqual(len(complete.attributions.ranges), 2)
@@ -176,6 +187,68 @@ class TestWebBackend(unittest.TestCase):
                 with self.assertRaises(web_backend.WebBackendError):
                     web_backend.identify_characters(session, "", endpoint=endpoint, settings_json='{"stream": true}')
                 post.assert_called_once()
+
+    def test_book_cast_problem_is_limited_to_selected_lines_using_automatic_casting(self):
+        session = self._book_session("unused", sections=2)
+        self.assertIsNone(web_backend.book_cast_problem(session))
+        roster = Roster((RosterCharacter("FIONA", "Fiona", is_narrator=True), RosterCharacter("MILO", "Milo")))
+        first = RangeAttribution(
+            0, 2, UtteranceUtil.range_text_hash(session.book, 0, 2), (UtteranceAttribution((1,), "MILO"),),
+        )
+        stale = RangeAttribution(2, 4, "obsolete", (UtteranceAttribution((3,), "MILO"),))
+        session = replace(session, roster=roster, attributions=AttributionsFile((first, stale)))
+
+        self.assertIsNone(web_backend.book_cast_problem(session, first_line=3, last_line=3))
+        self.assertIsNone(web_backend.book_cast_problem(session, first_line=2, last_line=2))
+        self.assertIn("Assign dialogue", web_backend.book_cast_problem(session))
+
+        session.book.phrase_groups[3].voice_index = 1
+        self.assertIn("Assign dialogue", web_backend.book_cast_problem(session))
+        overridden = replace(session, line_voices={1: RenderVoice(name="Manual line voice")})
+        self.assertIsNone(web_backend.book_cast_problem(overridden))
+        self.assertIsNone(web_backend.book_cast_problem(overridden, first_line=4))
+        self.assertIsNone(web_backend.book_cast_problem(overridden, first_line=5))
+
+    def test_book_cast_problem_accepts_narrator_and_reserved_attribution_answers(self):
+        session = self._book_session("unused")
+        roster = Roster((RosterCharacter("FIONA", "Fiona", is_narrator=True),))
+        for speaker in ("FIONA", "UNKNOWN", "OTHER:Passerby", "NOT_SPEECH", *web_backend.UNIDENTIFIED_CAST_ROLES):
+            with self.subTest(speaker=speaker):
+                attribution = RangeAttribution(
+                    0, 2, UtteranceUtil.range_text_hash(session.book, 0, 2), (UtteranceAttribution((1,), speaker),),
+                )
+                attributed = replace(session, roster=roster, attributions=AttributionsFile((attribution,)))
+                self.assertIsNone(web_backend.book_cast_problem(attributed))
+
+    def test_dialogue_review_labels_and_saves_unidentified_cast_groups(self):
+        female = "OTHER:unidentified female"
+        male = "OTHER:unidentified male"
+        legacy_label = " other : UNIDENTIFIED__FEMALE "
+        self.assertEqual(web_backend.canonical_cast_role(legacy_label), female)
+        self.assertEqual(web_backend.canonical_cast_role("Other: unidentified\tMALE"), male)
+        for unrelated in ("UNIDENTIFIED_FEMALE", "OTHER:Guard", "OTHER", "UNKNOWN", "NOT_SPEECH"):
+            self.assertEqual(web_backend.canonical_cast_role(unrelated), unrelated)
+
+        with tempfile.TemporaryDirectory() as directory:
+            session = self._book_session(directory)
+            attribution = RangeAttribution(
+                0, 2, UtteranceUtil.range_text_hash(session.book, 0, 2),
+                (UtteranceAttribution((1,), legacy_label, uncertain=True),),
+            )
+            session = replace(
+                session, roster=Roster((RosterCharacter("FIONA", "Fiona"),)), attributions=AttributionsFile((attribution,)),
+            )
+            choices = dict(web_dialogue.speaker_choices(session))
+            self.assertEqual(choices["Unidentified female"], female)
+            self.assertEqual(choices["Unidentified male"], male)
+            self.assertEqual(web_dialogue.dialogue_rows(session, 0)[0].speaker, "Unidentified female")
+
+            updated = web_dialogue.correct_speaker(session, 0, 1, male)
+            saved = SpeakerAssignFileUtil.load_attributions_file(directory)
+            self.assertEqual(saved, updated.attributions)
+            row = web_dialogue.dialogue_rows(updated, 0)[0]
+            self.assertEqual(row.speaker, "Unidentified male")
+            self.assertFalse(row.uncertain)
 
     @staticmethod
     def _book_session(directory: str, sections: int = 1) -> web_backend.BookSession:

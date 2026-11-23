@@ -40,6 +40,19 @@ class WebModelSetupError(ValueError):
 
 
 @dataclass(frozen=True)
+class ModelSetupProgress:
+    """Completed recipe steps and the stage currently being run."""
+
+    completed: int
+    total: int
+    stage: str
+
+    @property
+    def description(self) -> str:
+        return f"{self.stage} ({self.completed}/{self.total} steps complete)"
+
+
+@dataclass(frozen=True)
 class _Checkpoint:
     repo_id: str
     revision: str = ""
@@ -180,7 +193,8 @@ def recommended_batch_size(
 
 
 def install_model(
-        model_id: str, *, on_progress: Callable[[str], None] | None = None, cancel_event: Event | None = None,
+        model_id: str, *, on_progress: Callable[[ModelSetupProgress], None] | None = None,
+        cancel_event: Event | None = None,
 ) -> Path:
     """Install a known recipe in a private environment and publish its verified link."""
     profile = _BY_MODEL_ID.get(model_id)
@@ -194,22 +208,37 @@ def remote_client_install_supported() -> bool:
 
 
 def install_remote_client(
-    *, on_progress: Callable[[str], None] | None = None, cancel_event: Event | None = None,
+    *, on_progress: Callable[[ModelSetupProgress], None] | None = None, cancel_event: Event | None = None,
 ) -> Path:
     """Install the native remote TTS client requirements into a launcher-marked environment."""
     return _install_profile(_REMOTE_PROFILE, on_progress, cancel_event)
 
 
 def _install_profile(
-    profile: ModelProfile, on_progress: Callable[[str], None] | None, cancel_event: Event | None,
+    profile: ModelProfile, on_progress: Callable[[ModelSetupProgress], None] | None, cancel_event: Event | None,
 ) -> Path:
     if not profile.installable:
         raise WebModelSetupError("Browser installation requires an x86-64 Linux or WSL server.")
     _check_cancelled(cancel_event)
+
+    # Both recipes create the environment, install dependencies, check the
+    # dependencies, verify the environment, and publish the verified link.
+    total = 5 + int(profile.catalog_id is not None) + int(profile.gated_repo is not None) + len(profile.checkpoints)
+    completed = 0
+
+    def start_step(description: str) -> None:
+        nonlocal completed
+        if on_progress is not None:
+            on_progress(ModelSetupProgress(completed, total, description))
+        # The next step starts only after this one succeeds.
+        completed += 1
+
     if profile.catalog_id is None:
         interpreter = remote_client_python(ROOT)
         _check_cancelled(cancel_event)
         if interpreter is not None:
+            if on_progress is not None:
+                on_progress(ModelSetupProgress(total, total, "Verified environment already available"))
             return interpreter.parent.parent
     directory = _setup_root()
     link = ROOT / profile.model_id
@@ -218,24 +247,31 @@ def _install_profile(
     try:
         if lock_path.is_symlink() or (lock_path.exists() and not lock_path.is_file()):
             raise OSError
+        already_installed = False
         with FileLock(str(lock_path), timeout=0):
             if link.is_symlink() or link.exists():
-                if _qualified(link, profile):
-                    return link
-                raise WebModelSetupError(f"An existing path occupies {profile.model_id}. Move it before retrying setup.")
-            uv = _find_uv()
-            requirements = ROOT / profile.requirements
-            if requirements.is_symlink() or not requirements.is_file():
-                raise WebModelSetupError(f"The upstream requirements file for {profile.label} is unavailable.")
-            if profile.portaudio and not find_library("portaudio"):
-                raise WebModelSetupError("Install the PortAudio system library in WSL before setting up Higgs Audio V2.")
-            if profile.gated_repo is not None:
-                _check_model_access(profile.gated_repo, on_progress, cancel_event)
-            return _install(profile, directory, link, uv, requirements, on_progress, cancel_event)
+                if not _qualified(link, profile):
+                    raise WebModelSetupError(f"An existing path occupies {profile.model_id}. Move it before retrying setup.")
+                _check_cancelled(cancel_event)
+                already_installed = True
+            else:
+                uv = _find_uv()
+                requirements = ROOT / profile.requirements
+                if requirements.is_symlink() or not requirements.is_file():
+                    raise WebModelSetupError(f"The upstream requirements file for {profile.label} is unavailable.")
+                if profile.portaudio and not find_library("portaudio"):
+                    raise WebModelSetupError("Install the PortAudio system library in WSL before setting up Higgs Audio V2.")
+                if profile.gated_repo is not None:
+                    _check_model_access(profile.gated_repo, start_step, cancel_event)
+                _install(profile, directory, link, uv, requirements, start_step, cancel_event)
     except Timeout:
         raise WebModelSetupError(f"Setup for {profile.label} is already running.") from None
     except OSError:
         raise WebModelSetupError(f"Could not complete local setup for {profile.label}.") from None
+    if on_progress is not None:
+        stage = "Verified environment already available" if already_installed else "Setup complete"
+        on_progress(ModelSetupProgress(total, total, stage))
+    return link
 
 
 def _setup_root() -> Path:
@@ -275,7 +311,7 @@ def _qualified(directory: Path, profile: ModelProfile) -> bool:
 def _install(
         profile: ModelProfile, directory: Path, link: Path, uv: str, requirements: Path,
         on_progress: Callable[[str], None] | None, cancel_event: Event | None,
-) -> Path:
+) -> None:
     # Venv entry points contain absolute paths, so the verified environment remains
     # at its creation path and the checkout receives only a discovery symlink.
     stage = Path(mkdtemp(prefix=f"{profile.model_id}-", dir=directory))
@@ -321,10 +357,12 @@ def _install(
                 f"Download {checkpoint.repo_id} weights", on_progress, cancel_event,
             )
         _check_cancelled(cancel_event)
+        if on_progress is not None:
+            on_progress("Publish the verified environment")
+        _check_cancelled(cancel_event)
         # Creating the link directly is atomic and fails if another path appeared.
         link.symlink_to(stage, target_is_directory=True)
         published = True
-        return link
     finally:
         if not published:
             shutil.rmtree(stage, ignore_errors=True)

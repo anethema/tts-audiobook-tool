@@ -58,9 +58,16 @@ def test_pocket_chatterbox_and_dots_variants_use_native_settings():
     chatterbox = "chatterbox_local"
     dots = "dots_local"
     assert voice_presets_for(pocket) == tuple(PocketBaseModel.PREDEFINED_VOICES)
-    assert validate_model_options(pocket, {"model_code": PocketBaseModel.LANGUAGES[0]}) == {
-        "model_code": PocketBaseModel.LANGUAGES[0],
-    }
+    option = next(item for item in model_options_for(pocket) if item.key == "model_code")
+    assert option.default == PocketBaseModel.RECOMMENDED_BY_LANGUAGE["en"] == "english_2026-10"
+    assert option.choices[0][1] == option.default
+    assert "" not in {value for _, value in option.choices}
+    assert validate_model_options(pocket, {"model_code": ""}) == {}
+    assert validate_model_options(pocket, {"model_code": option.default}) == {}
+    alternative = PocketBaseModel.RECOMMENDED_BY_LANGUAGE["fr"]
+    assert validate_model_options(pocket, {"model_code": alternative}) == {"model_code": alternative}
+    with pytest.raises(ValueError, match="Choose a supported value"):
+        validate_model_options(pocket, {"model_code": "unrecognized"})
     overrides = validate_model_options(chatterbox, {"type": ChatterboxType.TURBO.id})
     project = Project(tts_model_type=chatterbox)
     project.set_model_setting(chatterbox, "type", overrides["type"])

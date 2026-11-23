@@ -7,7 +7,9 @@ from threading import Event, Lock
 import gradio as gr
 
 from tts_audiobook_tool.tts_models.model_spec import TtsBackendKind
-from tts_audiobook_tool.web_model_setup import WebModelSetupError, install_remote_client, remote_client_install_supported
+from tts_audiobook_tool.web_model_setup import (
+    ModelSetupProgress, WebModelSetupError, install_remote_client, remote_client_install_supported,
+)
 from tts_audiobook_tool.web_remote_models import (
     RemoteTtsConfig, WebRemoteTtsError, discover_remote_models, normalize_remote_endpoint, remote_client_python,
     resolve_remote_selection, select_remote_model, unload_audio_cpp_models,
@@ -102,13 +104,17 @@ class RemoteModelPanel:
             with installation_lock:
                 active_installations[request.session_hash] = cancel
             available = remote_client_install_supported()
+
+            def report_setup(update: ModelSetupProgress) -> None:
+                progress((update.completed, update.total), desc=update.description)
+
             try:
                 yield (
                     _status("Preparing the remote speech client…"),
                     gr.update(interactive=False), gr.update(interactive=True),
                 )
                 try:
-                    install_remote_client(on_progress=lambda description: progress(0, desc=description), cancel_event=cancel)
+                    install_remote_client(on_progress=report_setup, cancel_event=cancel)
                 except WebModelSetupError as exc:
                     message = str(exc)
                 except Exception:
@@ -122,7 +128,8 @@ class RemoteModelPanel:
             yield _status(message), gr.update(interactive=available), gr.update(interactive=False)
 
         self.install.click(
-            install_client, outputs=[self.client_status, self.install, self.cancel_install], **event_options,
+            install_client, outputs=[self.client_status, self.install, self.cancel_install],
+            show_progress_on=self.client_status, **event_options,
         )
         self.cancel_install.click(
             stop_installation, api_visibility="private", queue=False, show_progress="hidden",

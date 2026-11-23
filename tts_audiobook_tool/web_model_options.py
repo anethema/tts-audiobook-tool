@@ -40,6 +40,7 @@ _LABELS = {
     "lora_strength": "LoRA strength",
 }
 _QWEN = "qwen3tts_local"
+POCKET_DEFAULT_MODEL_CODE = PocketBaseModel.RECOMMENDED_BY_LANGUAGE["en"]
 _LORA_MODELS = frozenset({"breeze_tts_2_local", "omnivoice_local", "vibevoice_local"})
 _QWEN_TYPE_BY_SUFFIX = {
     "Base": Qwen3ModelType.BASE.value,
@@ -104,11 +105,11 @@ def model_options_for(catalog_id: str) -> tuple[ModelOption, ...]:
                         info="Requires a Base checkpoint and a batch size of one."),
         ))
     elif catalog_id == "pocket_local":
-        languages = [("Select a Pocket model", "")]
+        languages = []
         for code in PocketBaseModel.LANGUAGES:
             note = PocketBaseModel.LANGUAGE_NOTES.get(code)
             languages.append((f"{code} ({note})" if note else code, code))
-        result.insert(0, ModelOption("model_code", "Pocket model", "", choices=tuple(languages)))
+        result.insert(0, ModelOption("model_code", "Pocket model", POCKET_DEFAULT_MODEL_CODE, choices=tuple(languages)))
     elif catalog_id == "chatterbox_local":
         binding = REGISTRY.get(catalog_id, "type")
         result.insert(0, ModelOption(
@@ -164,6 +165,8 @@ def validate_model_options(catalog_id: str, options: dict[str, object] | None) -
         if option is None:
             raise ValueError("The selected model does not support one of these settings.")
         if value is None:
+            continue
+        if catalog_id == "pocket_local" and key == "model_code" and isinstance(value, str) and not value.strip():
             continue
         if option.choices:
             allowed = [choice for _, choice in option.choices]

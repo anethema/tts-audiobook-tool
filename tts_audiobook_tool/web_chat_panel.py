@@ -8,6 +8,7 @@ from threading import Lock
 
 import gradio as gr
 
+from tts_audiobook_tool.web_api_keys import StoredApiKeyError, load_api_key
 from tts_audiobook_tool.web_chat import (
     ChatState, ChatStopped, ChatTurn, WebChatError, default_system_prompt, prepare_chat_turn, transcribe_chat_input,
 )
@@ -85,13 +86,16 @@ class VoiceChatPanel:
             state, message, key, model, endpoint_url, reasoning, extra_json, prompt, echo, stream, speech_model,
             language, settings, request: gr.Request, *runtime_and_voice_fields,
         ):
+            secret = (key or "").strip()
             try:
+                if not echo and not secret:
+                    secret = load_api_key(endpoint_url or "")
                 turn = prepare_chat_turn(
-                    state, message or "", api_key=key or "", model=model or "", endpoint=endpoint_url or "",
+                    state, message or "", api_key=secret, model=model or "", endpoint=endpoint_url or "",
                     effort=reasoning or "", extra_json=extra_json or "", system_prompt=prompt or "", echo=echo,
                     stream=stream,
                 )
-            except WebChatError as exc:
+            except (StoredApiKeyError, WebChatError) as exc:
                 yield *[gr.skip()] * 5, _status(str(exc)), gr.skip(), gr.skip()
                 return
 

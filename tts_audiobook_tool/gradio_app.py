@@ -18,14 +18,16 @@ from tts_audiobook_tool.constants_config import (
 from tts_audiobook_tool.l import L
 from tts_audiobook_tool.web_abr_project import read_abr_project
 from tts_audiobook_tool.web_activity_panel import ACTIVITY_CSS, ActivityPanel
+from tts_audiobook_tool.web_api_keys import StoredApiKeyError, forget_api_key, has_api_key, load_api_key, save_api_key
 from tts_audiobook_tool.web_backend import (
     DEFAULT_LLM_ENDPOINT,
     DEFAULT_OPENAI_MODEL,
     DEFAULT_REASONING_EFFORT,
+    UNIDENTIFIED_CAST_ROLES,
     BookSession,
     WebBackendError,
     attribute_dialog,
-    character_rows,
+    book_cast_problem,
     close_book_session,
     identify_characters,
 )
@@ -45,7 +47,7 @@ from tts_audiobook_tool.web_legacy_project import (
 )
 from tts_audiobook_tool.web_line_voice_panel import LineVoicePanel
 from tts_audiobook_tool.web_model_panel import ModelPanel
-from tts_audiobook_tool.web_model_setup import WebModelSetupError, install_model, model_profiles
+from tts_audiobook_tool.web_model_setup import ModelSetupProgress, WebModelSetupError, install_model, model_profiles
 from tts_audiobook_tool.web_playback_panel import PlaybackPanel
 from tts_audiobook_tool.web_models import (
     ModelRunError,
@@ -62,7 +64,7 @@ from tts_audiobook_tool.web_runtime_settings import WebRuntimeSettingsError
 from tts_audiobook_tool.web_text_panel import SectionTextPanel, TextImportPanel
 from tts_audiobook_tool.web_tools_panel import build_tools_panel
 from tts_audiobook_tool.web_voice_panel import VoicePanel, bind_transcription, voice_status
-from tts_audiobook_tool.web_voices import WebVoiceError, import_voices, load_voice
+from tts_audiobook_tool.web_voices import WebVoiceError, import_voices, load_voice, matching_voice_id
 
 
 TITLE = "TTS Audiobook Tool"
@@ -98,35 +100,38 @@ def _book_summary(session: BookSession) -> str:
     return "\n".join(lines)
 
 
-def _review_components(
-    session: BookSession | None,
-    voices: dict[str, RenderVoice],
-    role: str | None = None,
-) -> tuple[dict, dict]:
-    rows = character_rows(session) if session is not None and session.roster is not None else []
+def _narrator_role(session: BookSession | None) -> str:
     narrator = session.roster.narrator if session is not None and session.roster is not None else None
-    narrator_ids = {"NARRATOR"}
-    if narrator is not None:
-        narrator_ids.add(narrator.id)
+    return narrator.id if narrator is not None else "NARRATOR"
 
-    choices = [(row.name, row.speaker_id) for row in rows if row.speaker_id not in narrator_ids]
-    selected = role if role in {speaker_id for _, speaker_id in choices} else None
-    table = []
-    for row in rows:
-        if row.speaker_id in narrator_ids:
-            voice_label = "Voice settings"
-        elif voice := voices.get(row.speaker_id):
-            voice_label = voice.name or "Custom voice"
-        else:
-            voice_label = "Narrator"
-        table.append([row.name, row.line_count, row.voice_hint, voice_label])
+
+def _cast_role_name(session: BookSession, role: str) -> str | None:
+    if session.roster is None:
+        return None
+    character = session.roster.get(role)
+    return (character.name or character.id) if character is not None else UNIDENTIFIED_CAST_ROLES.get(role)
+
+
+def _review_components(session: BookSession | None) -> tuple[dict, dict]:
+    roster = session.roster if session is not None else None
+    roster_characters = roster.characters if roster is not None else ()
+    rows = [
+        [character.name] for character in roster_characters
+        if not character.is_narrator or character.name.strip().casefold() not in {"", "narrator", "the narrator"}
+    ]
+    choices = []
+    if session is not None and session.book.sections:
+        choices.append(("Narrator", _narrator_role(session)))
+        choices.extend((character.name, character.id) for character in roster_characters if not character.is_narrator)
+        if roster is not None:
+            choices.extend((label, role) for role, label in UNIDENTIFIED_CAST_ROLES.items())
     return (
-        gr.update(value=table, visible=bool(rows)),
-        gr.update(choices=choices, value=selected, visible=bool(choices)),
+        gr.update(value=rows, visible=bool(rows)),
+        gr.update(choices=choices, value=None, visible=bool(choices)),
     )
 
 
-def build_app() -> gr.Blocks:
+def build_app(*, terminal_log: bool = False) -> gr.Blocks:
     """Build the loopback UI without loading models or opening a connection."""
     if not hasattr(L, "logger"):
         L.init("tts-audiobook-web", level=logging.WARNING)
@@ -138,7 +143,7 @@ def build_app() -> gr.Blocks:
     profile_ids = {profile.model_id for profile in model_profiles()}
     running_jobs: dict[str | None, Event] = {}
     running_jobs_lock = Lock()
-    activity_panel = ActivityPanel()
+    activity_panel = ActivityPanel(terminal_log=terminal_log)
 
     @contextmanager
     def running_job(request: gr.Request):
@@ -203,10 +208,14 @@ def build_app() -> gr.Blocks:
                             gr.Markdown(
                                 "Character identification and dialogue assignment send book text to the configured LLM."
                             )
-                            api_key = gr.Textbox(
-                                label="LLM API key", type="password",
-                                html_attributes=gr.InputHTMLAttributes(autocomplete="off"),
-                            )
+                            with gr.Row():
+                                api_key = gr.Textbox(
+                                    label="LLM API key", type="password", scale=3,
+                                    html_attributes=gr.InputHTMLAttributes(autocomplete="off"),
+                                )
+                                save_key = gr.Button("Save key", size="sm")
+                                forget_key = gr.Button("Forget saved key", size="sm")
+                            key_status = gr.Markdown()
                             with gr.Row():
                                 llm_model = gr.Textbox(value=DEFAULT_OPENAI_MODEL, label="LLM model")
                                 effort = gr.Dropdown(
@@ -220,11 +229,12 @@ def build_app() -> gr.Blocks:
                                 )
                             with gr.Row():
                                 identify = gr.Button("Identify characters", interactive=False)
-                                attribute = gr.Button("Assign dialog", interactive=False)
-                            analysis_status = gr.Textbox(label="Analysis status", interactive=False, visible=False)
+                                analysis_status = gr.Textbox(
+                                    label="Analysis status", interactive=False, visible=False, scale=3,
+                                )
                             characters = gr.Dataframe(
-                                headers=["Character", "Dialog lines", "Voice suggestion", "Voice source"],
-                                datatype=["str", "number", "str", "str"],
+                                label="Identified characters",
+                                headers=["Character"], datatype="str",
                                 interactive=False,
                                 max_height=340,
                                 visible=False,
@@ -233,10 +243,13 @@ def build_app() -> gr.Blocks:
                                 label="Character to cast", choices=[], interactive=True, visible=False
                             )
                             with gr.Group(visible=False) as cast_editor:
-                                cast_library_voice = gr.Dropdown(label="Assign a saved voice", choices=[], interactive=True)
-                                clear_cast = gr.Button("Use narrator voice", size="sm")
+                                cast_mode = gr.Radio(
+                                    [("Saved voice", "saved"), ("Use narrator voice", "narrator"), ("Custom voice", "custom")],
+                                    value="saved", label="Voice source", interactive=True,
+                                )
+                                cast_library_voice = gr.Dropdown(label="Choose a saved voice", choices=[], interactive=True)
                                 cast_status = gr.Textbox(label="Casting status", interactive=False, visible=False)
-                                with gr.Accordion("Character reference and transcript", open=False):
+                                with gr.Accordion("Character reference and transcript", open=True, visible=False) as cast_details:
                                     cast_reference = gr.Audio(
                                         sources=["upload", "microphone"], type="filepath", editable=False,
                                         label="Character reference audio", buttons=[],
@@ -249,10 +262,11 @@ def build_app() -> gr.Blocks:
                                     )
                                     transcribe_cast = gr.Button("Retry character transcription", size="sm")
                                     cast_instructions = gr.Textbox(label="Default delivery instructions", lines=2)
-                                    save_cast = gr.Button("Save character voice")
+                                save_cast = gr.Button("Save assignment")
                                 cast_draft = gr.State(RenderVoice())
                                 cast_draft_role = gr.State(None)
 
+                            attribute = gr.Button("Assign dialogue", interactive=False)
                             with gr.Accordion("Review dialogue assignments", open=False, visible=False) as review_panel:
                                 review_section = gr.Dropdown(label="Book section", choices=[], interactive=True)
                                 review_lines = gr.Dataframe(
@@ -356,11 +370,42 @@ def build_app() -> gr.Blocks:
                     with gr.Tab("Settings"):
                         runtime_panel = create_runtime_panel(book, private_event=PRIVATE_EVENT, app=app)
 
-        activity_panel.bind(app, book_progress)
+                activity_panel.bind(app, book_progress)
+
         voice_panel.bind(app, cast_library_voice, event_options=PRIVATE_EVENT)
         text_import.bind(event_options=PRIVATE_EVENT)
         line_voice_panel.bind(app, book, event_options=PRIVATE_EVENT)
         remote_panel.bind(event_options=PRIVATE_EVENT)
+
+        key_saved = "API key saved for this endpoint."
+        key_missing = "No API key saved for this endpoint."
+
+        def saved_key_status(endpoint):
+            try:
+                return key_saved if has_api_key(endpoint or "") else key_missing
+            except StoredApiKeyError as exc:
+                return str(exc)
+
+        def save_llm_key(endpoint, key):
+            try:
+                save_api_key(endpoint or "", key or "")
+            except StoredApiKeyError as exc:
+                return gr.skip(), str(exc)
+            return "", key_saved
+
+        def forget_llm_key(endpoint):
+            try:
+                forget_api_key(endpoint or "")
+            except StoredApiKeyError as exc:
+                return str(exc)
+            return key_missing
+
+        key_events = {**PRIVATE_EVENT, "show_progress": "hidden"}
+        app.load(saved_key_status, [llm_endpoint], [key_status], **key_events)
+        llm_endpoint.change(saved_key_status, [llm_endpoint], [key_status], **key_events)
+        save_key.click(save_llm_key, [llm_endpoint, api_key], [api_key, key_status], **key_events)
+        forget_key.click(forget_llm_key, [llm_endpoint], [key_status], **key_events)
+
         chat_panel.bind(
             api_key=api_key, llm_model=llm_model, effort=effort, endpoint=llm_endpoint,
             voice_panel=voice_panel, model_settings=model_settings, runtime_panel=runtime_panel,
@@ -374,7 +419,7 @@ def build_app() -> gr.Blocks:
         )
 
         def present_book(session, voices, problem=None):
-            table, roles = _review_components(session, voices)
+            table, roles = _review_components(session)
             has_text = session is not None and bool(session.book.sections)
             return (
                 session,
@@ -627,124 +672,197 @@ def build_app() -> gr.Blocks:
             reasoning: str,
             endpoint: str,
             settings_json: str,
-            voices: dict[str, RenderVoice],
-            role: str | None,
             *,
-            new_roster: bool = False,
+            console: Callable[[str], None],
+            preserved_cast: dict[str, RenderVoice] | None = None,
             **kwargs,
         ):
             secret = (key or "").strip()
             try:
                 if session is None:
                     raise WebBackendError("Import book text first.")
+                if not secret:
+                    secret = load_api_key(endpoint or "")
+                if secret and secret in (endpoint or ""):
+                    raise WebBackendError("Remove the API key from the chat completions URL.")
+                console("Waiting for the LLM.\n")
                 session = operation(
                     session, secret, model, effort=reasoning or "", endpoint=endpoint,
                     settings_json=settings_json or "", **kwargs,
                 )
-            except WebBackendError as exc:
+            except (StoredApiKeyError, WebBackendError) as exc:
                 message = str(exc).replace(secret, "[redacted]") if secret else str(exc)
             except Exception:
                 message = "Character analysis failed. Check your LLM settings and try again."
             else:
-                if new_roster:
-                    voices = {}
-                    role = None
-                table, roles = _review_components(session, voices, role)
-                message = session.attribution_notice or (
-                    "Character roster ready. Assign dialog next." if new_roster else "Dialog assignments ready."
+                if preserved_cast is not None:
+                    table, roles = _review_components(session)
+                    count = len(table["value"])
+                    label = "character" if count == 1 else "characters"
+                    message = (
+                        f"Identified {count:,} {label}. Uncast roles use the narrator. "
+                        "Save any voice overrides, then click Assign dialogue."
+                    )
+                    console(message + "\n")
+                    return session, preserved_cast, table, roles, voice_status(message), gr.update(interactive=session.roster is not None)
+                else:
+                    message = session.attribution_notice or "Dialogue matched to speakers."
+                    console(message + "\n")
+                    return session, gr.skip(), gr.skip(), gr.skip(), voice_status(message), gr.skip()
+            console(message + "\n")
+            return (*[gr.skip()] * 4, gr.update(value=message, visible=True), gr.skip())
+
+        def find_characters(session, key, model, reasoning, endpoint, params, voices, request: gr.Request):
+            console = activity_panel.console_for(request.session_hash)
+            console("\nIdentifying characters.\n")
+            if session is not None:
+                yield (
+                    *[gr.skip()] * 4,
+                    gr.update(value="Waiting for the LLM to identify characters.", visible=True),
+                    gr.skip(),
                 )
-                return (
-                    session, voices, _book_summary(session), table, roles,
-                    gr.update(value=message, visible=True),
-                    gr.update(interactive=session.roster is not None),
-                )
-            return (*[gr.skip()] * 5, gr.update(value=message, visible=True), gr.skip())
-
-        def find_characters(session, key, model, reasoning, endpoint, params, voices, role, progress=gr.Progress()):
-            progress(0, desc="Identifying characters")
-            return analyze_book(
-                identify_characters, session, key, model, reasoning, endpoint, params, voices, role, new_roster=True,
+            yield analyze_book(
+                identify_characters, session, key, model, reasoning, endpoint, params, console=console,
+                preserved_cast={role: voices[role] for role in UNIDENTIFIED_CAST_ROLES if role in voices},
             )
 
-        def find_speakers(session, key, model, reasoning, endpoint, params, voices, role, progress=gr.Progress()):
-            progress(0, desc="Assigning dialog")
-            return analyze_book(
-                attribute_dialog, session, key, model, reasoning, endpoint, params, voices, role,
-                on_progress=lambda done, total: progress((done, total), desc="Assigning dialog"),
+        def find_speakers(session, key, model, reasoning, endpoint, params, request: gr.Request):
+            console = activity_panel.console_for(request.session_hash)
+            console("\nAssigning dialogue.\n")
+            if session is not None:
+                yield *[gr.skip()] * 4, voice_status("Assigning dialogue…"), gr.skip()
+            last_report = None
+
+            def report_progress(done: int, total: int) -> None:
+                nonlocal last_report
+                counts = (done, total)
+                if counts != last_report:
+                    console(f"Dialogue chunks complete: {done}/{total}.\n")
+                    last_report = counts
+
+            yield analyze_book(
+                attribute_dialog, session, key, model, reasoning, endpoint, params,
+                console=console, on_progress=report_progress,
             )
 
-        analysis_inputs = [book, api_key, llm_model, effort, llm_endpoint, llm_extra_params, cast, cast_role]
-        analysis_outputs = [book, cast, summary, characters, cast_role, analysis_status, attribute]
-        identified = identify.click(find_characters, analysis_inputs, analysis_outputs, **PRIVATE_EVENT)
-        attributed = attribute.click(find_speakers, analysis_inputs, analysis_outputs, **PRIVATE_EVENT)
-
-        def cast_fields_for(role, voice, selected=None):
-            return (
-                cast_reference.move_resource_to_block_cache(voice.reference_path),
-                gr.update(value=voice.transcript, interactive=True), voice.instructions,
-                voice, role, gr.update(value=selected), voice_status(),
-            )
-
-        def show_cast_voice(role: str | None, voices: dict[str, RenderVoice]):
-            return (
-                gr.update(visible=role is not None),
-                *cast_fields_for(role, voices.get(role, RenderVoice())), voice_status(),
-            )
+        analysis_inputs = [book, api_key, llm_model, effort, llm_endpoint, llm_extra_params]
+        analysis_outputs = [book, cast, characters, cast_role, analysis_status, attribute]
+        identified = identify.click(
+            find_characters, [*analysis_inputs, cast], analysis_outputs, show_progress="hidden", **PRIVATE_EVENT,
+        )
+        attributed = attribute.click(
+            find_speakers, analysis_inputs, analysis_outputs, show_progress="hidden", **PRIVATE_EVENT,
+        )
 
         cast_fields = [
-            cast_reference, cast_transcript, cast_instructions, cast_draft, cast_draft_role,
-            cast_library_voice, cast_transcription_status, cast_status,
+            cast_mode, cast_library_voice, cast_details, cast_reference, cast_transcript,
+            cast_instructions, cast_draft, cast_draft_role, cast_transcription_status, cast_status,
         ]
-        cast_role.change(show_cast_voice, [cast_role, cast], [cast_editor, *cast_fields], **PRIVATE_EVENT)
-
-        def cast_problem(message):
-            return (*[gr.skip()] * (len(cast_outputs) - 1), voice_status(message))
-
-        def update_cast(session, voices, role, voice, selected=None):
-            roster = session.roster if session is not None else None
-            narrator = roster.narrator if roster is not None else None
-            if roster is None or role not in roster.ids or role in {"NARRATOR", narrator.id if narrator else None}:
-                return cast_problem("Choose a character from the roster.")
-            next_voices = dict(voices)
-            if voice == RenderVoice():
-                next_voices.pop(role, None)
-                message = "This character will use the narrator voice."
-            else:
-                next_voices[role] = voice
-                message = f"Assigned {voice.name}." if voice.name else "Character voice saved."
-            table, _ = _review_components(session, next_voices, role)
-            return next_voices, table, *cast_fields_for(role, voice, selected), voice_status(message)
-
-        def use_saved_cast_voice(session, voices, role, selected):
-            if not selected:
-                return tuple(gr.skip() for _ in cast_outputs)
-            try:
-                return update_cast(session, voices, role, load_voice(selected).voice, selected)
-            except WebVoiceError as exc:
-                return cast_problem(str(exc))
-
-        def save_direct_cast(session, voices, role, draft_role, draft, reference, transcript, instructions):
-            if role is None or role != draft_role:
-                return cast_problem("Wait for the selected character’s voice settings to load.")
-            voice = replace(
-                draft, reference_path=reference, transcript=(transcript or "").strip(),
-                instructions=(instructions or "").strip(), trim_start=draft.trim_start if reference else 0.0,
-                trim_end=draft.trim_end if reference else None,
-            )
-            return update_cast(session, voices, role, voice)
-
         cast_inputs = [book, cast, cast_role]
-        cast_outputs = [cast, characters, *cast_fields]
-        cast_library_voice.input(use_saved_cast_voice, [*cast_inputs, cast_library_voice], cast_outputs, **PRIVATE_EVENT)
-        save_cast.click(
-            save_direct_cast,
-            [*cast_inputs, cast_draft_role, cast_draft, cast_reference, cast_transcript, cast_instructions],
-            cast_outputs,
-            **PRIVATE_EVENT,
+        cast_outputs = [cast, *cast_fields]
+        narrator_cast_outputs = [*voice_panel.outputs, *voice_panel.selection_outputs, voice_panel.library_status]
+
+        def cast_fields_for(role, voice, message, *, mode="saved", selected=None, is_narrator=False):
+            return (
+                gr.update(value=mode, visible=not is_narrator),
+                gr.update(value=selected, visible=mode == "saved"), gr.update(visible=mode == "custom"),
+                cast_reference.move_resource_to_block_cache(voice.reference_path),
+                gr.update(value=voice.transcript, interactive=True), voice.instructions,
+                voice, role, voice_status(), voice_status(message),
+            )
+
+        def show_cast_voice(role, voices, session, narrator_selected, narrator_name):
+            if role is None or session is None:
+                return gr.update(visible=False), *cast_fields_for(None, RenderVoice(), None)
+            if role == _narrator_role(session):
+                message = f"Narrator uses {narrator_name}." if narrator_name else "Narrator uses the voice in Voice settings."
+                return gr.update(visible=True), *cast_fields_for(
+                    role, RenderVoice(), message, selected=narrator_selected, is_narrator=True,
+                )
+            role_name = _cast_role_name(session, role)
+            if role_name is None:
+                return gr.update(visible=False), *cast_fields_for(None, RenderVoice(), None)
+            voice = voices.get(role)
+            if voice is None:
+                fields = cast_fields_for(role, RenderVoice(), f"{role_name} uses the narrator voice by default.")
+            elif voice == RenderVoice():
+                fields = cast_fields_for(role, voice, f"{role_name} uses the narrator voice.", mode="narrator")
+            else:
+                selected = matching_voice_id(voice)
+                if selected is not None:
+                    message = f"{role_name} uses {voice.name}."
+                elif voice.name:
+                    message = f"{role_name} uses a saved copy of {voice.name}."
+                else:
+                    message = f"{role_name} uses a custom voice."
+                try:
+                    fields = cast_fields_for(
+                        role, voice, message, mode="saved" if voice.name else "custom", selected=selected,
+                    )
+                except OSError:
+                    fields = cast_fields_for(role, RenderVoice(), f"Could not open the voice assigned to {role_name}.")
+            return gr.update(visible=True), *fields
+
+        cast_role.change(
+            show_cast_voice, [cast_role, cast, book, voice_panel.selected, voice_panel.name],
+            [cast_editor, *cast_fields], **PRIVATE_EVENT,
         )
-        clear_cast.click(
-            lambda session, voices, role: update_cast(session, voices, role, RenderVoice()),
-            cast_inputs, cast_outputs, **PRIVATE_EVENT,
+        cast_mode.input(
+            lambda mode: (gr.update(visible=mode == "saved"), gr.update(visible=mode == "custom")),
+            cast_mode, [cast_library_voice, cast_details], show_progress="hidden", **PRIVATE_EVENT,
+        )
+
+        def save_cast_assignment(session, voices, role, draft_role, mode, selected, draft, reference, transcript, instructions):
+            narrator_unchanged = tuple(gr.skip() for _ in narrator_cast_outputs)
+            try:
+                if session is None or role is None or role != draft_role:
+                    raise WebVoiceError("Choose a character and wait for its voice settings to load.")
+                is_narrator = role == _narrator_role(session)
+                if is_narrator or mode == "saved":
+                    if not selected:
+                        raise WebVoiceError("Choose a saved voice before saving the assignment.")
+                    voice = load_voice(selected).voice
+                elif mode == "narrator":
+                    voice = RenderVoice()
+                elif mode == "custom":
+                    voice = replace(
+                        draft, reference_path=reference, transcript=(transcript or "").strip(),
+                        instructions=(instructions or "").strip(), trim_start=draft.trim_start if reference else 0.0,
+                        trim_end=draft.trim_end if reference else None,
+                    )
+                    if voice == RenderVoice():
+                        raise WebVoiceError("Add a custom reference or choose a different voice source.")
+                else:
+                    raise WebVoiceError("Choose a voice source before saving the assignment.")
+                if is_narrator:
+                    narrator_fields = voice_panel.show(voice)
+                    *selection_updates, _ = voice_panel.refresh(selected, selected)
+                    fields = cast_fields_for(
+                        role, RenderVoice(), f"Saved {voice.name} for the narrator.", selected=selected, is_narrator=True,
+                    )
+                    return (
+                        gr.skip(), *fields, *narrator_fields, *selection_updates, voice_status(),
+                    )
+                role_name = _cast_role_name(session, role)
+                if role_name is None:
+                    raise WebVoiceError("Choose a role from the casting list.")
+                if mode == "narrator":
+                    message = f"Saved the narrator voice for {role_name}."
+                else:
+                    message = f"Saved {voice.name or 'a custom voice'} for {role_name}."
+                fields = cast_fields_for(role, voice, message, mode=mode, selected=selected if mode == "saved" else None)
+                return {**voices, role: voice}, *fields, *narrator_unchanged
+            except (WebVoiceError, WebRenderError) as exc:
+                message = str(exc)
+            except OSError:
+                message = "Could not open the saved reference."
+            return *[gr.skip()] * (len(cast_outputs) - 1), voice_status(message), *narrator_unchanged
+
+        save_cast.click(
+            save_cast_assignment,
+            [*cast_inputs, cast_draft_role, cast_mode, cast_library_voice, cast_draft,
+             cast_reference, cast_transcript, cast_instructions],
+            [*cast_outputs, *narrator_cast_outputs], **PRIVATE_EVENT,
         )
         bind_transcription(
             cast_reference, cast_language, cast_transcript, cast_transcription_status, transcribe_cast,
@@ -787,16 +905,15 @@ def build_app() -> gr.Blocks:
         def display_review_section(session, section):
             return (*section_controls(session, section), gr.update(value=None, visible=False))
 
-        def update_dialogue_speaker(session, voices, role, section, line, speaker):
+        def update_dialogue_speaker(session, section, line, speaker):
             try:
                 if session is None:
                     raise WebBackendError("Import book text first.")
                 session = correct_speaker(session, section, line, speaker)
             except WebBackendError as exc:
-                return (*[gr.skip()] * 6, gr.update(value=str(exc), visible=True))
-            table, _ = _review_components(session, voices, role)
+                return (*[gr.skip()] * 5, gr.update(value=str(exc), visible=True))
             return (
-                session, table, *section_controls(session, section, line),
+                session, *section_controls(session, section, line),
                 gr.update(value="Speaker assignment updated.", visible=True),
             )
 
@@ -822,8 +939,8 @@ def build_app() -> gr.Blocks:
         review_outputs = [review_lines, review_line, review_speaker, save_speaker, review_status]
         review_section.change(display_review_section, [book, review_section], review_outputs, **PRIVATE_EVENT)
         save_speaker.click(
-            update_dialogue_speaker, [book, cast, cast_role, review_section, review_line, review_speaker],
-            [book, characters, *review_outputs], **PRIVATE_EVENT,
+            update_dialogue_speaker, [book, review_section, review_line, review_speaker], [book, *review_outputs],
+            **PRIVATE_EVENT,
         )
 
         def generate_audiobook(
@@ -838,6 +955,9 @@ def build_app() -> gr.Blocks:
                     gr.update(value="Import book text and choose an installed speech model.", visible=True),
                     gr.skip(), gr.skip(),
                 )
+                return
+            if problem := book_cast_problem(session, first_line=first, last_line=last):
+                yield voice_status(problem), gr.skip(), gr.skip()
                 return
             try:
                 narrator = voice_panel.snapshot(*narrator_fields)
@@ -998,9 +1118,9 @@ def build_app() -> gr.Blocks:
             unchanged = [gr.skip()] * 8
             console = activity_panel.console_for(request.session_hash)
 
-            def report_setup(description):
-                progress(0, desc=description)
-                console(description + "\n")
+            def report_setup(update: ModelSetupProgress) -> None:
+                progress((update.completed, update.total), desc=update.description)
+                console(update.description + "\n")
 
             with running_job(request) as cancel:
                 console("\nInstalling speech model\n")
@@ -1053,6 +1173,7 @@ def build_app() -> gr.Blocks:
                 batch_size, generate_book, generate_samples, sample_status,
                 model_panel.setup_status, model_panel.install, model_panel.cancel, chat_panel.speech_model,
             ],
+            show_progress_on=model_panel.setup_status,
             **PRIVATE_EVENT,
         )
 
@@ -1063,8 +1184,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Launch the local TTS Audiobook Tool browser interface.")
     parser.add_argument("--port", type=int, default=7862)
     parser.add_argument("--open", action="store_true", help="Open the browser after launch.")
+    parser.add_argument("--terminal-log", action="store_true", help="Also show browser console output in this terminal.")
     args = parser.parse_args()
-    build_app().launch(
+    build_app(terminal_log=args.terminal_log).launch(
         server_name="127.0.0.1",
         server_port=args.port,
         inbrowser=args.open,

@@ -118,6 +118,7 @@ class FishS2Model(FishS2BaseModel):
         logger.remove()
         logger.add(sys.stderr, level="WARNING", filter="fish_speech")
 
+    @torch.no_grad()
     def _create_voice_clone(self, source_path: str, transcribed_text: str) -> VoiceClone:
         """
         Prepares a voice clone: loads the reference audio and eagerly encodes

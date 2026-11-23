@@ -100,6 +100,8 @@ class GenerateUtil:
             batch_size: int,
             is_regen: bool,
             staging_dir: str = "",
+            *,
+            suppress_validation_passes: bool = False,
     ) -> bool:
         """
         Subroutine for doing a series of audio generations to files
@@ -112,6 +114,8 @@ class GenerateUtil:
             of the project's segments directory: existing project segments are
             left untouched, redundant takes are pruned within the staging
             directory, and the project's generation range is not updated.
+        :param suppress_validation_passes:
+            Omit routine first-attempt validation passes from console output.
 
         Returns:
             True if ended because interrupted (user pressed control-c)
@@ -364,6 +368,12 @@ class GenerateUtil:
                 phrase_group = project.phrase_groups[index]
                 stt_info: SegmentTranscriptData | None = None
                 should_show_viz = False
+                quiet_pass = (
+                    suppress_validation_passes
+                    and isinstance(validation_result, TranscriptResult)
+                    and not validation_result.is_fail
+                    and retry_counts[i] == 0
+                )
                 message_lines = []
 
                 retry_string = f" (retry #{retry_counts[i]})" if retry_counts[i] else ""
@@ -394,7 +404,7 @@ class GenerateUtil:
                 elif validation_result:
                     consecutive_model_errors = 0
 
-                    val_line = f"{validation_result.get_ui_message_with_extras()}"
+                    val_line = "" if quiet_pass else validation_result.get_ui_message_with_extras()
                     validation_word_error_count: int | None = None
                     if isinstance(validation_result, TranscriptResult):
                         validation_word_error_count = SegmentTranscriptUtil.make_generation_word_error_count(validation_result)
@@ -457,8 +467,17 @@ class GenerateUtil:
                             or (isinstance(validation_result, WordErrorResult) and validation_result.num_errors > 0)
                         )
 
-                    val_line += Ansi.RESET
-                    message_lines.append(val_line)
+                    if not quiet_pass:
+                        message_lines.append(val_line + Ansi.RESET)
+                    else:
+                        # A routine pass can still report a trim or truncation warning.
+                        warnings = (
+                            validation_result.get_ui_message() if isinstance(validation_result, TrimmedResult) else "",
+                            validation_result.get_possible_truncation_ui_message(),
+                            validation_result.get_generated_trim_ui_message(),
+                            validation_result.get_trailing_token_noise_trim_ui_message(),
+                        )
+                        message_lines.extend(warning + Ansi.RESET for warning in warnings if warning)
 
                     # Update word count metrics
                     word_counts[index] = phrase_group.num_words
@@ -475,7 +494,7 @@ class GenerateUtil:
                         dir_path=staging_dir or None,
                     )
                     if err:
-                        save_line = f"{COL_ERROR}Couldn't save file: {err} {saved_path}"
+                        message_lines.append(f"{COL_ERROR}Couldn't save file: {err} {saved_path}")
                     else:
                         saved_indices.add(index)
                         if staging_dir:
@@ -489,16 +508,17 @@ class GenerateUtil:
                             saved_audio_seconds += duration - saved_durations.get(index, 0.0)
                             saved_durations[index] = duration
 
-                        url = saved_path
-                        text = Path(saved_path).name
-                        link = text_util.make_terminal_hyperlink(url=url, text=text, is_file=True)
-                        save_line = f"Saved: {COL_DIM}{link}{Ansi.RESET}"
+                        if not quiet_pass:
+                            link = text_util.make_terminal_hyperlink(
+                                url=saved_path, text=Path(saved_path).name, is_file=True,
+                            )
+                            message_lines.append(f"Saved: {COL_DIM}{link}{Ansi.RESET}")
 
-                    message_lines.append(save_line)
-
+                if quiet_pass and len(message_lines) == 1:
+                    continue
                 printt("\n".join(message_lines))
 
-                if validation_result:
+                if validation_result and not quiet_pass:
                     printt()
                     if stt_info is not None:
                         printt(

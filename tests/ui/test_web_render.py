@@ -17,13 +17,16 @@ from tts_audiobook_tool.app_types import Book, BookSection, RoomReverb, Sound, S
 from tts_audiobook_tool.app_types.book_serialization import book_to_project_text_json_dict
 from tts_audiobook_tool.app_types.phrase import Phrase, PhraseGroup, Reason
 from tts_audiobook_tool.constants import AAC_BITRATE_DEFAULT, AAC_BITRATES
+from tts_audiobook_tool.generation_events import GenerationPhase
 from tts_audiobook_tool.model_worker_protocol import (
     ConsoleOutput,
     GenerationFinished,
     GenerationTerminalStatus,
+    GenerationUpdate,
     TtsPreviewFinished,
 )
 from tts_audiobook_tool.speaker_assign.attribution import AttributionsFile
+from tts_audiobook_tool.speaker_assign.roster import Roster, RosterCharacter
 from tts_audiobook_tool.tts_models.tts_model_type import TtsModelType
 from tts_audiobook_tool.web_backend import BookSession
 
@@ -176,6 +179,42 @@ def test_pocket_preset_uses_no_reference_audio_in_render_project_or_checkpoint(t
     )
 
 
+def test_pocket_sample_applies_the_browser_model_default(monkeypatch):
+    model = TtsModelType.require_by_id("pocket_local")
+    monkeypatch.setattr(web_render, "_detect_model", lambda: model)
+    monkeypatch.setattr(web_render, "mark_interactive_main", lambda: None)
+    monkeypatch.setattr(web_render.Tts, "_available_local_models", (model,))
+
+    def submit(*, state, prompt):
+        assert state.project.get_model_setting(model.id, "model_code") == "english_2026-10"
+        return "job"
+
+    sample = Sound(np.full(300, 0.125, dtype=np.float32), 24000)
+    result = TtsPreviewFinished("job", GenerationTerminalStatus.COMPLETED, sample)
+    monkeypatch.setattr(web_render.ModelWorker, "submit_tts_preview", submit)
+    monkeypatch.setattr(web_render.ModelWorker, "get_event", lambda **_: result)
+    voice = web_render.RenderVoice(presets=((model.id, "Alba"),))
+    output = Path(web_render.render_sample("A line.", voice))
+    try:
+        assert soundfile.info(output).frames == sample.data.size
+    finally:
+        output.unlink()
+
+
+def test_pocket_default_preserves_existing_explicit_checkpoint_id():
+    model = "pocket_local"
+    args = (Book([]), [web_render.RenderVoice()], model, "en", False, 1)
+    explicit = {"model_code": "english_2026-10"}
+    existing = web_render._checkpoint_id(*args, model_options=explicit)
+    for option in (None, {}, {"model_code": ""}, explicit):
+        effective = web_render._validated_model_options(model, option)
+        assert effective == explicit
+        assert web_render._checkpoint_id(*args, model_options=effective) == existing
+    alternative = {"model_code": "french_24l"}
+    assert web_render._validated_model_options(model, alternative) == alternative
+    assert web_render._checkpoint_id(*args, model_options=alternative) != existing
+
+
 def test_trim_preview_uses_selected_frames_without_clone_processing(tmp_path):
     clip = tmp_path / "reference.wav"
     sr = 16000
@@ -305,31 +344,54 @@ def test_cancelled_stuck_worker_is_shut_down(monkeypatch):
     assert calls == [("cancel", "job"), ("shutdown",)]
 
 
-def test_cast_prefers_named_narrator_and_preserves_original_book(monkeypatch):
+def test_cast_uses_shared_voices_and_falls_back_to_the_named_narrator(monkeypatch):
+    lines = ("Opening", "A named speaker", "A manual voice", "Unknown", "Uncast speaker",
+             "An unidentified woman", "An unidentified man", "Another unidentified man", "The custodian")
     book = Book([BookSection(phrase_groups=[
-        PhraseGroup(phrases=[Phrase(text=text, reason=Reason.SENTENCE)]) for text in ("Opening", "Hello", "Again", "Yes")
+        PhraseGroup(phrases=[Phrase(text=text, reason=Reason.SENTENCE)]) for text in lines
     ])])
-    attributions = AttributionsFile()
-    monkeypatch.setattr(
-        AttributionsFile, "speaker_of_each_line",
-        lambda _self, _book: {1: "ALEX", 2: "ALEX", 3: "UNKNOWN"},
-    )
+    speakers = {
+        1: "ALEX",
+        2: "ALEX",
+        3: "UNKNOWN",
+        4: "SAM",
+        5: "other:  Unidentified   Female",
+        6: "OTHER:unidentified male",
+        7: "OTHER:UNIDENTIFIED_MALE",
+        8: "OTHER:Custodian",
+    }
+    monkeypatch.setattr(AttributionsFile, "speaker_of_each_line", lambda _self, _book: speakers)
+
     manual = web_render.RenderVoice(name="Line voice")
     book.phrase_groups[2].voice_index = 12
-    session = SimpleNamespace(
-        book=book,
-        roster=SimpleNamespace(narrator=SimpleNamespace(id="NINA")),
-        attributions=attributions,
-        line_voices={12: manual},
-    )
+    roster = Roster((
+        RosterCharacter("NINA", "Nina", is_narrator=True),
+        RosterCharacter("ALEX", "Alex"),
+        RosterCharacter("SAM", "Sam"),
+    ))
+    session = BookSession(book, "", roster=roster, line_voices={12: manual})
     nina = web_render.RenderVoice(instructions="Calm")
     alex = web_render.RenderVoice(instructions="Quiet")
-    cast_book, voices = web_render._cast_book(
-        session, {"NINA": nina, "ALEX": alex, "NARRATOR": web_render.RenderVoice()},
-    )
-    assert voices == [nina, alex, manual]
-    assert [group.voice_index for group in cast_book.phrase_groups] == [0, 1, 2, 0]
-    assert [group.voice_index for group in book.phrase_groups] == [0, 0, 12, 0]
+    female = web_render.RenderVoice(instructions="Measured")
+    male = web_render.RenderVoice(instructions="Warm")
+    cast = {
+        "NINA": nina, "ALEX": alex, "NARRATOR": web_render.RenderVoice(),
+        "OTHER:unidentified female": female, "OTHER:unidentified male": male,
+    }
+
+    cast_book, voices = web_render._cast_book(session, cast)
+    assert voices == [nina, alex, manual, female, male]
+    assert [group.voice_index for group in cast_book.phrase_groups] == [0, 1, 2, 0, 0, 3, 4, 4, 0]
+    assert [group.voice_index for group in book.phrase_groups] == [0, 0, 12, 0, 0, 0, 0, 0, 0]
+    labels = web_render._cast_voice_labels(session, cast, voices)
+    assert "unidentified female" in labels[3].casefold()
+    assert "unidentified male" in labels[4].casefold()
+    assert "other:" not in labels[3].casefold()
+    assert "other:" not in labels[4].casefold()
+
+    cast_book, voices = web_render._cast_book(session, {"NINA": nina, "ALEX": web_render.RenderVoice()})
+    assert voices == [nina, manual]
+    assert [group.voice_index for group in cast_book.phrase_groups] == [0, 0, 1, 0, 0, 0, 0, 0, 0]
 
 
 def test_process_exit_reaps_idle_model_worker(tmp_path):
@@ -382,7 +444,7 @@ def test_book_retries_only_missing_audio_and_keeps_completed_export(monkeypatch,
     time = np.arange(24000, dtype=np.float32) / 24000
     sample = Sound(0.12 * np.sin(2 * np.pi * time * 440), 24000)
 
-    def submit(*, state, indices, batch_size, is_regen, staging_dir):
+    def submit(*, state, indices, batch_size, is_regen, staging_dir, **_):
         assert not is_regen and not staging_dir
         submissions.append(indices)
         temperatures.append(state.project.get_model_setting(model.id, "temperature"))
@@ -448,7 +510,7 @@ def test_selective_generation_shares_checkpoint_and_regeneration_retains_existin
     sample = Sound(0.12 * np.sin(2 * np.pi * time * 400), 24000)
     export_path = None
 
-    def submit(*, state, indices, batch_size, is_regen, staging_dir):
+    def submit(*, state, indices, batch_size, is_regen, staging_dir, **_):
         requests.append((indices, is_regen))
         assert state.project.strictness is Strictness.HIGH
         assert state.project.max_retries == 0
@@ -549,11 +611,15 @@ def test_book_uses_selected_validation_prefs_and_saves_native_generation_log(mon
     )
     events = iter([
         ConsoleOutput("another-job", "stdout", "Do not record this job.\n"),
-        ConsoleOutput("job", "stdout", "\x1b[32mLine 1 passed\x1b[0m\r\n"),
+        GenerationUpdate("job", GenerationPhase("Preparing models")),
+        GenerationUpdate("job", GenerationPhase("Preparing models")),
+        ConsoleOutput("job", "stdout", "\x1b[32mGenerated audio in 1.0s\x1b[0m\r\n"),
         GenerationFinished("job", GenerationTerminalStatus.COMPLETED, ""),
     ])
+    console = []
 
-    def submit(*, state, indices, **_):
+    def submit(*, state, indices, suppress_validation_passes, **_):
+        assert suppress_validation_passes is True
         assert indices == {0}
         assert state.prefs.stt_variant is SttVariant.LARGE_V3
         assert state.prefs.stt_config is SttConfig.CPU_INT8FLOAT32
@@ -570,11 +636,18 @@ def test_book_uses_selected_validation_prefs_and_saves_native_generation_log(mon
 
     monkeypatch.setattr(web_render.ModelWorker, "submit_generation", submit)
     monkeypatch.setattr(web_render.ModelWorker, "get_event", lambda **_: next(events))
-    assert web_render.render_book(session, {}, runtime_settings=runtime, auto_concat=False) is None
+    monkeypatch.setattr(web_render.ModelWorker, "drain_events", lambda: [
+        ConsoleOutput("another-job", "stdout", "Do not record this either.\n"),
+        ConsoleOutput("job", "stdout", "Lines saved: 1 (all)\n"),
+    ])
+    assert web_render.render_book(session, {}, runtime_settings=runtime, auto_concat=False, on_console=console.append) is None
     assert native_lookups == [(SttVariant.LARGE_V3.id, True)]
+    assert console.count("Preparing models\n") == 1
+    assert console[-3:] == ["Lines saved: 1 (all)\n", "Generation completed.\n", "Automatic export is off.\n"]
+    assert "Do not record" not in "".join(console)
     log = latest_generation_log(str(tmp_path))
     assert log is not None
-    assert Path(log).read_text(encoding="utf-8") == "Line 1 passed\nGeneration completed.\n"
+    assert Path(log).read_text(encoding="utf-8") == "Generated audio in 1.0s\nLines saved: 1 (all)\nGeneration completed.\n"
 
 
 def test_automatic_export_rebuilds_for_bitrate_without_regenerating_takes(monkeypatch, tmp_path):

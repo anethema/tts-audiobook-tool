@@ -5,7 +5,7 @@ import wave
 
 import pytest
 
-pytest.importorskip("torchaudio")
+torchaudio = pytest.importorskip("torchaudio")
 
 import torch
 
@@ -71,6 +71,24 @@ def stub_generate(model, monkeypatch, generated: list) -> None:
         "generate",
         lambda **kwargs: (generated.append(kwargs), Sound([0.0] * 10, 24000))[1],
     )
+
+
+def test_fish_s2_encodes_reference_without_gradients(monkeypatch):
+    model = make_model()
+    encode = model.dac_model.encode
+
+    def encode_without_gradients(audios, audio_lengths):
+        assert not torch.is_grad_enabled()
+        return encode(audios, audio_lengths)
+
+    monkeypatch.setattr(model.dac_model, "encode", encode_without_gradients)
+    monkeypatch.setattr(torchaudio, "load", lambda _: (torch.zeros(1, 480), model.dac_model.sample_rate))
+
+    with torch.enable_grad():
+        clone = model._create_voice_clone("reference.wav", "Reference text")
+        assert torch.is_grad_enabled()
+
+    assert clone.prompt_tokens.device.type == "cpu"
 
 
 def test_fish_s2_reuses_prompt_tokens_for_a_b_a(tmp_path, monkeypatch):

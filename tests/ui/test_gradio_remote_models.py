@@ -10,7 +10,7 @@ from tts_audiobook_tool import web_remote_panel
 from tts_audiobook_tool.app_support.remote_tts_discovery import RemoteTtsDiscovery, RemoteTtsSnapshot
 from tts_audiobook_tool.tts_models.model_spec import TtsBackendKind
 from tts_audiobook_tool.tts_models.tts_model_type import TtsModelType
-from tts_audiobook_tool.web_model_setup import WebModelSetupError
+from tts_audiobook_tool.web_model_setup import ModelSetupProgress, WebModelSetupError
 from tts_audiobook_tool.web_remote_models import WebRemoteTtsError
 
 
@@ -65,16 +65,19 @@ def test_remote_panel_requires_refresh_before_a_changed_url_can_render(monkeypat
 
 def test_remote_client_install_action_reports_progress_and_recovers_after_cancel(monkeypatch):
     calls = []
+    progress = []
 
     def install(*, on_progress, cancel_event):
         calls.append(cancel_event.is_set())
-        on_progress("Prepare the launcher marker")
         if cancel_event.is_set():
             raise WebModelSetupError("Model setup was stopped.")
+        on_progress(ModelSetupProgress(2, 5, "Verify the launcher marker"))
+        on_progress(ModelSetupProgress(5, 5, "Setup complete"))
         return Path("venv-remote-tts")
 
     monkeypatch.setattr(web_remote_panel, "install_remote_client", install)
     monkeypatch.setattr(web_remote_panel, "remote_client_install_supported", lambda: True)
+    monkeypatch.setattr(gr.Progress, "__call__", lambda _self, value, *, desc: progress.append((value, desc)))
     monkeypatch.setattr(RemoteTtsDiscovery, "_probe", lambda *_args: pytest.fail("Unexpected server probe"))
     with gr.Blocks(analytics_enabled=False) as app:
         panel = web_remote_panel.RemoteModelPanel()
@@ -83,6 +86,7 @@ def test_remote_client_install_action_reports_progress_and_recovers_after_cancel
     state = SessionState(app)
     request = gr.Request(session_hash="test-remote-install")
     start = next(fn for fn in app.fns.values() if (panel.install._id, "click") in fn.targets)
+    assert start.show_progress_on == [panel.client_status]
     stop = next(fn for fn in app.fns.values() if (panel.cancel_install._id, "click") in fn.targets)
 
     async def run_install(cancel=False):
@@ -107,3 +111,7 @@ def test_remote_client_install_action_reports_progress_and_recovers_after_cancel
 
     asyncio.run(exercise())
     assert calls == [True, False]
+    assert progress == [
+        ((2, 5), "Verify the launcher marker (2/5 steps complete)"),
+        ((5, 5), "Setup complete (5/5 steps complete)"),
+    ]
