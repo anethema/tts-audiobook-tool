@@ -34,7 +34,7 @@ The browser interface should cover each console workflow with the same project, 
 | Stereo position, volume, and room reverb | Stored on named voices and applied by native generation and export. |
 | LoRA | Adapter options in Speech Models for Breeze, OmniVoice and VibeVoice. |
 | Assign voice selections to arbitrary lines | Inclusive line and range assignment from the named library, including clear and review. Console manual assignments copy where references are available. |
-| Build character roster and attribute dialogue | Supported with OpenAI. Oversized roster requests are tracked as a separate follow-up. |
+| Build character roster and attribute dialogue | **Analyze book** discovers characters and attributes dialogue in the same request per chunk. The browser log shows progress, and completed chunks can be reused. |
 | Review attribution and map named characters to voices | Per-section correction, direct character references, and named library selection. |
 
 ## Generate and export

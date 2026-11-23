@@ -16,7 +16,8 @@ On disk (the keys the prototype's cache already uses):
                 "description": "...",
                 "voice_hint": "elderly; deep, gravelly; slow, imperious",
                 "is_narrator": false,
-                "prominence": "major"
+                "prominence": "major",
+                "merged_ids": ["OLD_BARON_ID"]    # optional user-confirmed redirects
             }
         ]
     }
@@ -112,6 +113,7 @@ class RosterCharacter:
     is_narrator: bool = False
     prominence: Prominence = Prominence.UNKNOWN
     voice_hint: str = ""
+    merged_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not ROSTER_ID_PATTERN.fullmatch(self.id):
@@ -124,13 +126,18 @@ class RosterCharacter:
         object.__setattr__(self, "aliases", tuple(self.aliases))
         if not all(isinstance(alias, str) for alias in self.aliases):
             raise ValueError(f"Roster character {self.id}: aliases must be strings")
+        object.__setattr__(self, "merged_ids", tuple(self.merged_ids))
+        for merged_id in self.merged_ids:
+            if (not isinstance(merged_id, str) or not ROSTER_ID_PATTERN.fullmatch(merged_id)
+                    or merged_id in RESERVED_SPEAKER_IDS):
+                raise ValueError(f"Roster character {self.id}: invalid merged id {merged_id!r}")
 
     def name_keys(self) -> set[str]:
         """The normalized name and aliases (see name_key)."""
         return {name_key(self.name), *(name_key(alias) for alias in self.aliases)}
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value: dict[str, Any] = {
             "id": self.id,
             "name": self.name,
             "aliases": list(self.aliases),
@@ -140,12 +147,15 @@ class RosterCharacter:
             "prominence": self.prominence.value,
             "voice_hint": self.voice_hint,
         }
+        if self.merged_ids:
+            value["merged_ids"] = list(self.merged_ids)
+        return value
 
     @staticmethod
     def from_dict(value: Any) -> RosterCharacter:
         """Parse one stored character. Raises ValueError for a non-object or an
-        invalid id; optional fields are tolerant (a missing or malformed
-        value loads as its default; non-string aliases are dropped)."""
+        invalid id or malformed merge history. Other optional fields are
+        tolerant (non-string aliases are dropped)."""
         if not isinstance(value, dict):
             raise ValueError(f"Expected a roster character object. Value: {value!r}")
         char_id = value.get("id")
@@ -153,6 +163,9 @@ class RosterCharacter:
             raise ValueError(f"Roster character without a string id: {value!r}")
         raw_aliases = value.get("aliases")
         aliases = tuple(a for a in raw_aliases if isinstance(a, str)) if isinstance(raw_aliases, list) else ()
+        merged_ids = value.get("merged_ids", [])
+        if not isinstance(merged_ids, list):
+            raise ValueError(f"Roster character {char_id}: merged ids must be a list")
         return RosterCharacter(
             id=char_id,
             name=_string(value.get("name"), char_id),
@@ -162,6 +175,7 @@ class RosterCharacter:
             is_narrator=value.get("is_narrator") is True,
             prominence=Prominence.from_value(value.get("prominence")),
             voice_hint=_string(value.get("voice_hint"), ""),
+            merged_ids=tuple(merged_ids),
         )
 
 
@@ -202,6 +216,12 @@ class Roster:
         duplicates = sorted({char_id for char_id in ids if ids.count(char_id) > 1})
         if duplicates:
             raise ValueError(f"Duplicate roster ids: {', '.join(duplicates)}")
+        assigned_ids = set(ids)
+        for character in self.characters:
+            for merged_id in character.merged_ids:
+                if merged_id in assigned_ids:
+                    raise ValueError(f"Conflicting merged roster id: {merged_id}")
+                assigned_ids.add(merged_id)
         narrators = [character.id for character in self.characters if character.is_narrator]
         if len(narrators) > 1:
             raise ValueError(f"More than one narrator: {', '.join(narrators)}")

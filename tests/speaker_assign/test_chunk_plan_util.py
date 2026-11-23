@@ -1,5 +1,8 @@
 from tts_audiobook_tool.app_types.phrase import Reason
+from tts_audiobook_tool.speaker_assign.assign_plan import AssignPlan
+from tts_audiobook_tool.speaker_assign.attribution import AttributionsFile, RangeAttribution, UtteranceAttribution
 from tts_audiobook_tool.speaker_assign.chunk_plan_util import ChunkPlanUtil
+from tts_audiobook_tool.speaker_assign.utterance_util import UtteranceUtil
 
 from tests.speaker_assign.speaker_assign_test_support import DIALOG, NARRATION, make_book
 
@@ -40,6 +43,24 @@ def test_oversized_pieces_split_away_from_conversations() -> None:
     groups = book.flat_phrase_groups
     for _, end in chunks[:-1]:
         assert not (groups[end - 1].is_dialog and groups[end].is_dialog)
+
+
+def test_unspaced_text_uses_multiple_chunks_and_reuses_complete_legacy_ranges() -> None:
+    line = ("“" + "他明天回来" * 20 + "。”\n", Reason.PARAGRAPH, DIALOG)
+    book = make_book([line] * 6)
+    before = AssignPlan.make(book, AttributionsFile(), chunk_words=100)
+    assert len(before.chunks) > 1
+    assert all(len(UtteranceUtil.range_text(book, chunk.start, chunk.end).encode("utf-8")) <= 800
+               for chunk in before.chunks)
+
+    original = RangeAttribution(
+        0, 6, UtteranceUtil.range_text_hash(book, 0, 6),
+        tuple(UtteranceAttribution((index,), "MILO") for index in range(6)),
+    )
+    saved = AttributionsFile((original,))
+    assert AssignPlan.make(book, saved, chunk_words=100).is_complete
+    changed = make_book([("“他没有回来。”\n", Reason.PARAGRAPH, DIALOG), *[line] * 5])
+    assert not AssignPlan.make(changed, saved, chunk_words=100).is_complete
 
 
 def test_empty_book_has_no_chunks() -> None:

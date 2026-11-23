@@ -5,6 +5,8 @@ from tts_audiobook_tool.app_types.phrase import Reason
 
 
 DEFAULT_CHUNK_WORDS = 5000
+# Keep the word limit meaningful for scripts that have few spaces.
+BYTES_PER_ESTIMATED_WORD = 8
 # Smaller break-delimited pieces (chapter headings, dedications) join the following text
 MIN_PIECE_WORDS = 20
 CHUNK_BREAK_REASONS = (Reason.SPACE_BREAK, Reason.SECTION_BREAK)
@@ -31,7 +33,7 @@ class ChunkPlanUtil:
         groups = book.flat_phrase_groups
         if not groups:
             return []
-        words = [len(group.text.split()) for group in groups]
+        words = [ChunkPlanUtil._word_weight(group.text) for group in groups]
         section_starts = set(book.section_start_indices())
         line_count = len(groups)
 
@@ -64,6 +66,12 @@ class ChunkPlanUtil:
             else:
                 chunks.append((start, end))
         return chunks
+
+    @staticmethod
+    def _word_weight(text: str) -> int:
+        byte_count = len(text.strip().encode("utf-8"))
+        estimated_words = (byte_count + BYTES_PER_ESTIMATED_WORD - 1) // BYTES_PER_ESTIMATED_WORD
+        return max(len(text.split()), estimated_words)
 
     @staticmethod
     def _split_piece(

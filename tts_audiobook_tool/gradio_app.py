@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from collections.abc import Callable
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import replace
 from threading import Event, Lock
@@ -26,12 +26,12 @@ from tts_audiobook_tool.web_backend import (
     UNIDENTIFIED_CAST_ROLES,
     BookSession,
     WebBackendError,
-    attribute_dialog,
+    analyze_book_dialogue,
     book_cast_problem,
     close_book_session,
-    identify_characters,
 )
 from tts_audiobook_tool.web_book_output_panel import create_book_output_panel
+from tts_audiobook_tool.web_character_merge import merge_characters, suggest_duplicate_characters
 from tts_audiobook_tool.web_chat_panel import VoiceChatPanel
 from tts_audiobook_tool.web_dialogue import correct_speaker, dialogue_rows, dialogue_sections, speaker_choices
 from tts_audiobook_tool.web_projects import (
@@ -112,7 +112,7 @@ def _cast_role_name(session: BookSession, role: str) -> str | None:
     return (character.name or character.id) if character is not None else UNIDENTIFIED_CAST_ROLES.get(role)
 
 
-def _review_components(session: BookSession | None) -> tuple[dict, dict]:
+def _review_components(session: BookSession | None, selected_role: str | None = None) -> tuple[dict, dict]:
     roster = session.roster if session is not None else None
     roster_characters = roster.characters if roster is not None else ()
     rows = [
@@ -127,7 +127,10 @@ def _review_components(session: BookSession | None) -> tuple[dict, dict]:
             choices.extend((label, role) for role, label in UNIDENTIFIED_CAST_ROLES.items())
     return (
         gr.update(value=rows, visible=bool(rows)),
-        gr.update(choices=choices, value=None, visible=bool(choices)),
+        gr.update(
+            choices=choices, value=selected_role if any(role == selected_role for _, role in choices) else None,
+            visible=bool(choices),
+        ),
     )
 
 
@@ -206,7 +209,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
 
                         with gr.Accordion("Character voices", open=False):
                             gr.Markdown(
-                                "Character identification and dialogue assignment send book text to the configured LLM."
+                                "Analyze the book to find characters and label their dialogue. Book text is sent to the configured LLM."
                             )
                             with gr.Row():
                                 api_key = gr.Textbox(
@@ -225,10 +228,10 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                             with gr.Accordion("LLM endpoint and request settings", open=False):
                                 llm_endpoint = gr.Textbox(value=DEFAULT_LLM_ENDPOINT, label="Chat completions URL")
                                 llm_extra_params = gr.Textbox(
-                                    label="Extra parameters for character analysis (JSON)", lines=3,
+                                    label="Extra parameters for book analysis (JSON)", lines=3,
                                 )
                             with gr.Row():
-                                identify = gr.Button("Identify characters", interactive=False)
+                                analyze = gr.Button("Analyze book", interactive=False)
                                 analysis_status = gr.Textbox(
                                     label="Analysis status", interactive=False, visible=False, scale=3,
                                 )
@@ -239,6 +242,23 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                                 max_height=340,
                                 visible=False,
                             )
+                            with gr.Accordion("Merge characters", open=False, visible=False) as merge_panel:
+                                duplicate_suggestion = gr.Dropdown(
+                                    label="Possible duplicates", choices=[], interactive=True, visible=False,
+                                )
+                                with gr.Row():
+                                    keep_character = gr.Dropdown(
+                                        label="Character to keep", choices=[], interactive=True,
+                                        info="Keep this character's voice.",
+                                    )
+                                    remove_character = gr.Dropdown(
+                                        label="Character to merge into it", choices=[], interactive=True,
+                                    )
+                                merge_preview = gr.Textbox(label="Merge summary", interactive=False, visible=False)
+                                with gr.Row():
+                                    preview_merge = gr.Button("Review merge", size="sm")
+                                    confirm_merge = gr.Button("Confirm merge", size="sm", interactive=False)
+                                merge_draft = gr.State(None)
                             cast_role = gr.Dropdown(
                                 label="Character to cast", choices=[], interactive=True, visible=False
                             )
@@ -266,7 +286,6 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                                 cast_draft = gr.State(RenderVoice())
                                 cast_draft_role = gr.State(None)
 
-                            attribute = gr.Button("Assign dialogue", interactive=False)
                             with gr.Accordion("Review dialogue assignments", open=False, visible=False) as review_panel:
                                 review_section = gr.Dropdown(label="Book section", choices=[], interactive=True)
                                 review_lines = gr.Dataframe(
@@ -430,7 +449,6 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                 gr.update(visible=False),
                 gr.update(value=None, visible=False),
                 gr.update(interactive=has_text),
-                gr.update(interactive=session is not None and session.roster is not None),
                 gr.update(interactive=has_text and bool(model_choices)),
                 gr.update(value=None, visible=False),
                 gr.update(value=None, visible=False),
@@ -467,7 +485,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
 
         book_outputs = [
             book, cast, summary, characters, cast_role, cast_editor, analysis_status,
-            identify, attribute, generate_book, book_status, audiobook, first_line, last_line, regenerate_lines,
+            analyze, generate_book, book_status, audiobook, first_line, last_line, regenerate_lines,
         ]
         project_actions = [active_project, save_new, save_changes, project_status]
         import_outputs = [*book_outputs, *project_actions]
@@ -664,20 +682,18 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
         save_new.click(save_named_project, [project_name, *persist_inputs], persist_outputs, **PRIVATE_EVENT)
         save_changes.click(save_loaded_project, [active_project, *persist_inputs], persist_outputs, **PRIVATE_EVENT)
 
-        def analyze_book(
-            operation: Callable,
-            session: BookSession | None,
-            key: str | None,
-            model: str,
-            reasoning: str,
-            endpoint: str,
-            settings_json: str,
-            *,
-            console: Callable[[str], None],
-            preserved_cast: dict[str, RenderVoice] | None = None,
-            **kwargs,
-        ):
+        def analyze_book(session, key, model, reasoning, endpoint, settings_json, selected_role, request: gr.Request):
+            console = activity_panel.console_for(request.session_hash)
             secret = (key or "").strip()
+
+            def redact(message: str) -> str:
+                return message.replace(secret, "[redacted]") if secret else message
+
+            def log(message: str) -> None:
+                console(redact(message).rstrip() + "\n")
+
+            console("\nAnalyzing book.\n")
+            yield gr.skip(), gr.skip(), gr.skip(), voice_status("Analyzing characters and dialogue…")
             try:
                 if session is None:
                     raise WebBackendError("Import book text first.")
@@ -685,73 +701,24 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                     secret = load_api_key(endpoint or "")
                 if secret and secret in (endpoint or ""):
                     raise WebBackendError("Remove the API key from the chat completions URL.")
-                console("Waiting for the LLM.\n")
-                session = operation(
+                session = analyze_book_dialogue(
                     session, secret, model, effort=reasoning or "", endpoint=endpoint,
-                    settings_json=settings_json or "", **kwargs,
+                    settings_json=settings_json or "", on_log=log,
                 )
             except (StoredApiKeyError, WebBackendError) as exc:
-                message = str(exc).replace(secret, "[redacted]") if secret else str(exc)
+                message = str(exc)
             except Exception:
-                message = "Character analysis failed. Check your LLM settings and try again."
+                message = "Book analysis failed. Check your LLM settings and try again."
             else:
-                if preserved_cast is not None:
-                    table, roles = _review_components(session)
-                    count = len(table["value"])
-                    label = "character" if count == 1 else "characters"
-                    message = (
-                        f"Identified {count:,} {label}. Uncast roles use the narrator. "
-                        "Save any voice overrides, then click Assign dialogue."
-                    )
-                    console(message + "\n")
-                    return session, preserved_cast, table, roles, voice_status(message), gr.update(interactive=session.roster is not None)
-                else:
-                    message = session.attribution_notice or "Dialogue matched to speakers."
-                    console(message + "\n")
-                    return session, gr.skip(), gr.skip(), gr.skip(), voice_status(message), gr.skip()
-            console(message + "\n")
-            return (*[gr.skip()] * 4, gr.update(value=message, visible=True), gr.skip())
+                message = redact(session.attribution_notice or "Book analysis complete.")
+                yield session, *_review_components(session, selected_role), voice_status(message)
+                return
+            log(message)
+            yield gr.skip(), gr.skip(), gr.skip(), voice_status(redact(message))
 
-        def find_characters(session, key, model, reasoning, endpoint, params, voices, request: gr.Request):
-            console = activity_panel.console_for(request.session_hash)
-            console("\nIdentifying characters.\n")
-            if session is not None:
-                yield (
-                    *[gr.skip()] * 4,
-                    gr.update(value="Waiting for the LLM to identify characters.", visible=True),
-                    gr.skip(),
-                )
-            yield analyze_book(
-                identify_characters, session, key, model, reasoning, endpoint, params, console=console,
-                preserved_cast={role: voices[role] for role in UNIDENTIFIED_CAST_ROLES if role in voices},
-            )
-
-        def find_speakers(session, key, model, reasoning, endpoint, params, request: gr.Request):
-            console = activity_panel.console_for(request.session_hash)
-            console("\nAssigning dialogue.\n")
-            if session is not None:
-                yield *[gr.skip()] * 4, voice_status("Assigning dialogue…"), gr.skip()
-            last_report = None
-
-            def report_progress(done: int, total: int) -> None:
-                nonlocal last_report
-                counts = (done, total)
-                if counts != last_report:
-                    console(f"Dialogue chunks complete: {done}/{total}.\n")
-                    last_report = counts
-
-            yield analyze_book(
-                attribute_dialog, session, key, model, reasoning, endpoint, params,
-                console=console, on_progress=report_progress,
-            )
-
-        analysis_inputs = [book, api_key, llm_model, effort, llm_endpoint, llm_extra_params]
-        analysis_outputs = [book, cast, characters, cast_role, analysis_status, attribute]
-        identified = identify.click(
-            find_characters, [*analysis_inputs, cast], analysis_outputs, show_progress="hidden", **PRIVATE_EVENT,
-        )
-        attributed = attribute.click(
-            find_speakers, analysis_inputs, analysis_outputs, show_progress="hidden", **PRIVATE_EVENT,
+        analyzed = analyze.click(
+            analyze_book, [book, api_key, llm_model, effort, llm_endpoint, llm_extra_params, cast_role],
+            [book, characters, cast_role, analysis_status], show_progress="hidden", **PRIVATE_EVENT,
         )
 
         cast_fields = [
@@ -917,6 +884,118 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                 gr.update(value="Speaker assignment updated.", visible=True),
             )
 
+        def merge_character_labels(session):
+            roster = session.roster if session else None
+            if roster is None:
+                return {}
+            names = {character.id: character.name.strip() or character.id for character in roster.characters}
+            counts = Counter(name.casefold() for name in names.values())
+            return {
+                role: f"{name} ({role})" if counts[name.casefold()] > 1 else name
+                for role, name in names.items()
+            }
+
+        def reset_merge_preview():
+            return None, voice_status(), gr.update(interactive=False)
+
+        def refresh_character_merge(session):
+            labels = merge_character_labels(session)
+            keep_choices = [(label, role) for role, label in labels.items()]
+            remove_choices = [(label, role) for label, role in keep_choices if role != _narrator_role(session)]
+            suggestions = [
+                (f"{labels[first]} / {labels[second]}", f"{first}/{second}")
+                for first, second in suggest_duplicate_characters(session)
+            ]
+            label = "Merge characters"
+            if suggestions:
+                plural = "" if len(suggestions) == 1 else "s"
+                label += f" ({len(suggestions):,} possible duplicate{plural})"
+            return (
+                gr.update(label=label, visible=len(labels) > 1 and bool(remove_choices)),
+                gr.update(choices=suggestions, value=None, visible=bool(suggestions)),
+                gr.update(choices=keep_choices, value=None), gr.update(choices=remove_choices, value=None),
+                *reset_merge_preview(),
+            )
+
+        def select_merge_suggestion(pair, session):
+            if not pair:
+                return None, None, *reset_merge_preview()
+            keep, remove = pair.split("/", 1)
+            if remove == _narrator_role(session):
+                keep, remove = remove, keep
+            return keep, remove, *reset_merge_preview()
+
+        def merge_selection(session, voices, keep, remove, narrator_name):
+            return id(session), keep, remove, voices.get(keep), narrator_name
+
+        def draft_character_merge(session, voices, keep, remove, narrator_name):
+            labels = merge_character_labels(session)
+            problem = None
+            if keep not in labels or remove not in labels or keep == remove:
+                problem = "Choose two different characters to merge."
+            elif remove == _narrator_role(session):
+                problem = "Choose the narrator as the character to keep."
+            if problem:
+                return None, voice_status(problem), gr.update(interactive=False)
+            voice = voices.get(keep)
+            if keep == _narrator_role(session) or voice is None or voice == RenderVoice():
+                voice_label = narrator_name or "the narrator voice"
+            else:
+                voice_label = voice.name or "the retained character's custom voice"
+            summary = (
+                f"Merge {labels[remove]} into {labels[keep]}? "
+                f"The merged character's voice will be {voice_label}."
+            )
+            return (
+                merge_selection(session, voices, keep, remove, narrator_name), voice_status(summary),
+                gr.update(interactive=True),
+            )
+
+        merge_preview_outputs = [merge_draft, merge_preview, confirm_merge]
+        merge_inputs = [book, cast, keep_character, remove_character, voice_panel.name]
+        book.change(
+            refresh_character_merge, book,
+            [merge_panel, duplicate_suggestion, keep_character, remove_character, *merge_preview_outputs],
+            show_progress="hidden", **PRIVATE_EVENT,
+        )
+        duplicate_suggestion.input(
+            select_merge_suggestion, [duplicate_suggestion, book],
+            [keep_character, remove_character, *merge_preview_outputs], show_progress="hidden", **PRIVATE_EVENT,
+        )
+        gr.on(
+            [keep_character.input, remove_character.input], reset_merge_preview, outputs=merge_preview_outputs,
+            show_progress="hidden", **PRIVATE_EVENT,
+        )
+        preview_merge.click(
+            draft_character_merge, merge_inputs, merge_preview_outputs, show_progress="hidden", **PRIVATE_EVENT,
+        )
+
+        def confirm_character_merge(session, voices, keep, remove, narrator_name, draft, role, section, line):
+            try:
+                if draft != merge_selection(session, voices, keep, remove, narrator_name):
+                    raise WebBackendError("Review the current selection before confirming the merge.")
+                labels = merge_character_labels(session)
+                session, voices = merge_characters(session, voices, keep, remove)
+            except WebBackendError as exc:
+                return (
+                    *[gr.skip()] * (len(merge_outputs) - len(merge_preview_outputs)),
+                    None, voice_status(str(exc)), gr.update(interactive=False),
+                )
+            message = f"Merged {labels[remove]} into {labels[keep]}. Save the project to keep this change."
+            return (
+                session, voices, *_review_components(session, keep if role == remove else role),
+                voice_status(message), *section_controls(session, section, line), *reset_merge_preview(),
+            )
+
+        merge_outputs = [
+            book, cast, characters, cast_role, analysis_status,
+            review_lines, review_line, review_speaker, save_speaker, *merge_preview_outputs,
+        ]
+        confirm_merge.click(
+            confirm_character_merge, [*merge_inputs, merge_draft, cast_role, review_section, review_line],
+            merge_outputs, show_progress="hidden", **PRIVATE_EVENT,
+        )
+
         for event in (imported_book, opened_project, copied_console, created_from_abr):
             event.then(
                 section_text.refresh, book, section_text.refresh_outputs,
@@ -931,11 +1010,10 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
             changed_inputs=[cast], changed_outputs=[*book_outputs, review_panel, review_section],
             event_options=PRIVATE_EVENT, source_epub=imported_epub,
         )
-        for event in (identified, attributed):
-            event.then(
-                update_review_sections, [book, review_section], [review_panel, review_section],
-                show_progress="hidden", **PRIVATE_EVENT,
-            )
+        analyzed.then(
+            update_review_sections, [book, review_section], [review_panel, review_section],
+            show_progress="hidden", **PRIVATE_EVENT,
+        )
         review_outputs = [review_lines, review_line, review_speaker, save_speaker, review_status]
         review_section.change(display_review_section, [book, review_section], review_outputs, **PRIVATE_EVENT)
         save_speaker.click(

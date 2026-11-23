@@ -36,13 +36,19 @@ class TestModelProfiles(unittest.TestCase):
         gib = 1024**3
         with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}):
             with patch.object(setup, "get_nv_vram", return_value=(2 * gib, 24 * gib)):
-                self.assertEqual(setup.recommended_batch_size("venv-breeze"), 10)
+                self.assertEqual(setup.recommended_batch_size("venv-breeze"), 54)
                 self.assertEqual(setup.recommended_batch_size("venv-qwen3tts"), 5)
                 self.assertEqual(setup.recommended_batch_size("venv-moss"), 1)
                 target = "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
                 self.assertEqual(setup.recommended_batch_size("venv-moss", model_target=target), 1)
                 self.assertEqual(setup.recommended_batch_size("venv-moss", model_target=target, validate_audio=False), 20)
                 self.assertEqual(setup.recommended_batch_size("venv-fish-s2"), 1)
+            # Driver reporting may put a 24 GiB card slightly below 24 GiB total.
+            with patch.object(setup, "get_nv_vram", return_value=(3500 * 1024**2, 24564 * 1024**2)):
+                self.assertEqual(setup.recommended_batch_size("venv-breeze"), 54)
+                self.assertEqual(setup.recommended_batch_size("venv-breeze", validate_audio=False), 54)
+            with patch.object(setup, "get_nv_vram", return_value=(7 * gib, 24 * gib)):
+                self.assertEqual(setup.recommended_batch_size("venv-breeze"), 10)
             with patch.object(setup, "get_nv_vram", return_value=(11 * gib, 24 * gib)):
                 self.assertEqual(setup.recommended_batch_size("venv-breeze"), 1)
                 self.assertEqual(setup.recommended_batch_size("venv-breeze", validate_audio=False), 10)

@@ -28,6 +28,8 @@ INSTALL_ROOT = Path.home() / ".local/share/tts-audiobook-tool/model-envs"
 _VALIDATION_RESERVE_GIB = 2
 _BENCHMARK_FREE_GIB = 12
 _LARGE_VARIANT_FREE_GIB = 21
+_BREEZE_HIGH_MEMORY_BATCH_SIZE = 54
+_BREEZE_HIGH_MEMORY_FREE_GIB = 18
 _MOSS_BATCH_TARGET = "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
 _VIBEVOICE_LARGE_TARGET = "vibevoice/VibeVoice-7B"
 _REMOTE_MARKER_REQUIREMENT = "./launcher_markers/remote_client"
@@ -189,7 +191,11 @@ def recommended_batch_size(
     if memory is None:
         return PROJECT_BATCH_SIZE_DEFAULT
     used, total = memory
-    return batch_size if (total - used) >= needed * 1024**3 else PROJECT_BATCH_SIZE_DEFAULT
+    free = total - used
+    # Batch 54 used about 15 GiB above baseline in the 4090 benchmark with validation.
+    if profile.model_id == "venv-breeze" and free >= _BREEZE_HIGH_MEMORY_FREE_GIB * 1024**3:
+        return _BREEZE_HIGH_MEMORY_BATCH_SIZE
+    return batch_size if free >= needed * 1024**3 else PROJECT_BATCH_SIZE_DEFAULT
 
 
 def install_model(

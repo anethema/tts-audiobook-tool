@@ -227,19 +227,30 @@ def test_library_selection_reaches_samples_cast_and_saved_project(tmp_path, monk
     epub = upload_dir / "book.epub"
     epub.write_bytes(b"test EPUB")
     monkeypatch.setattr(gradio_app.TextImportPanel, "import_book", staticmethod(lambda *_: session))
-    monkeypatch.setattr(gradio_app, "identify_characters", lambda session, *_args, **_kwargs: replace(session, roster=roster))
     rendered = []
-    attributions = []
+    analysis_requests = []
     rendered_books = []
+    chunk_sent = Event()
+    finish_analysis = Event()
 
-    def assign_dialogue(session, *_args, on_progress, **_kwargs):
-        attributions.append(session)
-        on_progress(1, 1)
+    def analyze_dialogue(session, _key, _model, *, on_log, **_kwargs):
+        if session.attributions.ranges:
+            on_log("Reusing saved dialogue labels.")
+            return session
+        analysis_requests.append(session)
+        on_log("Sending chapter 1 for analysis.")
+        chunk_sent.set()
+        assert finish_analysis.wait(10)
         assigned_range = RangeAttribution(0, 3, UtteranceUtil.range_text_hash(book, 0, 3), (
             UtteranceAttribution((0,), "RUE"), UtteranceAttribution((1,), "MINA"),
             UtteranceAttribution((2,), unidentified_female),
         ))
-        return replace(session, attributions=AttributionsFile((assigned_range,)))
+        on_log("Chapter 1 complete.")
+        on_log("Book analysis complete.")
+        return replace(
+            session, roster=roster, attributions=AttributionsFile((assigned_range,)),
+            attribution_notice="Book analysis complete.",
+        )
 
     def render_sample(model, text, voice, **kwargs):
         rendered.append(voice)
@@ -248,7 +259,7 @@ def test_library_selection_reaches_samples_cast_and_saved_project(tmp_path, monk
     def render_book(model, session, voices, **kwargs):
         rendered_books.append(voices)
 
-    monkeypatch.setattr(gradio_app, "attribute_dialog", assign_dialogue)
+    monkeypatch.setattr(gradio_app, "analyze_book_dialogue", analyze_dialogue)
     monkeypatch.setattr(gradio_app, "render_model_sample", render_sample)
     monkeypatch.setattr(gradio_app, "render_model_book", render_book)
     monkeypatch.setattr(
@@ -269,16 +280,34 @@ def test_library_selection_reaches_samples_cast_and_saved_project(tmp_path, monk
         fields[3] = {"path": str(epub), "meta": {"_type": "gradio.FileData"}}
         (loaded,) = await ui.run(load, *fields)
         assert loaded[4]["choices"] == [["Narrator", "NARRATOR"]]
-        identify = ui.event("find_characters")
-        arguments = [ui.values[component._id] for component in identify.inputs]
-        arguments[1] = "fixture-key"
-        _, identified = await ui.run(identify, *arguments)
-        assert identified[2]["value"] == {"headers": ["Character"], "data": [["Aya"], ["Rue"], ["Mina"]], "metadata": None}
-        assert identified[3]["choices"] == [
+        analyze = ui.event("analyze_book")
+        ui.values[analyze.inputs[1]._id] = "fixture-key"
+        job = asyncio.create_task(ui.run(analyze))
+        try:
+            assert await asyncio.to_thread(chunk_sent.wait, 10)
+            (live_log,) = await ui.run(ui.event("refresh_activity"))
+            assert "Sending chapter 1 for analysis." in live_log[0]
+            assert "Chapter 1 complete." not in live_log[0]
+        finally:
+            finish_analysis.set()
+            _, analyzed = await job
+        assert analyzed[1]["value"] == {"headers": ["Character"], "data": [["Aya"], ["Rue"], ["Mina"]], "metadata": None}
+        assert analyzed[2]["choices"] == [
             ["Narrator", "AYA"], ["Rue", "RUE"], ["Mina", "MINA"],
             ["Unidentified female", unidentified_female], ["Unidentified male", unidentified_male],
         ]
-        assert identified[4]["value"].startswith("Identified 3 characters.")
+        assert analyzed[3]["value"] == "Book analysis complete."
+        (log,) = await ui.run(ui.event("refresh_activity"))
+        assert "Chapter 1 complete." in log[0]
+        assert log[0].count("Book analysis complete.") == 1
+        assert "fixture-key" not in log[0]
+
+        review = next(fn for fn in ui.app.fns.values() if fn.name == "update_review_sections" and len(fn.inputs) == 2)
+        (sections,) = await ui.run(review)
+        assert sections[0]["visible"] is True
+        ui.values[review.outputs[1]._id] = sections[1]["choices"][0][1]
+        (tagged_lines,) = await ui.run(ui.event("display_review_section"))
+        assert [row[2] for row in tagged_lines[0]["value"]["data"]] == ["Rue", "Mina", "Unidentified female"]
 
         show_cast = ui.event("show_cast_voice")
         save_assignment = ui.event("save_cast_assignment")
@@ -322,25 +351,18 @@ def test_library_selection_reaches_samples_cast_and_saved_project(tmp_path, monk
         await ui.run(save_assignment)
         assert ui.values[cast_status._id] == "Saved Library narrator for the narrator."
         assert ui.values[select.inputs[0]._id] == saved_narrator.voice_id
-        assert not attributions
-        (blocked,) = await ui.run(generate)
-        assert "Run Assign dialogue" in blocked[0]["value"]
-        assert not rendered_books
-
         saved_cast = dict(ui.state[cast_state])
-        assign_dialogue_event = ui.event("find_speakers")
-        arguments = [ui.values[component._id] for component in assign_dialogue_event.inputs]
-        arguments[1] = "fixture-key"
-        await ui.run(assign_dialogue_event, *arguments)
-        assert ui.state[cast_state] == saved_cast
-        assert ui.values[cast_role] == "AYA"
-        assert ui.values[voice_picker._id] == saved_narrator.voice_id
         await ui.run(generate)
-        assert len(attributions) == len(rendered_books) == 1
+        assert len(analysis_requests) == len(rendered_books) == 1
         assert rendered_books[0] == {
             "NARRATOR": replace(narrator, reference_path=rendered_books[0]["NARRATOR"].reference_path),
             "RUE": saved_cast["RUE"], unidentified_female: saved_cast[unidentified_female],
         }
+        await ui.run(analyze)
+        assert len(analysis_requests) == 1
+        assert ui.state[cast_state] == saved_cast
+        assert ui.values[cast_role] == "AYA"
+        assert ui.values[voice_picker._id] == saved_narrator.voice_id
         await ui.run(compare, ["venv-breeze"], "A narrator preview.", "en", *[ui.values[c._id] for c in compare.inputs[3:]])
         assert rendered[-1] == replace(narrator, reference_path=rendered[-1].reference_path)
 
@@ -387,6 +409,84 @@ def test_library_selection_reaches_samples_cast_and_saved_project(tmp_path, monk
             assert Path(opened.voices["RUE"].reference_path).is_file()
         finally:
             gradio_app.close_book_session(opened.session)
+
+    asyncio.run(exercise())
+
+
+def test_character_merge_confirms_current_pair_and_survives_reopening(tmp_path, monkeypatch):
+    monkeypatch.setattr(gradio_app, "installed_model_choices", lambda: [("Breeze TTS 2", "venv-breeze")])
+    monkeypatch.setattr(gradio_app, "analyze_book_dialogue", lambda *_args, **_kwargs: pytest.fail("Merge is local."))
+    project_root = tmp_path / "projects"
+    for method in ("list_projects", "load_project", "save_project"):
+        monkeypatch.setattr(gradio_app, method, partial(getattr(web_projects, method), root=project_root))
+    book = Book([BookSection([
+        PhraseGroup([Phrase("“Hello.”", Reason.PARAGRAPH)], is_dialog=True),
+        PhraseGroup([Phrase("“Welcome.”", Reason.SECTION_BREAK)], is_dialog=True),
+    ])])
+    roster = Roster((
+        RosterCharacter("SYKORA", "Sykora"), RosterCharacter("SYKORRA", "Sykorra"),
+        RosterCharacter("SECOND_SYKORA", "Sykora"), RosterCharacter("AYA", "Aya", is_narrator=True),
+    ))
+    attributed = RangeAttribution(0, 2, UtteranceUtil.range_text_hash(book, 0, 2), (
+        UtteranceAttribution((0,), "SYKORRA"), UtteranceAttribution((1,), "SYKORA"),
+    ))
+    session = BookSession(book, str(tmp_path), roster=roster, attributions=AttributionsFile((attributed,)))
+    actor = RenderVoice(name="Kept voice", instructions="Speak clearly.")
+    project = web_projects.create_project(
+        "Duplicate cast", session, narrator=RenderVoice(),
+        voices={"SYKORA": actor, "SYKORRA": RenderVoice(name="Duplicate voice")},
+        model_id="venv-breeze", root=project_root,
+    )
+    ui = VoiceApp()
+
+    async def exercise():
+        open_project = ui.event("open_project_snapshot")
+        await ui.run(ui.event("list_saved_projects"))
+        await ui.run(open_project, project.project_id, None)
+        refresh = ui.event("refresh_character_merge")
+        (controls,) = await ui.run(refresh)
+        assert "possible duplicate" in controls[0]["label"] and controls[0]["visible"]
+        assert ["Sykora (SYKORA) / Sykorra", "SYKORA/SYKORRA"] in controls[1]["choices"]
+        assert ["Sykora (SECOND_SYKORA)", "SECOND_SYKORA"] in controls[2]["choices"]
+        assert all(role != "AYA" for _label, role in controls[3]["choices"])
+
+        suggest = ui.event("select_merge_suggestion")
+        ui.values[suggest.inputs[0]._id] = "SYKORA/SYKORRA"
+        await ui.run(suggest)
+        draft = ui.event("draft_character_merge")
+        confirm = ui.event("confirm_character_merge")
+        (preview,) = await ui.run(draft)
+        assert preview[2]["interactive"]
+        assert all(name in preview[1]["value"] for name in ("Sykora", "Sykorra", "Kept voice"))
+
+        keep_id, remove_id = (component._id for component in confirm.inputs[2:4])
+        ui.values[keep_id], ui.values[remove_id] = "SYKORRA", "SYKORA"
+        (stale,) = await ui.run(confirm)
+        assert "Review the current selection" in stale[-2]["value"]
+        book_state, cast_state = (component._id for component in confirm.inputs[:2])
+        assert ui.state[book_state].roster == roster
+        assert "SYKORRA" in ui.state[cast_state]
+
+        await ui.run(suggest)
+        await ui.run(draft)
+        review = next(fn for fn in ui.app.fns.values() if fn.name == "update_review_sections" and len(fn.inputs) == 1)
+        (sections,) = await ui.run(review)
+        ui.values[confirm.inputs[-2]._id] = sections[1]["choices"][0][1]
+        ui.values[confirm.inputs[-3]._id] = "SYKORRA"
+        (merged,) = await ui.run(confirm)
+        assert merged[3]["value"] == "SYKORA"
+        assert [row[2] for row in merged[5]["value"]["data"]] == ["Sykora", "Sykora"]
+        assert ui.state[cast_state] == {"SYKORA": actor}
+
+        (saved,) = await ui.run(ui.event("save_loaded_project"))
+        assert "Saved Duplicate cast" in saved[-1]["value"]
+        await ui.run(open_project, project.project_id, None)
+        reopened = ui.state[book_state]
+        assert reopened.roster.get("SYKORRA") is None
+        assert "Sykorra" in reopened.roster.get("SYKORA").aliases
+        assert reopened.attributions.speaker_of_each_line(reopened.book) == {0: "SYKORA", 1: "SYKORA"}
+        assert ui.state[cast_state] == {"SYKORA": actor}
+        gradio_app.close_book_session(reopened)
 
     asyncio.run(exercise())
 

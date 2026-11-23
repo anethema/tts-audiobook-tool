@@ -16,20 +16,25 @@ from typing import TYPE_CHECKING
 import requests
 
 from tts_audiobook_tool.app_types import Book
+from tts_audiobook_tool.app_support.JsonSaveUtil import JsonArtifactType, JsonSaveUtil
 from tts_audiobook_tool.constants import MAX_WORDS_PER_SEGMENT_DEFAULT
 from tts_audiobook_tool.constants_config import PROJECT_DEFAULT_SEGMENTATION_STRATEGY
 from tts_audiobook_tool.conversation.llm_session import LlmSession
 from tts_audiobook_tool.project_support.project_text_io_util import ProjectTextIOUtil
 from tts_audiobook_tool.prefs import Prefs
 from tts_audiobook_tool.speaker_assign.assign_plan import AssignPlan, PlannedChunk
-from tts_audiobook_tool.speaker_assign.attribution import AttributionsFile, RangeAttribution
+from tts_audiobook_tool.speaker_assign.attribution import AttributionsFile, RangeAttribution, UtteranceAttribution
 from tts_audiobook_tool.speaker_assign.attribution_prompt_util import ATTRIBUTION_SYSTEM_PROMPT
 from tts_audiobook_tool.speaker_assign.attribution_reply_util import AttributionReplyUtil
+from tts_audiobook_tool.speaker_assign.combined_analysis import SYSTEM_PROMPT as COMBINED_ANALYSIS_SYSTEM_PROMPT
+from tts_audiobook_tool.speaker_assign.combined_analysis import build_prompt, parse_chunk_reply
 from tts_audiobook_tool.speaker_assign.attribution_runner import AttributionRunner, AttributionRunListener
 from tts_audiobook_tool.speaker_assign.llm_request_util import LlmRequestResult, SPEAKER_ASSIGN_LLM_TIMEOUT
 from tts_audiobook_tool.speaker_assign.roster import Roster
 from tts_audiobook_tool.speaker_assign.roster_util import ROSTER_SYSTEM_PROMPT, RosterUtil
 from tts_audiobook_tool.speaker_assign.speaker_assign_file_util import SpeakerAssignFileUtil
+from tts_audiobook_tool.speaker_assign.speaker_assign_types import Utterance
+from tts_audiobook_tool.speaker_assign.utterance_util import UtteranceUtil
 from tts_audiobook_tool.text_ops.epub_extractor import EpubExtractor
 
 if TYPE_CHECKING:
@@ -220,9 +225,152 @@ def book_cast_problem(
             if chunk.done:
                 unattributed.difference_update(range(max(first_line - 1, chunk.start), min(last_line, chunk.end)))
         if unattributed:
-            return "Run Assign dialogue for the selected lines before generating audio."
+            return "Run Analyze book for the selected lines before generating audio."
 
     return None
+
+
+def analyze_book_dialogue(
+        session: BookSession,
+        api_key: str,
+        model: str = DEFAULT_OPENAI_MODEL,
+        *,
+        effort: str = DEFAULT_REASONING_EFFORT,
+        endpoint: str = DEFAULT_LLM_ENDPOINT,
+        settings_json: str = "",
+        on_log: Callable[[str], None] | None = None,
+) -> BookSession:
+    """Discover characters and assign quote IDs together, checkpointing each chunk."""
+    log = on_log if on_log is not None else lambda _message: None
+    directory = session.attribution_dir or session.project_dir
+    checkpoint = Path(SpeakerAssignFileUtil.attributions_path(directory))
+    roster, attributions = _load_analysis_checkpoint(session, checkpoint)
+    book = session.book
+    plan = AssignPlan.make(book, attributions)
+    total = len(plan.chunks)
+    if not total:
+        raise WebBackendError("This book has no dialogue lines to analyze.")
+    effective = attributions.by_first_line(book)
+    prior_speakers = {line: utterance.speaker for line, utterance in effective.items()}
+    effective_by_line = {line: stored for stored in effective.values() for line in stored.lines}
+    utterances_by_chunk = {
+        chunk.number: UtteranceUtil.find_utterances(book, chunk.start, chunk.end) for chunk in plan.chunks
+    }
+    saved_by_chunk = {
+        number: {
+            quote_id: stored for quote_id, utterance in enumerate(utterances, 1)
+            if (stored := _covered_utterance(utterance, effective_by_line)) is not None
+        }
+        for number, utterances in utterances_by_chunk.items()
+    }
+    fully_covered = {
+        number for number, utterances in utterances_by_chunk.items()
+        if all(line in effective_by_line for utterance in utterances for line in utterance.lines)
+    }
+    complete = len(fully_covered)
+    prefs = None
+    issue = ""
+    log(f"Analyzing {total:,} dialogue chunks.\n")
+    for chunk in plan.chunks:
+        label = f"Chunk {chunk.number:,}/{total:,}"
+        utterances = utterances_by_chunk[chunk.number]
+        covered = saved_by_chunk[chunk.number]
+        if chunk.number in fully_covered:
+            quotes = _count_label(len(utterances), "quote")
+            log(f"{label} reused saved speaker labels for {quotes}.\n")
+            continue
+        requested = set(range(1, len(utterances) + 1)) - covered.keys()
+        try:
+            if prefs is None:
+                api_key, prefs = _request_settings(api_key, model, effort, endpoint, settings_json)
+            prompt = build_prompt(
+                book, chunk, roster, prior_speakers,
+                {number: utterance.speaker for number, utterance in covered.items()},
+            )
+            quotes = _count_label(len(requested), "quote")
+            log(f"{label} requesting speakers for {quotes} (lines {chunk.start + 1:,}–{chunk.end:,}).\n")
+            reply = _send(_make_session(prefs, api_key, COMBINED_ANALYSIS_SYSTEM_PROMPT), prompt)
+            if reply.error is not None:
+                raise WebBackendError(_request_error_message(reply.error))
+            if reply.hit_output_limit:
+                raise WebBackendError("The model reached its output limit. Try lower reasoning effort or a higher output limit.")
+            try:
+                next_roster, parsed = parse_chunk_reply(reply.reply, roster, requested)
+            except ValueError:
+                raise WebBackendError("The model returned incomplete or invalid speaker labels.") from None
+
+            added = AttributionReplyUtil.make_range_attribution(
+                book, chunk.start, chunk.end, utterances, parsed, llm={"model": prefs.llm_model},
+            )
+            added = replace(added, utterances=tuple(
+                covered.get(number, utterance) for number, utterance in enumerate(added.utterances, 1)
+            ))
+            next_attributions = attributions.with_range(added)
+            _save_analysis_checkpoint(checkpoint, next_roster, next_attributions)
+        except WebBackendError as exc:
+            issue = str(exc)
+            log(f"{label} stopped. {issue} Run Analyze book to retry this chunk.\n")
+            break
+        roster, attributions = next_roster, next_attributions
+        prior_speakers.update((utterance.first_line, utterance.speaker) for utterance in added.utterances)
+        complete += 1
+        usage = ""
+        if reply.input_tokens is not None and reply.output_tokens is not None:
+            usage = f" {reply.input_tokens:,} input / {reply.output_tokens:,} output tokens."
+        labels = _count_label(len(requested), "speaker label")
+        log(f"{label} saved {labels} in {reply.elapsed:.1f}s.{usage}\n")
+
+    if issue and not attributions.ranges:
+        raise WebBackendError(issue)
+    notice = f"{complete:,} of {total:,} dialogue chunks complete."
+    if issue:
+        notice += f" {issue} Run Analyze book to continue."
+    log(notice + "\n")
+    return replace(session, roster=roster, attributions=attributions, attribution_notice=notice)
+
+
+def _covered_utterance(utterance: Utterance, saved_by_line: dict[int, UtteranceAttribution]) -> UtteranceAttribution | None:
+    saved = [saved_by_line.get(line) for line in utterance.lines]
+    first = saved[0]
+    if first is None or any(item is None or item.speaker != first.speaker for item in saved):
+        return None
+    if first.lines == utterance.lines:
+        return first
+    return replace(first, lines=utterance.lines, uncertain=any(item.uncertain for item in saved if item is not None))
+
+
+def _count_label(count: int, singular: str) -> str:
+    return f"{count:,} {singular}{'' if count == 1 else 's'}"
+
+
+def _load_analysis_checkpoint(session: BookSession, checkpoint: Path) -> tuple[Roster, AttributionsFile]:
+    roster = session.roster or Roster(())
+    try:
+        value = json.loads(checkpoint.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return roster, AttributionsFile(tuple(session.attributions.valid_ranges(session.book)))
+    except (OSError, ValueError):
+        raise WebBackendError("Saved dialogue assignments could not be read.") from None
+    try:
+        saved = AttributionsFile(tuple(AttributionsFile.from_dict(value).valid_ranges(session.book)))
+        if "combined_roster" in value and saved.ranges:
+            roster = Roster.from_dict(value["combined_roster"])
+    except ValueError:
+        raise WebBackendError("Saved dialogue assignments could not be read.") from None
+    return roster, saved
+
+
+def _save_analysis_checkpoint(checkpoint: Path, roster: Roster, attributions: AttributionsFile) -> None:
+    """Store roster and quote labels in one write, using the canonical attribution file."""
+    try:
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise WebBackendError("Dialogue analysis progress could not be saved.") from None
+    if JsonSaveUtil.save(
+        JsonArtifactType.SPEAKER_ATTRIBUTIONS, checkpoint,
+        lambda: {**attributions.to_dict(), "combined_roster": roster.to_dict()},
+    ):
+        raise WebBackendError("Dialogue analysis progress could not be saved.")
 
 
 def identify_characters(
@@ -387,7 +535,11 @@ def _send(llm: LlmSession, prompt: str) -> LlmRequestResult:
         reply = llm.send(prompt)
     except (requests.RequestException, WebBackendError) as error:
         return LlmRequestResult("", "", monotonic() - started, error=error)
-    return LlmRequestResult(reply, "", monotonic() - started, finish_reason=llm.last_finish_reason)
+    return LlmRequestResult(
+        reply, "", monotonic() - started, finish_reason=llm.last_finish_reason,
+        input_tokens=llm.last_input_tokens, output_tokens=llm.last_output_tokens,
+        reasoning_tokens=llm.last_reasoning_tokens,
+    )
 
 
 class _SanitizedHttpError(requests.HTTPError):
@@ -445,8 +597,10 @@ class _WebOpenAISession(LlmSession):
                 ) as response:
                     if response.status_code != 200:
                         raise _SanitizedHttpError(response.status_code, _safe_error_code(response))
-                    choice = response.json()["choices"][0]
+                    body = response.json()
+                    choice = body["choices"][0]
                     content = choice["message"]["content"]
+                    self._record_usage(body.get("usage"), "completion_tokens", "prompt_tokens")
                     finish_reason = choice.get("finish_reason")
                     self.last_finish_reason = finish_reason if finish_reason in _FINISH_REASONS else None
         except _SanitizedHttpError:

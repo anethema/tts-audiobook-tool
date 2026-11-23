@@ -200,10 +200,10 @@ class TestWebBackend(unittest.TestCase):
 
         self.assertIsNone(web_backend.book_cast_problem(session, first_line=3, last_line=3))
         self.assertIsNone(web_backend.book_cast_problem(session, first_line=2, last_line=2))
-        self.assertIn("Assign dialogue", web_backend.book_cast_problem(session))
+        self.assertIn("Analyze book", web_backend.book_cast_problem(session))
 
         session.book.phrase_groups[3].voice_index = 1
-        self.assertIn("Assign dialogue", web_backend.book_cast_problem(session))
+        self.assertIn("Analyze book", web_backend.book_cast_problem(session))
         overridden = replace(session, line_voices={1: RenderVoice(name="Manual line voice")})
         self.assertIsNone(web_backend.book_cast_problem(overridden))
         self.assertIsNone(web_backend.book_cast_problem(overridden, first_line=4))

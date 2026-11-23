@@ -43,17 +43,20 @@ class AssignPlan:
 
     @staticmethod
     def make(book: Book, attributions: AttributionsFile, chunk_words: int = DEFAULT_CHUNK_WORDS) -> AssignPlan:
+        assigned_lines = attributions.speaker_of_each_line(book)
         chunks: list[PlannedChunk] = []
         for start, end in ChunkPlanUtil.plan_chunks(book, chunk_words):
-            utterance_count = len(UtteranceUtil.find_utterances(book, start, end))
-            if not utterance_count:
+            utterances = UtteranceUtil.find_utterances(book, start, end)
+            if not utterances:
                 continue
             saved = attributions.get(start, end)
+            # A complete assignment can already cover these lines under older chunk boundaries.
+            covered = all(line in assigned_lines for utterance in utterances for line in utterance.lines)
             chunks.append(PlannedChunk(
                 number=len(chunks) + 1,
                 start=start,
                 end=end,
-                utterance_count=utterance_count,
-                done=saved is not None and saved.is_valid_for(book),
+                utterance_count=len(utterances),
+                done=covered or (saved is not None and saved.is_valid_for(book)),
             ))
         return AssignPlan(tuple(chunks))
