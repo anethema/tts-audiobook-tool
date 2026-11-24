@@ -1192,12 +1192,15 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
             except (WebRenderError, WebRuntimeSettingsError) as exc:
                 yield [voice_status(str(exc)), gr.skip(), *[gr.skip() for _ in sample_players]]
                 return
+            player_props: list[dict[str, str | bool | None]] = [
+                {"value": None, "visible": False} for _ in sample_players
+            ]
             with running_job(request) as cancel:
                 console = activity_panel.console_for(request.session_hash)
                 yield [
                     gr.update(value="Generating text samples.", visible=True),
                     gr.update(interactive=True),
-                    *[gr.update(value=None, visible=False) for _ in sample_players],
+                    *[gr.update(**props) for props in player_props],
                 ]
                 statuses = []
                 for index, model in enumerate(selected):
@@ -1226,16 +1229,18 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                         statuses.append(f"{label} — generation failed.")
                     else:
                         statuses.append(f"{label} — ready.")
-                        updates[index] = gr.update(label=label, value=audio, visible=True)
+                        player_props[index] = {"label": label, "value": audio, "visible": True}
+                        updates[index] = gr.update(**player_props[index])
                     console(statuses[-1] + "\n")
                     yield [gr.update(value="\n".join(statuses), visible=True), gr.skip(), *updates]
                 if cancel.is_set():
                     statuses.append("Generation stopped.")
                     console("Generation stopped.\n")
+            # Gradio uses the last yield as the completed queue response.
             yield [
                 gr.update(value="\n".join(statuses), visible=True),
                 gr.update(interactive=False),
-                *[gr.skip() for _ in sample_players],
+                *[gr.update(**props) for props in player_props],
             ]
 
         generate_samples.click(
@@ -1245,6 +1250,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                 *remote_panel.selection_inputs, *voice_panel.inputs,
             ],
             [sample_status, stop_samples, *sample_players],
+            show_progress_on=sample_status,
             **PRIVATE_EVENT,
         )
         stop_options = {"api_visibility": "private", "queue": False, "show_progress": "hidden"}

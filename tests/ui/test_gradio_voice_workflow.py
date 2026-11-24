@@ -72,6 +72,72 @@ def _uploaded_audio(directory):
     return {"path": str(path), "meta": {"_type": "gradio.FileData"}}
 
 
+def test_completed_text_sample_comparison_exposes_all_playable_downloads(tmp_path, monkeypatch):
+    labels = ["Breeze TTS 2", "Qwen3-TTS", "OmniVoice"]
+    models = ["venv-breeze", "venv-qwen3tts", "venv-omnivoice"]
+    monkeypatch.setattr(gradio_app, "installed_model_choices", lambda: list(zip(labels, models, strict=True)))
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("GRADIO_TEMP_DIR", str(cache))
+    audio = Path(_uploaded_audio(tmp_path / "audio")["path"]).read_bytes()
+    samples = {model: tmp_path / f"{model}.wav" for model in models}
+    for sample in samples.values():
+        sample.write_bytes(audio)
+
+    def render_sample(model, text, _voice, *, cancel_event, **_kwargs):
+        if model == models[1]:
+            if text == "Stop this comparison.":
+                cancel_event.set()
+            raise ModelRunError("Sample synthesis failed.")
+        return str(samples[model])
+
+    monkeypatch.setattr(gradio_app, "render_model_sample", render_sample)
+    ui = VoiceApp()
+    compare = ui.event("compare_samples")
+    request = gr.Request(session_hash="test-text-sample-comparison")
+
+    async def run_samples(selected, text):
+        inputs = [selected, text, *[ui.values[component._id] for component in compare.inputs[2:]]]
+        result = await ui.app.process_api(
+            compare, inputs, ui.state, request=request, session_hash=request.session_hash,
+        )
+        first = result["data"]
+        while result["is_generating"]:
+            result = await ui.app.process_api(
+                compare, [], ui.state, request=request, session_hash=request.session_hash,
+                iterator=result["iterator"],
+            )
+        return first, result["data"]
+
+    def assert_playable(player, index):
+        assert player["label"] == labels[index] and player["visible"]
+        assert player["value"]["orig_name"] == samples[models[index]].name
+        cached = Path(player["value"]["path"])
+        assert cached.is_relative_to(cache)
+        assert cached.read_bytes() == audio
+
+    async def exercise():
+        assert all(isinstance(player, gr.Audio) and player.buttons == ["download"] for player in compare.outputs[2:])
+        _, (status, stop, *players) = await run_samples(models, "A comparison.")
+        assert "Sample synthesis failed." in status["value"]
+        assert stop["interactive"] is False
+        assert_playable(players[0], 0)
+        assert_playable(players[2], 2)
+        assert players[1]["value"] is None and players[1]["visible"] is False
+
+        _, (_, *unchanged) = await run_samples(models, " ")
+        assert unchanged == [gr.skip()] * len(unchanged)
+
+        (_, active_stop, *cleared), (status, stop, *players) = await run_samples(models, "Stop this comparison.")
+        assert active_stop["interactive"]
+        assert all(player["value"] is None and player["visible"] is False for player in cleared)
+        assert "Generation stopped." in status["value"]
+        assert stop["interactive"] is False
+        assert_playable(players[0], 0)
+        assert all(player["value"] is None and player["visible"] is False for player in players[1:])
+
+    asyncio.run(exercise())
+
+
 def test_completed_audiobook_exposes_download_until_another_book_is_imported(tmp_path, monkeypatch):
     export = tmp_path / "audiobook.abr.m4b"
     export.write_bytes(b"M4B export fixture")
