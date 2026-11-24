@@ -1,7 +1,7 @@
 """Private local storage for named browser projects."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
 from hashlib import sha256
 import json
@@ -213,6 +213,7 @@ def load_project(
         raw_roster = metadata.get("roster")
         roster = Roster.from_dict(raw_roster) if raw_roster is not None else None
         attributions = AttributionsFile.from_dict(metadata.get("attributions"))
+        attribution_notice = metadata.get("attribution_notice")
         warnings = metadata["warnings"]
         if not isinstance(warnings, list) or not all(isinstance(warning, str) for warning in warnings):
             raise ValueError
@@ -271,6 +272,8 @@ def load_project(
     except (OSError, WebBackendError):
         raise WebProjectError("Could not open a workspace for this project.") from None
 
+    if isinstance(attribution_notice, str) and attribution_notice:
+        session = replace(session, attribution_notice=attribution_notice)
     return SavedProject(
         summary, session, narrator, voices, model_id, source_epub, validate_audio, batch_size,
         model_options, strictness, max_retries, auto_concat, performance_cues, character_voices,
@@ -359,6 +362,7 @@ def _save_snapshot(
                 "warnings": list(session.warnings),
                 "roster": session.roster.to_dict() if session.roster is not None else None,
                 "attributions": session.attributions.to_dict(),
+                "attribution_notice": session.attribution_notice,
                 "narrator": narrator_data,
                 "voices": voices_data,
                 "line_voices": line_voices_data,

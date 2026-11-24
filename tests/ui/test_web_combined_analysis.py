@@ -57,8 +57,8 @@ def test_combined_chunks_resume_checkpoints_and_reuse_manual_corrections(tmp_pat
         _response(_reply({}, [{"name": "RAW-ROSTER-FIELD"}])),
         _response(_reply({})),
         _response(_reply({"1": "UNLISTED_SPEAKER"})),
-        _response(_reply({"1": "ANNA"})),
         _response(_reply({"1": "OTHER:unidentified female"})),
+        _response(_reply({"1": "ANNA"})),
         _response(_reply({"1": "UNKNOWN"})),
     ])
     prompts = []
@@ -72,31 +72,41 @@ def test_combined_chunks_resume_checkpoints_and_reuse_manual_corrections(tmp_pat
     monkeypatch.setattr(requests.Session, "post", post)
     logs = []
     partial = web_backend.analyze_book_dialogue(session, "test-key", on_log=logs.append)
-    assert "1 of 3" in partial.attribution_notice
-    assert "speaker outside the character list. Stopped after 3 attempts." in partial.attribution_notice
-    assert len(prompts) == 4
-    assert len({messages[1]["content"] for messages in prompts[1:]}) == 1
+    assert "2 of 3" in partial.attribution_notice
+    assert "Skipped chunk 2 (lines 3–4)" in partial.attribution_notice
+    assert "Run Analyze book to retry" in partial.attribution_notice
+    assert len(prompts) == 5
+    assert len({messages[1]["content"] for messages in prompts[1:4]}) == 1
+    assert "Current passage, starting at line 5:" in prompts[4][1]["content"]
+    assert "Retry reminder:" not in prompts[4][0]["content"]
     assert "RAW-ROSTER-FIELD" not in repr(prompts)
     assert "RAW-ROSTER-FIELD" not in "".join(logs)
     assert "Retrying (1/2)" in "".join(logs)
     assert "Retrying (2/2)" in "".join(logs)
     assert "120 input / 20 output tokens" in "".join(logs)
-    assert "2/3 stopped" in "".join(logs)
-    assert "Run Analyze book to retry this chunk." in "".join(logs)
-    assert partial.attributions.speaker_of_each_line(book) == {1: "ANNA"}
+    assert "Chunk 2/3 skipped (lines 3–4) after 3 invalid replies." in "".join(logs)
+    assert "speaker outside the character list." in "".join(logs)
+    assert "Run Analyze book to retry" in "".join(logs)
+    assert [saved.key for saved in partial.attributions.ranges] == [(0, 2), (4, 6)]
+    assert partial.attributions.speaker_of_each_line(book) == {1: "ANNA", 5: "OTHER:unidentified female"}
     assert partial.roster.ids == {"ANNA"}
+    assert web_backend.book_cast_problem(partial, first_line=4, last_line=4)
+    assert web_backend.book_cast_problem(partial, first_line=5, last_line=6) is None
 
-    # Recover both roster and labels even if the interrupted browser did not
+    # Recover both roster and labels even if the browser did not
     # receive the returned session.
     complete = web_backend.analyze_book_dialogue(session, "test-key", on_log=logs.append)
     assert "3 of 3" in complete.attribution_notice
+    assert "Skipped" not in complete.attribution_notice
     assert len(prompts) == 6
     first_passage = prompts[0][1]["content"]
     assert [marker in first_passage for marker in ("FIRST-SECTION", "SECOND-SECTION", "THIRD-SECTION")] == [True, False, False]
-    resumed_passage = prompts[4][1]["content"]
+    resumed_passage = prompts[5][1]["content"]
     assert "FIRST-SECTION" not in resumed_passage
+    assert "Current passage, starting at line 3:" in resumed_passage
     assert 'Established characters: [{"id":"ANNA","name":"Anna"}]' in resumed_passage
     assert "1/3 reused saved speaker labels for 1 quote" in "".join(logs)
+    assert "3/3 reused saved speaker labels for 1 quote" in "".join(logs)
 
     corrected = web_dialogue.correct_speaker(complete, 0, 1, "NOT_SPEECH")
     cached = web_backend.analyze_book_dialogue(corrected, "", on_log=logs.append)
@@ -158,6 +168,30 @@ def test_combined_analysis_corrects_invalid_replies_with_a_fresh_retry_budget_pe
         assert raw_text not in messages
 
 
+def test_all_invalid_chunks_report_the_gaps_without_saving_assignments(tmp_path, monkeypatch):
+    monkeypatch.setattr(L, "logger", logging.getLogger(__name__), raising=False)
+    book = Book(sections=[_section("FIRST-SECTION"), _section("SECOND-SECTION")])
+    session = web_backend.BookSession(book, str(tmp_path))
+    prompts = []
+    logs = []
+
+    def post(_http, _url, **kwargs):
+        prompts.append(kwargs["json"]["messages"][1]["content"])
+        return _content_response("No valid JSON")
+
+    monkeypatch.setattr(requests.Session, "post", post)
+    result = web_backend.analyze_book_dialogue(session, "test-key", on_log=logs.append)
+    assert len(prompts) == 6
+    assert all("Current passage, starting at line 1:" in prompt for prompt in prompts[:3])
+    assert all("Current passage, starting at line 3:" in prompt for prompt in prompts[3:])
+    assert "0 of 2" in result.attribution_notice
+    assert "Skipped chunks 1 (lines 1–2), 2 (lines 3–4)" in result.attribution_notice
+    assert "Chunk 2/2 skipped (lines 3–4)" in "".join(logs)
+    assert result.roster is not None
+    assert not result.attributions.ranges
+    assert not list(tmp_path.iterdir())
+
+
 @pytest.mark.parametrize(
     ("status", "finish_reason", "message"),
     [(429, "stop", "rate-limited"), (200, "length", "output limit")],
@@ -166,7 +200,8 @@ def test_combined_analysis_does_not_retry_provider_or_output_limit_errors(
         tmp_path, monkeypatch, status, finish_reason, message,
 ):
     monkeypatch.setattr(L, "logger", logging.getLogger(__name__), raising=False)
-    session = web_backend.BookSession(Book(sections=[_section("FIRST-SECTION")]), str(tmp_path))
+    book = Book(sections=[_section("FIRST-SECTION"), _section("SECOND-SECTION")])
+    session = web_backend.BookSession(book, str(tmp_path))
     response = _content_response('{"unfinished":', finish_reason=finish_reason)
     response.status_code = status
     calls = []
@@ -181,7 +216,34 @@ def test_combined_analysis_does_not_retry_provider_or_output_limit_errors(
         web_backend.analyze_book_dialogue(session, "test-key", on_log=logs.append)
     assert len(calls) == 1
     assert "Retrying (" not in "".join(logs)
+    assert "skipped" not in "".join(logs)
     assert not list(tmp_path.iterdir())
+
+
+def test_provider_error_stops_later_chunks_but_keeps_earlier_gaps_in_status(tmp_path, monkeypatch):
+    monkeypatch.setattr(L, "logger", logging.getLogger(__name__), raising=False)
+    book = Book(sections=[_section("FIRST-SECTION"), _section("SECOND-SECTION"), _section("THIRD-SECTION")])
+    session = web_backend.BookSession(book, str(tmp_path))
+    invalid = _response(_reply({}))
+    rate_limited = _content_response("")
+    rate_limited.status_code = 429
+    responses = iter([invalid, invalid, invalid, rate_limited])
+    prompts = []
+    logs = []
+
+    def post(_http, _url, **kwargs):
+        prompts.append(kwargs["json"]["messages"][1]["content"])
+        return next(responses)
+
+    monkeypatch.setattr(requests.Session, "post", post)
+    result = web_backend.analyze_book_dialogue(session, "test-key", on_log=logs.append)
+    assert len(prompts) == 4
+    assert "Current passage, starting at line 3:" in prompts[-1]
+    assert "0 of 3" in result.attribution_notice
+    assert "Skipped chunk 1 (lines 1–2)" in result.attribution_notice
+    assert "rate-limited" in result.attribution_notice
+    assert "Chunk 2/3 stopped." in "".join(logs)
+    assert not result.attributions.ranges
 
 
 def test_combined_analysis_only_requests_missing_quotes_inside_a_chunk(tmp_path, monkeypatch):
@@ -197,16 +259,25 @@ def test_combined_analysis_only_requests_missing_quotes_inside_a_chunk(tmp_path,
         book, str(tmp_path), roster=Roster((RosterCharacter("ANNA", "Anna"),)),
         attributions=AttributionsFile((existing,)),
     )
+    invalid = _response(_reply({}))
+    responses = iter([invalid, invalid, invalid, _response(_reply({"2": "NOT_SPEECH"}))])
 
     def post(_http, _url, **kwargs):
         passage = kwargs["json"]["messages"][1]["content"]
         assert '<q speaker="ANNA">“First.”</q>' in passage
         assert '<q id="1">' not in passage
         assert '<q id="2">“Second.”</q>' in passage
-        return _response(_reply({"2": "NOT_SPEECH"}))
+        return next(responses)
 
     monkeypatch.setattr(requests.Session, "post", post)
-    result = web_backend.analyze_book_dialogue(session, "test-key")
+    partial = web_backend.analyze_book_dialogue(session, "test-key")
+    assert "Skipped chunk 1 (lines 1–2)" in partial.attribution_notice
+    assert partial.attributions.ranges == (existing,)
+    reopened = web_backend.new_book_session(book, roster=partial.roster, attributions=partial.attributions)
+    try:
+        result = web_backend.analyze_book_dialogue(reopened, "test-key")
+    finally:
+        web_backend.close_book_session(reopened)
     assert result.attributions.speaker_of_each_line(book) == {0: "ANNA", 1: "NOT_SPEECH"}
 
 
@@ -283,6 +354,7 @@ def test_delivery_enrichment_checkpoints_empty_results_and_resumes(tmp_path, mon
     monkeypatch.setattr(requests.Session, "post", post)
     partial = web_backend.analyze_book_dialogue(session, "test-key", performance_cues=True)
     assert "1 of 2" in partial.attribution_notice
+    assert "Skipped chunk 2 (lines 3–4)" in partial.attribution_notice
     assert "Following context (evidence only):\nSECOND-SECTION" in prompts[0]
     assert partial.attributions.by_first_line(book)[1].delivery == DeliveryCue()
     assert partial.attributions.by_first_line(book)[3].delivery is None

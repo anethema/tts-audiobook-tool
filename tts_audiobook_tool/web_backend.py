@@ -299,6 +299,7 @@ def analyze_book_dialogue(
     )
     prefs = None
     issue = ""
+    skipped_chunks: list[PlannedChunk] = []
     log(f"Analyzing {total:,} dialogue chunks.\n")
     for chunk in plan.chunks:
         label = f"Chunk {chunk.number:,}/{total:,}"
@@ -331,7 +332,8 @@ def analyze_book_dialogue(
             if voice_requests:
                 request_parts.append(f"voice directions for {_count_label(len(voice_requests), 'character')}")
             request_description = " and ".join(request_parts)
-            log(f"{label} requesting {request_description} (lines {chunk.start + 1:,}–{chunk.end:,}).\n")
+            line_range = f"lines {chunk.start + 1:,}–{chunk.end:,}"
+            log(f"{label} requesting {request_description} ({line_range}).\n")
             system_prompt = PERFORMANCE_CUE_SYSTEM_PROMPT if cue_requests else COMBINED_ANALYSIS_SYSTEM_PROMPT
             if character_voices:
                 system_prompt += CHARACTER_VOICE_SYSTEM_INSTRUCTIONS
@@ -354,18 +356,18 @@ def analyze_book_dialogue(
                         reason = "The reply could not be parsed as JSON."
                     else:
                         reason = "The reply did not match the expected analysis format."
-                    if attempt == _ANALYSIS_REPLY_RETRIES:
-                        message = "The model returned incomplete or invalid speaker labels."
-                        if not requested and not cue_requests:
-                            message = "The model returned an unreadable character voice reply."
-                        raise WebBackendError(f"{message} {reason} Stopped after {attempt + 1} attempts.") from None
-                    log(f"{label} {reason} Retrying ({attempt + 1}/{_ANALYSIS_REPLY_RETRIES}).\n")
-                    attempt_system_prompt = (
-                        f"{system_prompt}\n\nRetry reminder: {reason} Return one valid JSON object. "
-                        "Include exactly the quote IDs needing speaker labels in speakers and use valid speaker IDs."
-                    )
+                    if attempt < _ANALYSIS_REPLY_RETRIES:
+                        log(f"{label} {reason} Retrying ({attempt + 1}/{_ANALYSIS_REPLY_RETRIES}).\n")
+                        attempt_system_prompt = (
+                            f"{system_prompt}\n\nRetry reminder: {reason} Return one valid JSON object. "
+                            "Include exactly the quote IDs needing speaker labels in speakers and use valid speaker IDs."
+                        )
                 else:
                     break
+            else:
+                skipped_chunks.append(chunk)
+                log(f"{label} skipped ({line_range}) after {attempt + 1} invalid replies. {reason}\n")
+                continue
 
             next_attributions, new_utterances = attributions, []
             if requested or cue_requests:
@@ -406,9 +408,15 @@ def analyze_book_dialogue(
         if missing_voices:
             log(f"{label} did not receive {_count_label(missing_voices, 'usable character voice direction')}.\n")
 
-    if issue and not attributions.ranges:
+    if issue and not attributions.ranges and not skipped_chunks:
         raise WebBackendError(issue)
     notice = f"{complete:,} of {total:,} dialogue chunks complete."
+    if skipped_chunks:
+        chunks = "chunk" if len(skipped_chunks) == 1 else "chunks"
+        locations = ", ".join(
+            f"{chunk.number:,} (lines {chunk.start + 1:,}–{chunk.end:,})" for chunk in skipped_chunks
+        )
+        notice += f" Skipped {chunks} {locations} after invalid replies."
     remaining_voices = sum(
         not is_current_character_voice_direction(entry.voice_direction) for entry in roster.characters
     ) if character_voices else 0
@@ -416,7 +424,9 @@ def analyze_book_dialogue(
         notice += f" Missing {_count_label(remaining_voices, 'character voice direction')}."
     if issue:
         notice += f" {issue}"
-    if issue or remaining_voices:
+    if skipped_chunks:
+        notice += " Run Analyze book to retry incomplete chunks."
+    elif issue or remaining_voices:
         notice += " Run Analyze book to continue."
     log(notice + "\n")
     return replace(session, roster=roster, attributions=attributions, attribution_notice=notice)

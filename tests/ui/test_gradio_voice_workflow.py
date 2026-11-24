@@ -573,6 +573,49 @@ def test_library_selection_reaches_samples_cast_and_saved_project(tmp_path, monk
     asyncio.run(exercise())
 
 
+def test_saved_analysis_status_returns_on_reopen_and_clears_on_import(tmp_path, monkeypatch):
+    monkeypatch.setenv("GRADIO_TEMP_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(gradio_app, "installed_model_choices", lambda: [("Breeze TTS 2", "venv-breeze")])
+    project_root = tmp_path / "projects"
+    for method in ("create_project", "list_projects", "load_project"):
+        monkeypatch.setattr(gradio_app, method, partial(getattr(web_projects, method), root=project_root))
+    notice = "0 of 1 dialogue chunks complete. Skipped chunk 1 (lines 1–1) after invalid replies."
+
+    def analyze_dialogue(session, key, *_args, **_kwargs):
+        return replace(session, attribution_notice=f"{notice} {key}")
+
+    monkeypatch.setattr(gradio_app, "analyze_book_dialogue", analyze_dialogue)
+    ui = VoiceApp()
+
+    async def exercise():
+        load = ui.event("load_book")
+        analyze = ui.event("analyze_book")
+        save = ui.event("save_named_project")
+        reopen = ui.event("open_project_snapshot")
+        analysis_status = analyze.outputs[-1]
+        ui.values[load.inputs[2]._id] = "manual"
+        ui.values[load.inputs[5]._id] = "“Hello.”"
+        await ui.run(load)
+        ui.values[analyze.inputs[1]._id] = "fixture-key"
+        await ui.run(analyze)
+        ui.values[save.inputs[0]._id] = "Skipped analysis"
+        await ui.run(save)
+        project = web_projects.list_projects(root=project_root)[0]
+        (opened,) = await ui.run(reopen, project.project_id, None)
+        reopened_status = opened[reopen.outputs.index(analysis_status)]
+        assert reopened_status["visible"] is True
+        assert reopened_status["value"] == f"{notice} [redacted]"
+
+        ui.values[load.inputs[5]._id] = "A different book."
+        (imported,) = await ui.run(load)
+        cleared_status = imported[load.outputs.index(analysis_status)]
+        assert cleared_status["visible"] is False
+        assert cleared_status["value"] is None
+        gradio_app.close_book_session(ui.state[load.inputs[0]._id])
+
+    asyncio.run(exercise())
+
+
 def test_character_merge_confirms_current_pair_and_survives_reopening(tmp_path, monkeypatch):
     monkeypatch.setattr(gradio_app, "installed_model_choices", lambda: [("Breeze TTS 2", "venv-breeze")])
     monkeypatch.setattr(gradio_app, "analyze_book_dialogue", lambda *_args, **_kwargs: pytest.fail("Merge is local."))

@@ -167,6 +167,7 @@ class TestWebProjects(unittest.TestCase):
         del snapshot["web_project"]["model_options"]
         del snapshot["web_project"]["character_voices"]
         del snapshot["web_project"]["analyze_performance_cues"]
+        del snapshot["web_project"]["attribution_notice"]
         snapshot["web_project"]["narrator"] = {
             "reference": None, "transcript": "Sample words.", "instructions": "Read gently.",
         }
@@ -177,6 +178,7 @@ class TestWebProjects(unittest.TestCase):
         self.assertFalse(saved.performance_cues)
         self.assertFalse(saved.character_voices)
         self.assertFalse(saved.analyze_performance_cues)
+        self.assertEqual(saved.session.attribution_notice, "")
 
     def test_delivery_settings_survive_save_and_can_be_disabled_independently(self):
         narrator = RenderVoice()
@@ -224,8 +226,10 @@ class TestWebProjects(unittest.TestCase):
         self.assertEqual(self._open(summary.project_id).model_options, {})
 
     def test_failed_save_keeps_previous_snapshot_and_explicit_save_can_clear_assignments(self):
+        notice = "1 of 2 dialogue chunks complete. Skipped chunk 2 (lines 2–3) after invalid replies."
+        initial = replace(self.session, attribution_notice=notice)
         summary = web_projects.create_project(
-            "First version", self.session, narrator=RenderVoice(), voices={}, model_id="old", root=self.root,
+            "First version", initial, narrator=RenderVoice(), voices={}, model_id="old", root=self.root,
         )
         changed = replace(self.session, attributions=AttributionsFile())
 
@@ -237,6 +241,7 @@ class TestWebProjects(unittest.TestCase):
         saved = self._open(summary.project_id)
         self.assertEqual(saved.model_id, "old")
         self.assertEqual(saved.session.attributions, self.attributions)
+        self.assertEqual(saved.session.attribution_notice, notice)
 
         web_projects.save_project(
             summary.project_id, changed, narrator=RenderVoice(), voices={}, model_id="new", root=self.root,
@@ -244,6 +249,7 @@ class TestWebProjects(unittest.TestCase):
         reopened = self._open(summary.project_id)
         self.assertEqual(reopened.model_id, "new")
         self.assertEqual(reopened.session.attributions, AttributionsFile())
+        self.assertEqual(reopened.session.attribution_notice, "")
 
     def test_rejects_non_project_ids_and_symlinked_project_assets(self):
         audio_path = self.directory / "voice.wav"

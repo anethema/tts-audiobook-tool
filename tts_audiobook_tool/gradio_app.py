@@ -458,6 +458,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
         def present_book(session, voices, problem=None):
             table, roles = _review_components(session)
             has_text = session is not None and bool(session.book.sections)
+            notice = session.attribution_notice if session else ""
             return (
                 session,
                 voices,
@@ -465,7 +466,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                 table,
                 roles,
                 gr.update(visible=False),
-                gr.update(value=None, visible=False),
+                voice_status(notice or None),
                 gr.update(interactive=has_text),
                 gr.update(interactive=has_text and bool(model_choices)),
                 gr.update(value=None, visible=False),
@@ -741,7 +742,10 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
             except Exception:
                 message = "Book analysis failed. Check your LLM settings and try again."
             else:
-                message = redact(session.attribution_notice or "Book analysis complete.")
+                notice = redact(session.attribution_notice)
+                if notice != session.attribution_notice:
+                    session = replace(session, attribution_notice=notice)
+                message = notice or redact("Book analysis complete.")
                 yield session, *_review_components(session, selected_role), voice_status(message)
                 return
             log(message)
