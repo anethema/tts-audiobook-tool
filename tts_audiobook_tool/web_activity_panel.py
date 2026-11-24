@@ -36,21 +36,23 @@ class BookActivity:
 
     def html(self) -> str:
         progress = self.telemetry
-        estimate = ""
         if progress is not None and progress.total > 0:
             done = min(max(0, progress.processed), progress.total)
-            counts = f"{done:,} of {progress.total:,} segments · {done / progress.total:.0%}"
+            details = f"{done:,} of {progress.total:,} segments · {done / progress.total:.0%}"
             bar_values = f'max="{progress.total}" value="{done}"'
-            eta = progress.eta_seconds
-            if (
-                not self.ended and not progress.assembling and done < progress.total
-                and eta is not None and math.isfinite(eta) and eta > 0
-            ):
-                duration = duration_string(math.ceil(eta), pad_seconds=True).replace("h", "h ").replace("m", "m ")
-                estimate = f' · <span title="Estimated time to finish generating audio">ETA {duration}</span>'
         else:
-            counts = ""
+            details = ""
             bar_values = 'max="1" value="0"' if self.ended else ""
+        if not self.ended and (
+            progress is None
+            or (not progress.assembling and (progress.total <= 0 or progress.processed < progress.total))
+        ):
+            eta = progress.eta_seconds if progress is not None else None
+            duration = "measuring…"
+            if eta is not None and math.isfinite(eta) and eta > 0:
+                duration = duration_string(math.ceil(eta), pad_seconds=True).replace("h", "h ").replace("m", "m ")
+            estimate = f'<span title="Estimated time to finish generating audio">ETA {duration}</span>'
+            details = f"{details} · {estimate}" if details else estimate
         rate = progress.speed_multiplier if progress is not None else None
         speed = ""
         if rate is not None and math.isfinite(rate) and rate >= 0:
@@ -60,7 +62,7 @@ class BookActivity:
             )
         return (
             '<div class="book-progress-details">'
-            f'<span>{escape(self.label)}</span><span>{counts}{estimate}</span></div>'
+            f'<span>{escape(self.label)}</span><span>{details}</span></div>'
             '<div class="book-progress-track">'
             f'<progress aria-label="Overall audiobook progress" {bar_values}></progress>{speed}</div>'
         )
@@ -90,7 +92,12 @@ class SessionActivity:
             self._book_version += 1
 
     def update_book(self, value: BookRenderTelemetry) -> None:
-        label = "Assembling M4B" if value.assembling else "Generating audiobook"
+        if value.assembling:
+            label = "Assembling M4B"
+        elif value.total > 0 and value.processed >= value.total:
+            label = "Finalizing audio"
+        else:
+            label = "Generating audiobook"
         with self._lock:
             self._book = BookActivity(label, value)
             self._book_version += 1

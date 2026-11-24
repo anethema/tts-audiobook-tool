@@ -24,6 +24,7 @@ from tts_audiobook_tool.checkpoint_writer import (
 )
 from tts_audiobook_tool.concat_util import ConcatUtil
 from tts_audiobook_tool.model_manager import ModelManager
+from tts_audiobook_tool.generation_eta import GenerationEta
 from tts_audiobook_tool.generation_events import (
     GenerationEvents,
     GenerationPhase,
@@ -81,13 +82,7 @@ class SubBatch:
 # ordering used to preserve a semblance of index monotonicity.
 BATCH_ITERATIONS_PER_GROUP = 5
 
-# Number of per-batch durations kept in the rolling history used to
-# extrapolate the estimated time remaining.
-BATCH_DURATION_HISTORY_SIZE = 50
-
-# The ETA is first shown once this many durations have been recorded;
-# further samples only refine the rolling average.
-ETA_MIN_BATCH_DURATIONS = 10
+CHECKPOINT_DURATION_HISTORY_SIZE = 50
 
 
 def make_consecutive_model_errors_reset_message(max_consecutive_model_errors: int) -> str:
@@ -227,6 +222,15 @@ class GenerateUtil:
                 items = bucket_items(items, project.phrase_groups, batch_size)
             queue = make_single_voice_rounds(items, batch_size)
 
+        text_lengths = {
+            index: max(1, sum(len(phrase.text) for phrase in project.phrase_groups[index].phrases))
+            for index in sorted_indices
+        }
+        generation_eta = GenerationEta(text_lengths, batch_size)
+        for queued_round in queue:
+            for sub in queued_round:
+                generation_eta.add_batch([index for index, _ in sub.items])
+
         # Metrics-related variables
         errored_indices: set[int] = set()
         num_failed = 0
@@ -245,13 +249,9 @@ class GenerateUtil:
         start_time = time.time()
         consecutive_model_errors = 0
         max_consecutive_model_errors = 5
-        # Rolling per-batch duration history for the ETA extrapolation. The
-        # run's first batch is never recorded (warm-up dominates it).
-        batch_durations: list[float] = []
-        did_skip_warmup_batch = False
         # Recalculated once per completed batch; never time-interpolated.
         eta_seconds: float | None = None
-        write_durations: deque[float] = deque(maxlen=BATCH_DURATION_HISTORY_SIZE)
+        write_durations: deque[float] = deque(maxlen=CHECKPOINT_DURATION_HISTORY_SIZE)
         write_error = ""
 
         if staging_dir:
@@ -269,7 +269,7 @@ class GenerateUtil:
             did_improve: bool,
             quiet: bool,
         ) -> SavedCheckpoint:
-            started = time.time()
+            started = monotonic()
             error, path = GenerateUtil.save_sound_and_timing_json(
                 state, phrase_group, index, result,
                 is_real_time=False, voice_tag=getattr(result, "voice_tag", ""),
@@ -277,7 +277,7 @@ class GenerateUtil:
             )
             duration = result.sound.duration if not error and Path(path).is_file() else None
             return SavedCheckpoint(
-                index, path, error, time.time() - started, duration,
+                index, path, error, monotonic() - started, duration,
                 not result.is_fail, final_attempt, did_improve, quiet,
             )
 
@@ -364,6 +364,7 @@ class GenerateUtil:
                 if pending_retries:
                     current_round = make_retry_round(pending_retries, voice_of_index, batch_size)
                     pending_retries = []
+                    generation_eta.start_retry_round()
                 elif queue:
                     current_round = queue.pop(0)
                 else:
@@ -373,6 +374,7 @@ class GenerateUtil:
 
             # Make parallel arrays from 'sub'
             indices = [item[0] for item in sub.items]
+            batch_work = generation_eta.start_batch(indices)
             retry_counts = [item[1] for item in sub.items]
             num_retries += sum(retry_count > 0 for retry_count in retry_counts)
 
@@ -409,7 +411,7 @@ class GenerateUtil:
             )
 
             # Generate and validate
-            gen_start_time = time.time()
+            gen_start_time = monotonic()
             with gen_timeout_tracker.scope() as gen_timeout_guard:
                 results = GenerateUtil.generate_and_validate_batch(
                     state=state,
@@ -427,7 +429,7 @@ class GenerateUtil:
                 Tts.clear_continuation()
                 did_interrupt = True
                 break
-            batch_gen_val_time = time.time() - gen_start_time
+            batch_gen_val_time = monotonic() - gen_start_time
             gen_val_sum_time += batch_gen_val_time
 
             # Check for OOM in results and break early if detected
@@ -611,42 +613,43 @@ class GenerateUtil:
             receive_queued_saves()
 
             # Include synchronous saves, pruning and any time waiting for
-            # room in the writer queue. Skip warm-up and model error batches.
-            if not did_skip_warmup_batch:
-                did_skip_warmup_batch = True
-            elif not any(isinstance(result, TtsModelError) for result in results):
-                batch_durations.append(time.time() - gen_start_time)
-                if len(batch_durations) > BATCH_DURATION_HISTORY_SIZE:
-                    batch_durations.pop(0)
+            # room in the writer queue. Error batches may exit early.
+            if (
+                not write_error
+                and len(results) == len(indices)
+                and not any(isinstance(result, (TtsModelError, str)) for result in results)
+            ):
+                generation_eta.record_duration(batch_work, monotonic() - gen_start_time)
 
             if re_adds:
                 # Pending retries are processed at the head of the queue,
                 # as the next round(s) before any further items from the
                 # main queue.
                 pending_retries.extend(re_adds)
+                for index, _ in re_adds:
+                    voice = voice_of_index[index] if voice_of_index is not None else 0
+                    generation_eta.add_retry(index, voice)
 
-            # Extrapolate the remaining time from the rolling history, once
-            # per completed batch (the consumer never interpolates it).
-            # Remaining work is counted in sub-batches (one model call
-            # each): the current round's remainder, the queued rounds, and
-            # a ceil-estimate for the pending retries, whose items have
-            # already left the main queue.
-            remaining_batches = (
-                len(current_round)
-                + sum(len(round) for round in queue)
-                + (len(pending_retries) + batch_size - 1) // batch_size
-            )
-            eta_seconds = make_batch_eta_seconds(batch_durations, remaining_batches)
-            if writer is not None and write_durations:
-                seconds_per_write = sum(write_durations) / len(write_durations)
-                drain_eta = writer.pending * seconds_per_write
-                if not remaining_batches:
-                    eta_seconds = drain_eta
-                elif eta_seconds is not None:
-                    # Encoding can overlap later batches, but the last batch's
-                    # writes run after synthesis ends.
-                    last_batch_size = len(queue[-1][-1].items) if queue else len(indices)
-                    eta_seconds = max(eta_seconds + last_batch_size * seconds_per_write, drain_eta)
+            eta_seconds = generation_eta.seconds_remaining()
+            if writer is not None:
+                if write_durations:
+                    seconds_per_write = sum(write_durations) / len(write_durations)
+                    drain_eta = writer.pending * seconds_per_write
+                    if not generation_eta.remaining_items:
+                        eta_seconds = drain_eta
+                    elif eta_seconds is not None:
+                        # The writer can overlap synthesis, except for the
+                        # writes submitted by the final sub-batch.
+                        if queue:
+                            last_batch_size = len(queue[-1][-1].items)
+                        elif pending_retries:
+                            last_batch_size = generation_eta.last_pending_retry_batch_size
+                        else:
+                            last_batch_size = len(current_round[-1].items)
+                        all_writes_eta = drain_eta + generation_eta.remaining_items * seconds_per_write
+                        eta_seconds = max(eta_seconds + last_batch_size * seconds_per_write, all_writes_eta)
+                elif not generation_eta.remaining_items and writer.pending:
+                    eta_seconds = None
             elapsed = monotonic() - generation_started
             speed_multiplier = saved_audio_seconds / elapsed if saved_audio_seconds > 0 and elapsed > 0 else None
             emit_progress()
@@ -1235,20 +1238,6 @@ def print_speed_info(gen_elapsed: float, gen_results: list) -> None:
         )
 
     print(message)
-
-def make_batch_eta_seconds(
-        batch_durations: list[float],
-        remaining_batches: int) -> float | None:
-    """
-    Extrapolates the estimated remaining seconds of a generation run from
-    the rolling per-batch duration history. Returns None until at least
-    ETA_MIN_BATCH_DURATIONS samples exist; the history itself holds at
-    most BATCH_DURATION_HISTORY_SIZE entries.
-    """
-    if len(batch_durations) < ETA_MIN_BATCH_DURATIONS:
-        return None
-    average = sum(batch_durations) / len(batch_durations)
-    return average * remaining_batches
 
 def print_eta(saved_elapsed: list[float], num_left) -> None:
 

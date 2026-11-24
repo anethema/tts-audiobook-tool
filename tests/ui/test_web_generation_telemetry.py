@@ -198,7 +198,26 @@ def test_eta_is_displayed_only_while_audio_generation_is_unfinished():
     assert 'aria-label="Synthesis speed"' in activity.html()
     assert "ETA" not in BookActivity("Finalizing audio", BookRenderTelemetry(2, 2, 3.0, eta_seconds=754)).html()
     assert "ETA" not in BookActivity("Generation stopped", activity.telemetry, ended=True).html()
-    assert "ETA" not in BookActivity("Generating audiobook", BookRenderTelemetry(1, 2, 3.0)).html()
+    assert "ETA measuring…" in BookActivity("Generating audiobook", BookRenderTelemetry(1, 2, 3.0)).html()
+
+
+def test_activity_panel_shows_eta_from_preparation_through_first_estimate():
+    from tts_audiobook_tool.web_activity_panel import SessionActivity
+
+    activity = SessionActivity()
+    activity.start_book()
+    _, update, version = activity.changes_since((0, 0))
+    assert "Preparing audiobook" in update["value"]
+    assert "ETA measuring…" in update["value"]
+
+    activity.update_book(BookRenderTelemetry(0, 2))
+    _, update, version = activity.changes_since(version)
+    assert "0 of 2 segments" in update["value"]
+    assert "ETA measuring…" in update["value"]
+
+    activity.update_book(BookRenderTelemetry(0, 2, eta_seconds=65))
+    _, update, _ = activity.changes_since(version)
+    assert "ETA 1m 05s" in update["value"]
 
 
 def test_activity_panel_switches_to_assembly_only_when_reported():
@@ -207,7 +226,8 @@ def test_activity_panel_switches_to_assembly_only_when_reported():
     activity = SessionActivity()
     activity.update_book(BookRenderTelemetry(2, 2, 3.0))
     _, update, version = activity.changes_since((0, 0))
-    assert "Generating audiobook" in update["value"]
+    assert "Finalizing audio" in update["value"]
+    assert "ETA" not in update["value"]
 
     activity.update_book(BookRenderTelemetry(2, 2, 3.0, assembling=True))
     _, update, _ = activity.changes_since(version)

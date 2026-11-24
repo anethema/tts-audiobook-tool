@@ -1,195 +1,227 @@
-"""Tests for the per-batch ETA extrapolation in GenerateUtil.generate_files().
+"""Exercise generation ETA snapshots with a deterministic clock."""
 
-A fake clock replaces generate_util's `time` module so batch durations are
-deterministic: the mocked generate_and_validate_batch side effect advances
-the clock before returning. Captured GenerationProgress events (via the
-GenerationEvents sink) expose what the header would render.
-"""
-
-
+from collections import deque
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
 
+from generate_files_test_support import StubValidationResult, generate_files_mock_stack, make_generate_state
 from tts_audiobook_tool import generate_util
-from tts_audiobook_tool.generate_util import (
-    BATCH_DURATION_HISTORY_SIZE,
-    ETA_MIN_BATCH_DURATIONS,
-    GenerateUtil,
-    TtsModelError,
-    make_batch_eta_seconds,
-)
+from tts_audiobook_tool.app_types.phrase import Phrase, PhraseGroup, Reason
+from tts_audiobook_tool.generate_util import GenerateUtil, TtsModelError
+from tts_audiobook_tool.generation_eta import GenerationEta
 from tts_audiobook_tool.generation_events import GenerationEvents, GenerationProgress
 from tts_audiobook_tool.state import State
-
-from generate_files_test_support import StubValidationResult, generate_files_mock_stack, make_generate_state
-
-
-class FakeClock:
-    def __init__(self) -> None:
-        self.now = 1000.0
-
-    def time(self) -> float:
-        return self.now
-
-    def advance(self, seconds: float) -> None:
-        self.now += seconds
-
-
-def progress_emits(events: list) -> list[GenerationProgress]:
-    return [event for event in events if isinstance(event, GenerationProgress)]
 
 
 def run_generate_files(
     monkeypatch,
     state: State,
     batch_durations: list[float],
-    results: list,
+    *,
+    batch_size: int = 1,
+    batch_results: list[list[StubValidationResult | TtsModelError | str]] | None = None,
     save_seconds: float = 0.0,
-) -> list[GenerationProgress]:
-    """Runs generate_files over one item per batch with scripted durations.
+) -> tuple[list[GenerationProgress], list[tuple[int, ...]]]:
+    now = 1000.0
+    monkeypatch.setattr(generate_util, "monotonic", lambda: now)
+    calls: list[tuple[int, ...]] = []
 
-    `batch_durations[i]` is the clock advance for batch i+1; `results[i]` is
-    its (single-item) generate_and_validate_batch return value.
-    """
-    clock = FakeClock()
-    monkeypatch.setattr(generate_util, "time", clock)
-    calls = {"n": 0}
-
-    def generate_and_validate_batch(**_: object) -> list:
-        i = calls["n"]
-        calls["n"] += 1
-        clock.advance(batch_durations[i])
-        return [results[i]]
+    def generate_and_validate_batch(*, indices: list[int], **_: object) -> list:
+        nonlocal now
+        i = len(calls)
+        calls.append(tuple(indices))
+        now += batch_durations[i]
+        if batch_results is not None:
+            assert len(batch_results[i]) == len(indices)
+            return batch_results[i]
+        return [StubValidationResult(False) for _ in indices]
 
     def save_and_prune(*_, **__):
-        clock.advance(save_seconds)
+        nonlocal now
+        now += save_seconds
         return "", "saved.wav"
 
-    events: list = []
+    events = []
     with (
-        generate_files_mock_stack(generate_and_validate_batch),
+        generate_files_mock_stack(generate_and_validate_batch, mock_save=False),
         patch.object(GenerateUtil, "save_sound_and_timing_json", side_effect=save_and_prune),
         GenerationEvents.using_sink(events.append),
     ):
         did_interrupt = GenerateUtil.generate_files(
-            state, set(range(len(state.project.phrase_groups))), batch_size=1, is_regen=False
+            state, set(range(len(state.project.phrase_groups))), batch_size=batch_size, is_regen=False,
         )
 
     assert not did_interrupt
-    assert calls["n"] == len(batch_durations)
-    return progress_emits(events)
+    assert len(calls) == len(batch_durations)
+    return [event for event in events if isinstance(event, GenerationProgress)], calls
 
 
-def test_make_batch_eta_seconds_requires_minimum_history() -> None:
-    assert BATCH_DURATION_HISTORY_SIZE == 50
-    assert ETA_MIN_BATCH_DURATIONS == 10
+def test_first_batch_publishes_eta_and_later_samples_drop_startup_cost(monkeypatch) -> None:
+    state = make_generate_state(num_groups=4, max_retries=0)
+    emits, _ = run_generate_files(monkeypatch, state, [300.0, 10.0, 10.0, 10.0])
+    pre = [event for event in emits if event.current_indices]
+    post = [event for event in emits if not event.current_indices]
 
-    assert make_batch_eta_seconds([10.0] * (ETA_MIN_BATCH_DURATIONS - 1), 5) is None
-    # Available at the minimum sample count; further samples only refine
-    # the rolling average.
-    assert make_batch_eta_seconds([10.0] * ETA_MIN_BATCH_DURATIONS, 5) == pytest.approx(50.0)
-    assert make_batch_eta_seconds([10.0] * BATCH_DURATION_HISTORY_SIZE, 5) == pytest.approx(50.0)
-    assert make_batch_eta_seconds([10.0] * ETA_MIN_BATCH_DURATIONS, 0) == pytest.approx(0.0)
-
-
-def test_history_cap_drops_oldest_duration(monkeypatch) -> None:
-    state = make_generate_state(num_groups=53, max_retries=0)
-    # Batch 1 (300s) is the skipped warm-up; batch 2 is slow (100s); batches
-    # 3-53 all take 10s. Fifty-one samples accumulate before the cap
-    # (BATCH_DURATION_HISTORY_SIZE) forces the oldest one out.
-    durations = [300.0, 100.0] + [10.0] * 51
-    results = [StubValidationResult(False)] * 53
-
-    emits = run_generate_files(monkeypatch, state, durations, results)
-    post = [e for e in emits if not e.current_indices]
-    assert len(post) == 53
-
-    # After batch 51 the history holds batches 2-51 (fifty samples that still
-    # include the 100s batch; average 11.8s). Two batches remain: ETA = 23.6s.
-    assert post[50].eta_seconds == pytest.approx(23.6)
-    # After batch 52 the fifty-first sample pushes the history one past the
-    # cap, which drops the 100s batch from the head. Only 10s samples remain
-    # and one batch is left queued: ETA = 10s. Without the cap the average
-    # would still include the 100s sample.
-    assert post[51].eta_seconds == pytest.approx(10.0)
+    assert pre[0].eta_seconds is None
+    assert [event.eta_seconds for event in post] == pytest.approx([900.0, 20.0, 10.0, 0.0])
+    assert [event.eta_seconds for event in pre[1:]] == pytest.approx([900.0, 20.0, 10.0])
+    assert [event.processed for event in post] == [1, 2, 3, 4]
 
 
-def test_eta_appears_only_once_minimum_samples_recorded(monkeypatch) -> None:
-    state = make_generate_state(num_groups=12, max_retries=0)
-    # Batch 1 (300s warm-up) is skipped; batches 2-12 all take 10s.
-    durations = [300.0] + [10.0] * 11
-    results = [StubValidationResult(False)] * 12
+def test_eta_smooths_changes_then_adapts_to_recent_rate(monkeypatch) -> None:
+    state = make_generate_state(num_groups=8, max_retries=0)
+    emits, _ = run_generate_files(monkeypatch, state, [10.0] * 2 + [20.0] * 6)
+    post = [event for event in emits if not event.current_indices]
+    predicted_per_batch = [event.eta_seconds / event.remaining for event in post[1:-1]]
 
-    emits = run_generate_files(monkeypatch, state, durations, results)
-
-    # One pre-batch and one post-batch emit per batch.
-    pre = [e for e in emits if e.current_indices]
-    post = [e for e in emits if not e.current_indices]
-    assert len(pre) == 12
-    assert len(post) == 12
-
-    # The skipped warm-up batch leaves 9 samples after batch 10: no ETA yet...
-    assert [e.eta_seconds for e in post[:10]] == [None] * 10
-    # ...then the tenth sample is recorded (batches 2-11, all 10s; the 300s
-    # never entered) and one batch remains queued: ETA = 10s x 1.
-    assert post[10].eta_seconds == pytest.approx(10.0)
-    assert post[11].eta_seconds == pytest.approx(0.0)
-
-    # The pre-batch snapshot carries the previous batch's ETA so the header
-    # does not blank the estimate during inference.
-    assert pre[11].eta_seconds == pytest.approx(10.0)
+    assert predicted_per_batch[0] == pytest.approx(10.0)
+    assert 10.0 < predicted_per_batch[1] < 20.0
+    assert predicted_per_batch == sorted(predicted_per_batch)
+    assert predicted_per_batch[-1] > 18.0
 
 
-def test_eta_includes_time_spent_saving_and_pruning(monkeypatch) -> None:
-    state = make_generate_state(num_groups=12, max_retries=0)
-    emits = run_generate_files(monkeypatch, state, [10.0] * 12, [StubValidationResult(False)] * 12, save_seconds=3.0)
-    assert [event.eta_seconds for event in emits if not event.current_indices][-2:] == pytest.approx([13.0, 0.0])
+def test_eta_accounts_for_length_sorted_batches_and_partial_tail(monkeypatch) -> None:
+    state = make_generate_state(num_groups=7, max_retries=0)
+    texts = ["short", "a few words", "a few words", "a few words", "long sentence " * 30]
+    texts.extend([texts[-1]] * 2)
+    state.project.phrase_groups = [PhraseGroup([Phrase(text, Reason.SENTENCE)]) for text in texts]
+
+    emits, calls = run_generate_files(monkeypatch, state, [40.0, 10.0, 5.0], batch_size=3)
+    post = [event for event in emits if not event.current_indices]
+
+    assert calls == [(4, 5, 6), (1, 2, 3), (0,)]
+    assert post[0].eta_seconds < 40.0
+    assert 0.0 < post[1].eta_seconds < 10.0
+    assert post[2].eta_seconds == 0.0
 
 
-def test_model_error_batch_is_excluded_from_history(monkeypatch) -> None:
-    state = make_generate_state(num_groups=13, max_retries=0)
-    # Batch 5 returns a model error after "taking" 999s; it must not skew
-    # the rolling average.
-    durations = [300.0, 10.0, 10.0, 10.0, 999.0] + [10.0] * 8
-    results = (
-        [StubValidationResult(False)] * 4
-        + [TtsModelError("boom")]
-        + [StubValidationResult(False)] * 8
+def test_eta_uses_text_length_for_cjk_even_without_word_bucketing(monkeypatch) -> None:
+    state = make_generate_state(num_groups=2, max_retries=0)
+    state.project.language_code = "zh"
+    state.project.phrase_groups = [
+        PhraseGroup([Phrase("你好" * repeats, Reason.SENTENCE)]) for repeats in (30, 1)
+    ]
+
+    emits, calls = run_generate_files(monkeypatch, state, [30.0, 3.0])
+    post = [event for event in emits if not event.current_indices]
+
+    assert calls == [(0,), (1,)]
+    assert 0.0 < post[0].eta_seconds < 10.0
+
+
+def test_eta_includes_synchronous_checkpoint_writes(monkeypatch) -> None:
+    state = make_generate_state(num_groups=3, max_retries=0)
+    emits, _ = run_generate_files(monkeypatch, state, [10.0] * 3, save_seconds=3.0)
+    post = [event for event in emits if not event.current_indices]
+
+    assert [event.eta_seconds for event in post] == pytest.approx([26.0, 13.0, 0.0])
+
+
+def test_error_batches_do_not_set_or_skew_generation_rate(monkeypatch) -> None:
+    state = make_generate_state(num_groups=5, max_retries=0)
+    emits, _ = run_generate_files(
+        monkeypatch, state, [999.0, 10.0, 999.0, 10.0, 10.0],
+        batch_results=[
+            [TtsModelError("model error")],
+            [StubValidationResult(False)],
+            ["validation error"],
+            [StubValidationResult(False)],
+            [StubValidationResult(False)],
+        ],
     )
+    post = [event for event in emits if not event.current_indices]
 
-    emits = run_generate_files(monkeypatch, state, durations, results)
-    post = [e for e in emits if not e.current_indices]
-    assert len(post) == 13
-
-    # After batch 12 the history holds ten 10s samples (batch 1 skipped as
-    # warm-up, batch 5 excluded as a model error); one batch remains.
-    assert post[11].eta_seconds == pytest.approx(10.0)
-    assert post[12].eta_seconds == pytest.approx(0.0)
-    # The errored item is tallied, not retried (max_retries=0).
-    assert post[-1].errored == 1
+    assert post[0].eta_seconds is None
+    assert [event.eta_seconds for event in post[1:]] == pytest.approx([30.0, 20.0, 10.0, 0.0])
+    assert post[-1].errored == 2
 
 
-def test_eta_counts_pending_retry_batches(monkeypatch) -> None:
-    state = make_generate_state(num_groups=12, max_retries=1)
-    # Batches 1-11 process items 1-11 (item 11 fails validation and is
-    # re-added), batch 12 is the retry of item 11, batch 13 is item 12.
-    durations = [300.0] + [10.0] * 12
-    results = (
-        [StubValidationResult(False)] * 10
-        + [StubValidationResult(True)]
-        + [StubValidationResult(False)] * 2
+def test_eta_counts_pending_retries_before_the_rest_of_the_queue(monkeypatch) -> None:
+    state = make_generate_state(num_groups=2, max_retries=1)
+    emits, calls = run_generate_files(
+        monkeypatch, state, [10.0] * 3,
+        batch_results=[[StubValidationResult(failed)] for failed in (True, False, False)],
     )
+    post = [event for event in emits if not event.current_indices]
 
-    emits = run_generate_files(monkeypatch, state, durations, results)
-    post = [e for e in emits if not e.current_indices]
-    # 12 items + 1 retry batch.
-    assert len(post) == 13
-
-    # After the failing batch 11: the queued item-12 round plus one retry
-    # batch remain, at a 10s average each.
-    assert post[10].eta_seconds == pytest.approx(20.0)
-    # After the retry batch: only the queued item-12 round remains.
-    assert post[11].eta_seconds == pytest.approx(10.0)
-    assert post[12].eta_seconds == pytest.approx(0.0)
+    assert calls == [(0,), (0,), (1,)]
+    assert [event.eta_seconds for event in post] == pytest.approx([20.0, 10.0, 0.0])
+    assert [event.processed for event in post] == [0, 1, 2]
     assert post[-1].retries == 1
+
+
+def test_eta_counts_separate_retry_sub_batches_by_voice(monkeypatch) -> None:
+    state = make_generate_state(num_groups=4, max_retries=1)
+    for index, group in enumerate(state.project.phrase_groups):
+        group.voice_index = index % 2
+    monkeypatch.setattr(generate_util.ProjectVoiceUtil, "get_voice_values", lambda *_: ["A", "B"])
+
+    emits, calls = run_generate_files(
+        monkeypatch, state, [10.0] * 4, batch_size=4,
+        batch_results=[[StubValidationResult(failed)] * 2 for failed in (True, True, False, False)],
+    )
+    post = [event for event in emits if not event.current_indices]
+
+    assert calls == [(0, 2), (1, 3), (0, 2), (1, 3)]
+    # All four retries fit within the nominal batch size, but use two voices.
+    assert [event.eta_seconds for event in post] == pytest.approx([20.0, 20.0, 10.0, 0.0])
+    assert post[-1].retries == 4
+
+
+def test_incremental_retry_work_matches_the_scheduled_voice_chunks() -> None:
+    lengths = {index: length for index, length in enumerate((10, 20, 4, 30, 5, 40, 2))}
+    planned = GenerationEta(lengths, batch_size=2)
+    retries = GenerationEta(lengths, batch_size=2)
+    batches = [[0, 2], [4], [1, 3], [5, 6]]
+    for batch in batches:
+        planned.add_batch(batch)
+    for index in (0, 1, 2, 3, 5, 6, 4):
+        retries.add_retry(index, int(index in {1, 3, 5, 6}))
+
+    planned.record_duration(work=1, duration=1.0)
+    retries.record_duration(work=1, duration=1.0)
+    assert retries.seconds_remaining() == planned.seconds_remaining()
+    assert retries.last_pending_retry_batch_size == 2
+    assert retries.remaining_items == planned.remaining_items == 7
+
+    retries.start_retry_round()
+    assert retries.last_pending_retry_batch_size == 0
+    for batch in batches:
+        assert retries.start_batch(batch) == planned.start_batch(batch)
+    assert retries.seconds_remaining() == 0.0
+    assert retries.remaining_items == 0
+
+
+def test_eta_accounts_for_async_checkpoint_backlog_and_final_drain(monkeypatch) -> None:
+    class ScriptedWriter:
+        def __init__(self, _batch_size: int) -> None:
+            self._pending = deque()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            assert not self._pending
+
+        @property
+        def pending(self):
+            return len(self._pending)
+
+        def submit(self, write):
+            self._pending.append(write)
+
+        def collect(self, *, drain=False, make_space=False):
+            while self.pending > (0 if drain else 1):
+                yield replace(self._pending.popleft()(), elapsed=20.0)
+
+    state = make_generate_state(num_groups=3, max_retries=0)
+    state.project.checkpoint_format = "aac"
+    monkeypatch.setattr(generate_util, "CheckpointWriteQueue", ScriptedWriter)
+
+    emits, _ = run_generate_files(monkeypatch, state, [10.0] * 3)
+    post = [event for event in emits if not event.current_indices]
+
+    assert [event.eta_seconds for event in post] == pytest.approx([20.0, 40.0, 20.0, 20.0, 0.0])
+    assert [event.saved for event in post] == [0, 1, 2, 2, 3]
