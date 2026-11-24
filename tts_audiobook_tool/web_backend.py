@@ -32,7 +32,8 @@ from tts_audiobook_tool.speaker_assign.attribution_prompt_util import ATTRIBUTIO
 from tts_audiobook_tool.speaker_assign.attribution_reply_util import AttributionReplyUtil
 from tts_audiobook_tool.speaker_assign.combined_analysis import SYSTEM_PROMPT as COMBINED_ANALYSIS_SYSTEM_PROMPT
 from tts_audiobook_tool.speaker_assign.combined_analysis import (
-    CHARACTER_VOICE_SYSTEM_INSTRUCTIONS, PERFORMANCE_CUE_SYSTEM_PROMPT, build_prompt, parse_chunk_reply,
+    CHARACTER_VOICE_SYSTEM_INSTRUCTIONS, PERFORMANCE_CUE_SYSTEM_PROMPT, InvalidChunkReplyError,
+    build_prompt, parse_chunk_reply,
 )
 from tts_audiobook_tool.speaker_assign.attribution_runner import AttributionRunner, AttributionRunListener
 from tts_audiobook_tool.speaker_assign.llm_request_util import LlmRequestResult, SPEAKER_ASSIGN_LLM_TIMEOUT
@@ -65,6 +66,7 @@ that is not spoken dialogue.
 """
 _REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 _FINISH_REASONS = ("stop", "length", "content_filter", "tool_calls", "function_call")
+_ANALYSIS_REPLY_RETRIES = 2
 _WORKSPACE = tempfile.TemporaryDirectory(prefix="tts-audiobook-web-", ignore_cleanup_errors=True)
 
 
@@ -255,7 +257,7 @@ def analyze_book_dialogue(
         character_voices: bool = False,
         on_log: Callable[[str], None] | None = None,
 ) -> BookSession:
-    """Analyze dialogue and optional voice directions and cues in one request per chunk."""
+    """Analyze dialogue and optional voice directions and cues together for each chunk."""
     log = on_log if on_log is not None else lambda _message: None
     directory = session.attribution_dir or session.project_dir
     checkpoint = Path(SpeakerAssignFileUtil.attributions_path(directory))
@@ -333,21 +335,37 @@ def analyze_book_dialogue(
             system_prompt = PERFORMANCE_CUE_SYSTEM_PROMPT if cue_requests else COMBINED_ANALYSIS_SYSTEM_PROMPT
             if character_voices:
                 system_prompt += CHARACTER_VOICE_SYSTEM_INSTRUCTIONS
-            reply = _send(_make_session(prefs, api_key, system_prompt), prompt)
-            if reply.error is not None:
-                raise WebBackendError(_request_error_message(reply.error))
-            if reply.hit_output_limit:
-                raise WebBackendError("The model reached its output limit. Try lower reasoning effort or a higher output limit.")
-            try:
-                next_roster, parsed = parse_chunk_reply(
-                    reply.reply, roster, requested, cue_requests=cue_requests,
-                    voice_requests=voice_requests, character_voices=character_voices,
-                )
-            except ValueError:
-                message = "The model returned incomplete or invalid speaker labels."
-                if not requested and not cue_requests:
-                    message = "The model returned an unreadable character voice reply."
-                raise WebBackendError(message) from None
+            attempt_system_prompt = system_prompt
+            for attempt in range(_ANALYSIS_REPLY_RETRIES + 1):
+                reply = _send(_make_session(prefs, api_key, attempt_system_prompt), prompt)
+                if reply.error is not None:
+                    raise WebBackendError(_request_error_message(reply.error))
+                if reply.hit_output_limit:
+                    raise WebBackendError("The model reached its output limit. Try lower reasoning effort or a higher output limit.")
+                try:
+                    next_roster, parsed = parse_chunk_reply(
+                        reply.reply, roster, requested, cue_requests=cue_requests,
+                        voice_requests=voice_requests, character_voices=character_voices,
+                    )
+                except (ValueError, RecursionError) as error:
+                    if isinstance(error, InvalidChunkReplyError):
+                        reason = str(error)
+                    elif isinstance(error, json.JSONDecodeError):
+                        reason = "The reply could not be parsed as JSON."
+                    else:
+                        reason = "The reply did not match the expected analysis format."
+                    if attempt == _ANALYSIS_REPLY_RETRIES:
+                        message = "The model returned incomplete or invalid speaker labels."
+                        if not requested and not cue_requests:
+                            message = "The model returned an unreadable character voice reply."
+                        raise WebBackendError(f"{message} {reason} Stopped after {attempt + 1} attempts.") from None
+                    log(f"{label} {reason} Retrying ({attempt + 1}/{_ANALYSIS_REPLY_RETRIES}).\n")
+                    attempt_system_prompt = (
+                        f"{system_prompt}\n\nRetry reminder: {reason} Return one valid JSON object. "
+                        "Include exactly the quote IDs needing speaker labels in speakers and use valid speaker IDs."
+                    )
+                else:
+                    break
 
             next_attributions, new_utterances = attributions, []
             if requested or cue_requests:

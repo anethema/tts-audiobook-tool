@@ -103,6 +103,10 @@ _FALLBACK_LABELS = {
 }
 
 
+class InvalidChunkReplyError(ValueError):
+    """A validation error with a fixed message safe to show or send back to the model."""
+
+
 def build_prompt(
         book: Book,
         chunk: PlannedChunk,
@@ -188,7 +192,7 @@ def parse_chunk_reply(
 
     value = json.loads(text, object_pairs_hook=unique_object)
     if not isinstance(value, dict):
-        raise ValueError("The reply did not contain a JSON object.")
+        raise InvalidChunkReplyError("The reply did not contain a JSON object.")
     raw_delivery = value.pop("delivery", None)
     raw_voices = value.pop("character_voices", None)
     if voice_requests and not requested and not cue_requests:
@@ -196,20 +200,20 @@ def parse_chunk_reply(
         redirects = {old_id: entry.id for entry in roster.characters for old_id in entry.merged_ids}
         return _apply_voice_directions(roster, raw_voices, voice_requests, redirects), ParsedReply({}, frozenset(), ())
     if _contains_duplicate_keys(value):
-        raise ValueError("The reply contained duplicate JSON keys.")
+        raise InvalidChunkReplyError("The reply contained duplicate JSON keys.")
     new_roster, aliases = _merge_roster(roster, value)
     raw_speakers = value.get("speakers")
     if not isinstance(raw_speakers, dict) or set(raw_speakers) != {str(number) for number in requested}:
-        raise ValueError("The reply did not contain exactly the requested quote IDs.")
+        raise InvalidChunkReplyError("The reply did not contain exactly the requested quote IDs.")
 
     speakers: dict[str, str] = {}
     for number, raw in raw_speakers.items():
         if not isinstance(raw, str):
-            raise ValueError("The reply contained an invalid speaker label.")
+            raise InvalidChunkReplyError("The reply contained an invalid speaker label.")
         label = raw.strip().upper()
         canonical = aliases.get(label) or _FALLBACK_LABELS.get(label)
         if canonical is None:
-            raise ValueError("The reply named a speaker outside the character list.")
+            raise InvalidChunkReplyError("The reply named a speaker outside the character list.")
         speakers[number] = canonical
 
     parsed = AttributionReplyUtil.parse_reply({**value, "speakers": speakers}, requested, new_roster.ids)
@@ -262,7 +266,7 @@ def _contains_duplicate_keys(value: object) -> bool:
 def _merge_roster(roster: Roster, value: dict) -> tuple[Roster, dict[str, str]]:
     raw_characters = value.get("characters")
     if not isinstance(raw_characters, list):
-        raise ValueError("The reply omitted the character list.")
+        raise InvalidChunkReplyError("The reply omitted the character list.")
 
     characters = {entry.id: entry for entry in roster.characters}
     merged_ids = {merged_id: entry.id for entry in roster.characters for merged_id in entry.merged_ids}
@@ -275,7 +279,7 @@ def _merge_roster(roster: Roster, value: dict) -> tuple[Roster, dict[str, str]]:
             raw = {key: value for key, value in raw.items() if key not in {"merged_ids", "voice_direction"}}
         entry = RosterCharacter.from_dict(raw)
         if not entry.name.strip() or entry.id in returned_ids:
-            raise ValueError("The reply contained an invalid or duplicate character entry.")
+            raise InvalidChunkReplyError("The reply contained an invalid or duplicate character entry.")
         returned_ids.add(entry.id)
         target = characters.get(merged_ids.get(entry.id, entry.id))
         if target is not None:
@@ -284,7 +288,7 @@ def _merge_roster(roster: Roster, value: dict) -> tuple[Roster, dict[str, str]]:
                 # conflicting metadata under a retired ID.
                 if entry.id in merged_ids:
                     continue
-                raise ValueError("The reply reused a character ID for a different speaker.")
+                raise InvalidChunkReplyError("The reply reused a character ID for a different speaker.")
         else:
             # A newly supplied alias can confirm an earlier canonical name.
             # A shared alias such as "the captain" is insufficient on its own.
