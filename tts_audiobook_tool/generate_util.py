@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from collections import deque
+from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
+from functools import partial
 import os
 import time
 from time import monotonic
@@ -10,6 +14,14 @@ import numpy as np
 from tts_audiobook_tool import app_support, ask, text_util
 from tts_audiobook_tool.app_types import Sound, SttConfig, SttVariant
 from tts_audiobook_tool.app_support import app_hint_util, app_memory
+from tts_audiobook_tool.checkpoint_writer import (
+    CheckpointWriteError,
+    CheckpointWriteQueue,
+    SavedCheckpoint,
+    StagedCheckpoints,
+    choose_checkpoint_path,
+    write_checkpoint,
+)
 from tts_audiobook_tool.concat_util import ConcatUtil
 from tts_audiobook_tool.model_manager import ModelManager
 from tts_audiobook_tool.generation_events import (
@@ -25,7 +37,6 @@ from tts_audiobook_tool.gen_timeout_util import make_backend_gen_timeout_tracker
 from tts_audiobook_tool.project_support.project_util import ProjectUtil
 from tts_audiobook_tool.project_support.project_voice_util import ProjectVoiceUtil
 from tts_audiobook_tool.project_support.segment_transcript_util import SegmentTranscriptUtil
-from tts_audiobook_tool.project_support.segment_staging_util import prune_staged_segments
 from tts_audiobook_tool.app_types.phrase import PhraseGroup
 from tts_audiobook_tool import readiness
 from tts_audiobook_tool.project import Project
@@ -33,7 +44,7 @@ from tts_audiobook_tool.app_support.interrupts import Interrupts
 from tts_audiobook_tool.sound.sound_pipeline import SoundPipeline
 from tts_audiobook_tool.sound.sound_extra_util import SoundExtraUtil
 from tts_audiobook_tool.app_types.segment_transcript_data import SegmentTranscriptData
-from tts_audiobook_tool.project_support.sound_segment_util import SoundSegmentUtil, get_segment_stt_info_path
+from tts_audiobook_tool.project_support.sound_segment_util import SoundSegmentUtil
 from tts_audiobook_tool.state import State
 from tts_audiobook_tool.stt import Stt
 from tts_audiobook_tool.sound.sound_file_util import SoundFileUtil
@@ -122,8 +133,31 @@ class GenerateUtil:
             or aborted (OOM detected or too many consecutive model errors;
             an abort also emits a ModelUnhealthy event so the main process
             hard-resets the model worker)
+        Raises CheckpointWriteError if accepted audio cannot be saved.
         """
+        writer = (
+            CheckpointWriteQueue(batch_size)
+            if getattr(state.project, "checkpoint_format", "flac") == "aac"
+            else None
+        )
+        with writer or nullcontext():
+            try:
+                return GenerateUtil._generate_files(
+                    state, indices_set, batch_size, is_regen, staging_dir, suppress_validation_passes, writer,
+                )
+            finally:
+                Interrupts().clear()
 
+    @staticmethod
+    def _generate_files(
+        state: State,
+        indices_set: set[int],
+        batch_size: int,
+        is_regen: bool,
+        staging_dir: str,
+        suppress_validation_passes: bool,
+        writer: CheckpointWriteQueue | None,
+    ) -> bool:
         project = state.project
         max_retries = project.max_retries
         stt_variant = state.prefs.stt_variant
@@ -194,7 +228,7 @@ class GenerateUtil:
             queue = make_single_voice_rounds(items, batch_size)
 
         # Metrics-related variables
-        num_errored = 0
+        errored_indices: set[int] = set()
         num_failed = 0
         num_failed_music = 0
         num_improved = 0
@@ -217,10 +251,89 @@ class GenerateUtil:
         did_skip_warmup_batch = False
         # Recalculated once per completed batch; never time-interpolated.
         eta_seconds: float | None = None
+        write_durations: deque[float] = deque(maxlen=BATCH_DURATION_HISTORY_SIZE)
+        write_error = ""
+
+        if staging_dir:
+            publish = StagedCheckpoints(staging_dir).record
+        else:
+            def publish(path: Path, replaced: Path | None) -> None:
+                project.sound_segments.record_published_segment(path, replaces=replaced)
+
+        def save_take(
+            index: int,
+            phrase_group: PhraseGroup,
+            result: ValidationResult,
+            stt_info: SegmentTranscriptData | None,
+            final_attempt: bool,
+            did_improve: bool,
+            quiet: bool,
+        ) -> SavedCheckpoint:
+            started = time.time()
+            error, path = GenerateUtil.save_sound_and_timing_json(
+                state, phrase_group, index, result,
+                is_real_time=False, voice_tag=getattr(result, "voice_tag", ""),
+                stt_info=stt_info, dir_path=staging_dir or None, on_published=publish,
+            )
+            duration = result.sound.duration if not error and Path(path).is_file() else None
+            return SavedCheckpoint(
+                index, path, error, time.time() - started, duration,
+                not result.is_fail, final_attempt, did_improve, quiet,
+            )
+
+        def receive_save(saved: SavedCheckpoint) -> str:
+            nonlocal write_error, num_passed, num_failed, num_improved, saved_audio_seconds
+            if saved.error:
+                errored_indices.add(saved.index)
+                message = f"Couldn't save file: {saved.error} {saved.path}".rstrip()
+                write_error = write_error or message
+                return f"{COL_ERROR}{message}"
+
+            write_durations.append(saved.elapsed)
+            saved_indices.add(saved.index)
+            if saved.passed or saved.final_attempt:
+                errored_indices.discard(saved.index)
+            num_passed += saved.passed
+            num_failed += not saved.passed and saved.final_attempt
+            num_improved += saved.improved
+            # A retry contributes the duration of the retained take for its line.
+            if saved.duration is not None:
+                saved_audio_seconds += saved.duration - saved_durations.get(saved.index, 0.0)
+                saved_durations[saved.index] = saved.duration
+            if saved.quiet or saved.duration is None:
+                return ""
+            link = text_util.make_terminal_hyperlink(url=saved.path, text=Path(saved.path).name, is_file=True)
+            return f"Saved: {COL_DIM}{link}{Ansi.RESET}"
+
+        def receive_queued_saves(*, drain: bool = False, make_space: bool = False) -> None:
+            if writer is not None:
+                for saved in writer.collect(drain=drain, make_space=make_space):
+                    if message := receive_save(saved):
+                        printt(message)
+
+        def emit_progress(current_indices: tuple[int, ...] = ()) -> None:
+            num_errored = len(errored_indices)
+            processed = num_passed + num_failed + num_errored
+            GenerationEvents.emit(
+                GenerationProgress(
+                    processed=processed,
+                    remaining=len(sorted_indices) - processed,
+                    total=len(sorted_indices),
+                    current_indices=current_indices,
+                    passed=num_passed,
+                    failed=num_failed,
+                    errored=num_errored,
+                    retries=num_retries,
+                    eta_seconds=eta_seconds,
+                    speed_multiplier=speed_multiplier,
+                    saved=num_passed + num_failed,
+                )
+            )
 
         Interrupts().set("generating")
         did_interrupt = False
         did_abort_model_errors = False
+        model_reset_reason = ""
 
         # Audiobook generation is a top-level generation run. Start from a
         # fresh rolling-continuation context, independent of any prior run.
@@ -239,7 +352,9 @@ class GenerateUtil:
         gen_timeout_tracker = make_backend_gen_timeout_tracker()
 
         while True:
-
+            receive_queued_saves()
+            if write_error:
+                break
             if Interrupts().did_interrupt:
                 did_interrupt = True
                 break
@@ -280,22 +395,8 @@ class GenerateUtil:
             # Print item info and publish a structured progress snapshot.
             # The snapshot carries the previous batch's ETA so the header
             # does not blank the estimate during this batch's inference.
-            num_processed = num_passed + num_failed + num_errored
             GenerationEvents.emit(GenerationPhase("Generating audio"))
-            GenerationEvents.emit(
-                GenerationProgress(
-                    processed=num_processed,
-                    remaining=len(sorted_indices) - num_processed,
-                    total=len(sorted_indices),
-                    current_indices=tuple(indices),
-                    passed=num_passed,
-                    failed=num_failed,
-                    errored=num_errored,
-                    retries=num_retries,
-                    eta_seconds=eta_seconds,
-                    speed_multiplier=speed_multiplier,
-                )
-            )
+            emit_progress(tuple(indices))
             heading_voice_index = sub.voice_selection_index
             if heading_voice_index is None and len(indices) == 1:
                 heading_voice_index = GenerateUtil.get_line_voice_index(
@@ -333,20 +434,10 @@ class GenerateUtil:
             if any(GenerateUtil.is_error_result_oom(r) for r in results):
                 # The per-segment error line already printed the raw error, and the
                 # reset reason below is shown by the hard-reset UI; print nothing more.
-                GenerationEvents.emit(ModelUnhealthy(reason=make_oom_reset_message()))
+                model_reset_reason = make_oom_reset_message()
                 Tts.clear_continuation()
                 did_interrupt = True
                 break
-
-            # Update the rolling duration history for the ETA extrapolation.
-            # The first batch is skipped (model warm-up dominates it), and a
-            # batch containing a model-derived error is not representative.
-            if not did_skip_warmup_batch:
-                did_skip_warmup_batch = True
-            elif not any(isinstance(result, TtsModelError) for result in results):
-                batch_durations.append(batch_gen_val_time)
-                if len(batch_durations) > BATCH_DURATION_HISTORY_SIZE:
-                    batch_durations.pop(0)
 
             # Process and print results # TODO: separate biz n print logic
             re_adds: list[tuple[int, int]] = []
@@ -394,7 +485,7 @@ class GenerateUtil:
                     if did_abort_model_errors:
                         val_line += f"; {COL_ERROR}too many consecutive TTS model errors"
                     elif new_retry_count > max_retries:
-                        num_errored += 1
+                        errored_indices.add(index)
                         val_line += f"; {COL_ERROR}max retries reached"
                     else:
                         re_adds.append((index, new_retry_count))
@@ -415,8 +506,6 @@ class GenerateUtil:
                         and previous_word_error_count is not None
                         and validation_word_error_count < previous_word_error_count
                     )
-                    if did_improve:
-                        num_improved += 1
                     if validation_word_error_count is not None and (
                         previous_word_error_count is None or validation_word_error_count < previous_word_error_count
                     ):
@@ -444,15 +533,12 @@ class GenerateUtil:
                     if validation_result.is_fail:
                         Tts.clear_continuation()
                         if new_retry_count > max_retries:
-                            num_failed += 1
                             val_line += f"; {COL_ERROR}max retries reached, tagging as failed"
                         else:
                             re_adds.append((index, new_retry_count))
                             val_line += f"; {COL_DEFAULT}will retry"
                         if isinstance(validation_result, MusicFailResult):
                             num_failed_music += 1
-                    else:
-                        num_passed += 1
 
                     # Print STT info
                     if isinstance(validation_result, TranscriptResult):
@@ -483,38 +569,21 @@ class GenerateUtil:
                     word_counts[index] = phrase_group.num_words
 
                     # Save
-                    err, saved_path = GenerateUtil.save_sound_and_timing_json(
-                        state,
-                        phrase_group,
-                        index,
-                        validation_result,
-                        is_real_time=False,
-                        voice_tag=getattr(validation_result, "voice_tag", ""),
-                        stt_info=stt_info,
-                        dir_path=staging_dir or None,
+                    save = partial(
+                        save_take, index, phrase_group, validation_result, stt_info,
+                        new_retry_count > max_retries, did_improve, quiet_pass,
                     )
-                    if err:
-                        message_lines.append(f"{COL_ERROR}Couldn't save file: {err} {saved_path}")
+                    if writer is None:
+                        if message := receive_save(save()):
+                            message_lines.append(message)
                     else:
-                        saved_indices.add(index)
-                        if staging_dir:
-                            prune_staged_segments(staging_dir, index)
-                        else:
-                            project.sound_segments.delete_redundants_for(index)
-
-                        # A retry contributes the duration of the retained take for its line.
-                        if Path(saved_path).is_file():
-                            duration = validation_result.sound.duration
-                            saved_audio_seconds += duration - saved_durations.get(index, 0.0)
-                            saved_durations[index] = duration
-
-                        if not quiet_pass:
-                            link = text_util.make_terminal_hyperlink(
-                                url=saved_path, text=Path(saved_path).name, is_file=True,
-                            )
-                            message_lines.append(f"Saved: {COL_DIM}{link}{Ansi.RESET}")
+                        receive_queued_saves(make_space=True)
+                        if not write_error:
+                            writer.submit(save)
 
                 if quiet_pass and len(message_lines) == 1:
+                    if write_error:
+                        break
                     continue
                 printt("\n".join(message_lines))
 
@@ -536,10 +605,19 @@ class GenerateUtil:
                 if i < len(results) - 1:
                     printt()
 
-                if did_abort_model_errors:
+                if did_abort_model_errors or write_error:
                     break
 
-            num_processed = num_passed + num_failed + num_errored
+            receive_queued_saves()
+
+            # Include synchronous saves, pruning and any time waiting for
+            # room in the writer queue. Skip warm-up and model error batches.
+            if not did_skip_warmup_batch:
+                did_skip_warmup_batch = True
+            elif not any(isinstance(result, TtsModelError) for result in results):
+                batch_durations.append(time.time() - gen_start_time)
+                if len(batch_durations) > BATCH_DURATION_HISTORY_SIZE:
+                    batch_durations.pop(0)
 
             if re_adds:
                 # Pending retries are processed at the head of the queue,
@@ -553,38 +631,30 @@ class GenerateUtil:
             # each): the current round's remainder, the queued rounds, and
             # a ceil-estimate for the pending retries, whose items have
             # already left the main queue.
-            eta_seconds = make_batch_eta_seconds(
-                batch_durations,
-                remaining_batches=(
-                    len(current_round)
-                    + sum(len(round) for round in queue)
-                    + (len(pending_retries) + batch_size - 1) // batch_size
-                ),
+            remaining_batches = (
+                len(current_round)
+                + sum(len(round) for round in queue)
+                + (len(pending_retries) + batch_size - 1) // batch_size
             )
+            eta_seconds = make_batch_eta_seconds(batch_durations, remaining_batches)
+            if writer is not None and write_durations:
+                seconds_per_write = sum(write_durations) / len(write_durations)
+                drain_eta = writer.pending * seconds_per_write
+                if not remaining_batches:
+                    eta_seconds = drain_eta
+                elif eta_seconds is not None:
+                    # Encoding can overlap later batches, but the last batch's
+                    # writes run after synthesis ends.
+                    last_batch_size = len(queue[-1][-1].items) if queue else len(indices)
+                    eta_seconds = max(eta_seconds + last_batch_size * seconds_per_write, drain_eta)
             elapsed = monotonic() - generation_started
             speed_multiplier = saved_audio_seconds / elapsed if saved_audio_seconds > 0 and elapsed > 0 else None
-            GenerationEvents.emit(
-                GenerationProgress(
-                    processed=num_processed,
-                    remaining=len(sorted_indices) - num_processed,
-                    total=len(sorted_indices),
-                    passed=num_passed,
-                    failed=num_failed,
-                    errored=num_errored,
-                    retries=num_retries,
-                    eta_seconds=eta_seconds,
-                    speed_multiplier=speed_multiplier,
-                )
-            )
+            emit_progress()
 
             if did_abort_model_errors:
                 printt()
                 GenerateUtil.print_consecutive_model_errors_message(max_consecutive_model_errors)
-                GenerationEvents.emit(
-                    ModelUnhealthy(
-                        reason=make_consecutive_model_errors_reset_message(max_consecutive_model_errors)
-                    )
-                )
+                model_reset_reason = make_consecutive_model_errors_reset_message(max_consecutive_model_errors)
                 Tts.clear_continuation()
                 did_interrupt = True
                 break
@@ -592,6 +662,18 @@ class GenerateUtil:
             # Memory usage is displayed by the generation header, not the
             # console; keep only the blank-line separator between batches.
             printt()
+
+        if writer is not None:
+            if writer.pending:
+                GenerationEvents.emit(GenerationPhase("Saving audio"))
+                eta_seconds = writer.pending * sum(write_durations) / len(write_durations) if write_durations else None
+                emit_progress()
+                receive_queued_saves(drain=True)
+            did_interrupt = did_interrupt or Interrupts().did_interrupt
+            eta_seconds = None if did_interrupt or write_error else 0.0
+            elapsed = monotonic() - generation_started
+            speed_multiplier = saved_audio_seconds / elapsed if saved_audio_seconds > 0 and elapsed > 0 else None
+            emit_progress()
 
         # Update the persisted queue once per generation run, based only on files
         # that were actually saved successfully. Staged output is not part of
@@ -611,8 +693,9 @@ class GenerateUtil:
                         f"Couldn't save updated generation range: {save_error}",
                     )
 
-        if did_interrupt:
-            Tts.clear_continuation()
+        did_interrupt = did_interrupt or Interrupts().did_interrupt
+        if model_reset_reason:
+            GenerationEvents.emit(ModelUnhealthy(reason=model_reset_reason))
 
         # Print summary info
         elapsed_line = f"Elapsed: {duration_string(time.time() - start_time)}"
@@ -633,16 +716,17 @@ class GenerateUtil:
         col = COL_ACCENT if num_failed else ""
         if num_failed:
             message += f"Lines saved, but with excess word errors: {col}{num_failed}{COL_DEFAULT}\n"
-        if num_errored:
-            message += f"Lines failed to generate: {COL_ERROR}{num_errored}{COL_DEFAULT}\n"
+        if errored_indices:
+            message += f"Lines failed to generate: {COL_ERROR}{len(errored_indices)}{COL_DEFAULT}\n"
         if DEV:
             message += f"Num words: {sum(word_counts.values())}\n"
             message += f"Gen/val elapsed: {duration_string(gen_val_sum_time)}\n"
         quick_generation_completed_cleanly = (
             is_regen
             and not did_interrupt
+            and not write_error
             and num_failed == 0
-            and num_errored == 0
+            and not errored_indices
         )
         # The batch loop is over: publish the run-end boundary before the
         # trailing summary block (whose first line is a dash rule that a
@@ -655,7 +739,8 @@ class GenerateUtil:
         # this run ends successfully without a paragraph/section break.
         Tts.clear_continuation()
 
-        Interrupts().clear()
+        if write_error:
+            raise CheckpointWriteError(write_error)
         return did_interrupt
 
     @staticmethod
@@ -844,13 +929,16 @@ class GenerateUtil:
                         phrase_groups[indices[0]].voice_index, len(voice_values),
                     )
             voice_tag = Tts.get_voice_tag_for_selection_index(project, voice_selection_index)
+            delivery_cues = [phrase_groups[index].delivery for index in indices]
+            delivery_kwargs = {"delivery_cues": delivery_cues} if any(delivery_cues) else {}
             result = Tts.generate_using_project(
                 project,
                 prompts,
                 force_random_seed,
                 voice_selection_index=voice_selection_index,
                 print_generation_request=print_generation_request,
-                print_params=print_params
+                print_params=print_params,
+                **delivery_kwargs,
             )
 
         # `result` is either n generated Sounds or a single error string
@@ -953,6 +1041,7 @@ class GenerateUtil:
         stt_info: SegmentTranscriptData | None = None,
         dir_path: str | None = None,
         sound: Sound | None = None,
+        on_published: Callable[[Path, Path | None], None] | None = None,
     ) -> tuple[str, str]:
         """
         Saves sound segment and timing info json
@@ -964,14 +1053,15 @@ class GenerateUtil:
         :param sound:
             Audio to save instead of `validation_result.sound`. Realtime uses
             this to save what was actually played (it writes no sidecar).
+        :param on_published:
+            Receives the completed checkpoint path and any same-name older
+            take after the audio and timing files have been published.
         """
 
         project = state.project
-
-        # Save sound
-        if not dir_path:
-            dir_path = project.realtime_path if is_real_time else project.sound_segments_path
-        os.makedirs(dir_path, exist_ok=True)
+        in_project = not is_real_time and not dir_path
+        directory = Path(dir_path or (project.realtime_path if is_real_time else project.sound_segments_path))
+        use_aac = not is_real_time and getattr(project, "checkpoint_format", "flac") == "aac"
 
         file_name = SoundSegmentUtil.make_file_name(
             index=index,
@@ -981,28 +1071,34 @@ class GenerateUtil:
             tts_model_type=project.get_tts_model_type().value,
             is_real_time=is_real_time,
             voice_tag=voice_tag,
+            suffix=".m4a" if use_aac else ".flac",
         )
-        sound_path = os.path.join(dir_path, file_name)
+        path = directory / file_name
+        audio = validation_result.sound if sound is None else sound
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            if is_real_time:
+                return SoundFileUtil.save_flac(audio, str(path)), str(path)
 
-        err = SoundFileUtil.save_flac(sound if sound is not None else validation_result.sound, sound_path)
-        if err:
-            return err, sound_path
+            if isinstance(validation_result, TranscriptResult) and stt_info is None:
+                stt_info = SegmentTranscriptUtil.from_validation_result(
+                    project=project, phrase_group=phrase_group, index=index, validation_result=validation_result,
+                )
 
-        if not is_real_time and isinstance(validation_result, TranscriptResult):
-            # Make STT/timing sidecar and save to 'parallel' json file
-            info = stt_info or SegmentTranscriptUtil.from_validation_result(
-                project=project,
-                phrase_group=phrase_group,
-                index=index,
-                validation_result=validation_result
-            )
-            json_path = get_segment_stt_info_path(sound_path)
-            err = SegmentTranscriptUtil.save(json_path, info)
-            if err:
-                printt(COL_ERROR + str(json_path))
-                printt(COL_ERROR + err)
+            path, replaced = choose_checkpoint_path(path)
+            bitrate = state.prefs.aac_bitrate if use_aac else AAC_BITRATE_DEFAULT
+            error = write_checkpoint(path, audio, stt_info, bitrate)
+            if error:
+                return error, str(path)
 
-        return "", sound_path
+            if on_published is not None:
+                on_published(path, replaced)
+            elif in_project:
+                project.sound_segments.record_published_segment(path, prune=False, replaces=replaced)
+        except OSError as error:
+            return make_error_string(error), str(path)
+
+        return "", str(path)
 
     @staticmethod
     def get_line_voice_index(

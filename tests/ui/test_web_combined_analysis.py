@@ -7,11 +7,14 @@ import requests
 
 from tts_audiobook_tool import web_backend, web_dialogue
 from tts_audiobook_tool.app_types import Book, BookSection
+from tts_audiobook_tool.app_types.delivery_cue import DeliveryCue
 from tts_audiobook_tool.app_types.phrase import Phrase, PhraseGroup, Reason
 from tts_audiobook_tool.l import L
 from tts_audiobook_tool.speaker_assign.attribution import AttributionsFile, RangeAttribution, UtteranceAttribution
 from tts_audiobook_tool.speaker_assign.combined_analysis import parse_chunk_reply
-from tts_audiobook_tool.speaker_assign.roster import Roster, RosterCharacter
+from tts_audiobook_tool.speaker_assign.roster import (
+    CHARACTER_VOICE_DIRECTIONS, NEUTRAL_CHARACTER_VOICE_DIRECTION, Roster, RosterCharacter,
+)
 from tts_audiobook_tool.speaker_assign.utterance_util import UtteranceUtil
 
 
@@ -119,6 +122,261 @@ def test_combined_analysis_only_requests_missing_quotes_inside_a_chunk(tmp_path,
     monkeypatch.setattr(requests.Session, "post", post)
     result = web_backend.analyze_book_dialogue(session, "test-key")
     assert result.attributions.speaker_of_each_line(book) == {0: "ANNA", 1: "NOT_SPEECH"}
+
+
+def test_combined_analysis_adds_delivery_without_replacing_saved_speakers(tmp_path, monkeypatch):
+    monkeypatch.setattr(L, "logger", logging.getLogger(__name__), raising=False)
+    book = Book(sections=[BookSection([
+        _group("Anna managed a hollow laugh. ", Reason.SENTENCE),
+        _group("“All right.” ", Reason.PARAGRAPH, dialogue=True),
+        _group("“Quiet Zone” ", Reason.PARAGRAPH, dialogue=True),
+        _group("“Let's go.” ", Reason.PARAGRAPH, dialogue=True),
+    ])])
+    existing = RangeAttribution(0, 3, UtteranceUtil.range_text_hash(book, 0, 3), (
+        UtteranceAttribution((1,), "ANNA", uncertain=True), UtteranceAttribution((2,), "NOT_SPEECH"),
+    ))
+    session = web_backend.BookSession(
+        book, str(tmp_path), roster=Roster((RosterCharacter("ANNA", "Anna"),)),
+        attributions=AttributionsFile((existing,)),
+    )
+    prompts = []
+
+    def post(_http, _url, **kwargs):
+        messages = kwargs["json"]["messages"]
+        prompts.append(messages)
+        return _response(_reply({"3": "NOT_SPEECH"}) | {"delivery": {
+            "1": {"direction": "with resignation", "before": "laughs"},
+            "2": {"after": "sighs"},
+            "3": {"after": "gasps"},
+        }})
+
+    monkeypatch.setattr(requests.Session, "post", post)
+    result = web_backend.analyze_book_dialogue(session, "test-key", performance_cues=True)
+    assert len(prompts) == 1
+    assert "Do not invent spoken words" in prompts[0][0]["content"]
+    passage = prompts[0][1]["content"]
+    assert "Anna managed a hollow laugh." in passage
+    assert '<q id="1" speaker="ANNA" cue="true">“All right.”</q>' in passage
+    assert '<q speaker="NOT_SPEECH">“Quiet Zone”</q>' in passage
+    assert '<q id="3" cue="true">“Let\'s go.”</q>' in passage
+    saved = result.attributions.by_first_line(book)
+    assert saved[1] == replace(existing.utterances[0], delivery=DeliveryCue("with resignation", before="laughs"))
+    assert saved[2].delivery is saved[3].delivery is None
+
+    corrected = web_dialogue.correct_speaker(result, 0, 1, "UNKNOWN")
+    cached = web_backend.analyze_book_dialogue(corrected, "", performance_cues=True)
+    assert len(prompts) == 1
+    assert cached.attributions.by_first_line(book)[1] == replace(saved[1], speaker="UNKNOWN", uncertain=False)
+    non_speech = web_dialogue.correct_speaker(cached, 0, 1, "NOT_SPEECH")
+    assert non_speech.attributions.by_first_line(book)[1].delivery is None
+
+
+def test_delivery_enrichment_checkpoints_empty_results_and_resumes(tmp_path, monkeypatch):
+    monkeypatch.setattr(L, "logger", logging.getLogger(__name__), raising=False)
+    book = Book(sections=[_section("FIRST-SECTION"), _section("SECOND-SECTION")])
+    existing = AttributionsFile(tuple(
+        RangeAttribution(start, end, UtteranceUtil.range_text_hash(book, start, end), (
+            UtteranceAttribution((end - 1,), "UNKNOWN"),
+        ))
+        for start, end in book.section_ranges()
+    ))
+    session = web_backend.BookSession(book, str(tmp_path), attributions=existing)
+    responses = iter([
+        _response(_reply({}) | {"delivery": {}}),
+        _response(_reply({"1": "UNKNOWN"})),
+        _response(_reply({}) | {"delivery": {"1": {"after": "sighs"}}}),
+    ])
+    prompts = []
+
+    def post(_http, _url, **kwargs):
+        prompts.append(kwargs["json"]["messages"][1]["content"])
+        return next(responses)
+
+    monkeypatch.setattr(requests.Session, "post", post)
+    partial = web_backend.analyze_book_dialogue(session, "test-key", performance_cues=True)
+    assert "1 of 2" in partial.attribution_notice
+    assert "Following context (evidence only):\nSECOND-SECTION" in prompts[0]
+    assert partial.attributions.by_first_line(book)[1].delivery == DeliveryCue()
+    assert partial.attributions.by_first_line(book)[3].delivery is None
+    assert partial.attributions.to_dict()["ranges"][0]["utterances"][0]["delivery"] == {}
+
+    complete = web_backend.analyze_book_dialogue(session, "test-key", performance_cues=True)
+    assert len(prompts) == 3
+    assert prompts[1] == prompts[2]
+    assert "2 of 2" in complete.attribution_notice
+    assert complete.attributions.by_first_line(book)[3].delivery == DeliveryCue(after="sighs")
+
+
+def test_character_voices_share_the_combined_request_and_keep_established_direction(tmp_path, monkeypatch):
+    monkeypatch.setattr(L, "logger", logging.getLogger(__name__), raising=False)
+    book = Book(sections=[_section("FIRST-SECTION"), _section("SECOND-SECTION")])
+    session = web_backend.BookSession(book, str(tmp_path))
+    direction = "Slightly warmer tone."
+    responses = iter([
+        _reply({"1": "ANNA"}, [{"id": "ANNA", "name": "Anna", "voice_hint": "clear"}]) | {
+            "character_voices": {"ANNA": {"voice_direction": direction, "gender": "female"}},
+            "delivery": {"1": {"direction": "with a trace of doubt"}},
+        },
+        _reply({"1": "ANN"}, [{"id": "ANN", "name": "Ann", "aliases": ["Anna"]}]) | {
+            "character_voices": {"ANN": {"voice_direction": "Slightly deeper tone.", "gender": "male"}},
+            "delivery": {"1": {"direction": "quietly"}},
+        },
+    ])
+    prompts = []
+
+    def post(_http, _url, **kwargs):
+        prompts.append(kwargs["json"]["messages"])
+        return _response(next(responses))
+
+    monkeypatch.setattr(requests.Session, "post", post)
+    result = web_backend.analyze_book_dialogue(session, "test-key", performance_cues=True, character_voices=True)
+    assert len(prompts) == 2
+    assert 'cue="true"' in prompts[0][1]["content"]
+    system_prompt = prompts[0][0]["content"]
+    assert all(f"- {choice}" in system_prompt for choice in CHARACTER_VOICE_DIRECTIONS)
+    assert 'Use "Neutral delivery." for most characters.' in system_prompt
+    assert "Situational\nperformance belongs to the individual quote." in system_prompt
+    assert 'Use "unknown" if the evidence is ambiguous' in prompts[0][0]["content"]
+    assert "Characters needing a voice direction:" not in prompts[1][1]["content"]
+    anna = result.roster.get("ANNA")
+    assert result.roster.ids == {"ANNA"}
+    assert anna.aliases == ("Ann",)
+    assert anna.voice_hint == "clear"
+    assert anna.voice_direction == direction
+    assert anna.gender == "female"
+    assert result.attributions.by_first_line(book)[1].delivery == DeliveryCue("with a trace of doubt")
+    assert result.attributions.by_first_line(book)[3].delivery == DeliveryCue("quietly")
+
+
+def test_character_voice_backfill_refreshes_legacy_direction_without_reanalyzing_quotes(tmp_path, monkeypatch):
+    monkeypatch.setattr(L, "logger", logging.getLogger(__name__), raising=False)
+    book = Book(sections=[_section("FIRST-SECTION"), _section("SECOND-SECTION"), _section("THIRD-SECTION")])
+    existing = AttributionsFile(tuple(
+        RangeAttribution(start, end, UtteranceUtil.range_text_hash(book, start, end), (
+            UtteranceAttribution((end - 1,), speaker, uncertain=True, delivery=DeliveryCue("quietly")),
+        ))
+        for (start, end), speaker in zip(book.section_ranges(), ("ANNA", "BETH", "BETH"), strict=True)
+    ))
+    anna = RosterCharacter("ANNA", "Anna", voice_direction=NEUTRAL_CHARACTER_VOICE_DIRECTION)
+    beth = RosterCharacter(
+        "BETH", "Beth", aliases=("Elizabeth",), merged_ids=("ELIZABETH",),
+        voice_direction="A slight New Zealand accent and a florid upbeat cadence.",
+    )
+    session = web_backend.BookSession(book, str(tmp_path), roster=Roster((anna, beth)), attributions=existing)
+    direction = "Slightly more measured pace."
+    prompts = []
+
+    def post(_http, _url, **kwargs):
+        prompts.append(kwargs["json"]["messages"][1]["content"])
+        return _response(_reply({"1": "ANNA"}, [{"id": "ANNA", "name": "Somebody else"}]) | {
+            "character_voices": {
+                "ANNA": {"voice_direction": "Slightly brighter tone."},
+                "ELIZABETH": {"voice_direction": direction, "gender": "female"},
+            },
+            "delivery": {"1": {"after": "sighs"}},
+        })
+
+    monkeypatch.setattr(requests.Session, "post", post)
+    unchanged = web_backend.analyze_book_dialogue(session, "", performance_cues=True)
+    assert not prompts
+    assert unchanged.roster == session.roster
+    result = web_backend.analyze_book_dialogue(session, "test-key", performance_cues=True, character_voices=True)
+    assert len(prompts) == 1
+    assert 'Characters needing a voice direction: ["BETH"]' in prompts[0]
+    assert "SECOND-SECTION" in prompts[0] and "THIRD-SECTION" not in prompts[0]
+    assert '<q speaker="BETH">' in prompts[0]
+    assert '<q id=' not in prompts[0]
+    assert result.attributions == existing
+    assert result.roster.get("ANNA") == anna
+    assert result.roster.get("BETH") == replace(beth, voice_direction=direction, gender="female")
+    row = next(row for row in web_backend.character_rows(result) if row.speaker_id == "BETH")
+    assert row.voice_direction == direction
+    assert row.gender == "female"
+    assert "3 of 3" in result.attribution_notice
+
+    # Using the original session exercises reading the successful profile from disk.
+    cached = web_backend.analyze_book_dialogue(session, "", performance_cues=True, character_voices=True)
+    assert len(prompts) == 1
+    assert cached.roster == result.roster
+    assert cached.attributions == existing
+
+
+def test_missing_character_voice_is_retryable_without_reviewing_the_quote_again(tmp_path, monkeypatch):
+    monkeypatch.setattr(L, "logger", logging.getLogger(__name__), raising=False)
+    book = Book(sections=[_section("FIRST-SECTION")])
+    session = web_backend.BookSession(book, str(tmp_path))
+    responses = iter([
+        _reply({"1": "SAM"}, [{"id": "SAM", "name": "Sam"}]) | {
+            "character_voices": {"SAM": {"voice_direction": "Speak gruffly with a gravelly accent and a buoyant cadence."}},
+            "delivery": {"1": {"after": "sighs"}},
+        },
+        {"character_voices": {"SAM": {"voice_direction": NEUTRAL_CHARACTER_VOICE_DIRECTION, "gender": 5}}},
+    ])
+    prompts = []
+
+    def post(_http, _url, **kwargs):
+        prompts.append(kwargs["json"]["messages"][1]["content"])
+        return _response(next(responses))
+
+    monkeypatch.setattr(requests.Session, "post", post)
+    partial = web_backend.analyze_book_dialogue(session, "test-key", performance_cues=True, character_voices=True)
+    assert partial.roster.get("SAM").voice_direction == ""
+    assert partial.attributions.by_first_line(book)[1].delivery == DeliveryCue(after="sighs")
+    assert "0 of 1" in partial.attribution_notice
+    assert "Missing 1 character voice direction" in partial.attribution_notice
+
+    opt_out = web_backend.analyze_book_dialogue(partial, "", performance_cues=True)
+    assert "1 of 1" in opt_out.attribution_notice
+    assert len(prompts) == 1
+
+    complete = web_backend.analyze_book_dialogue(partial, "test-key", performance_cues=True, character_voices=True)
+    assert len(prompts) == 2
+    assert '<q id=' not in prompts[-1]
+    assert complete.attributions == partial.attributions
+    assert complete.roster.get("SAM").voice_direction == NEUTRAL_CHARACTER_VOICE_DIRECTION
+    assert complete.roster.get("SAM").gender == "unknown"
+    assert "1 of 1" in complete.attribution_notice
+
+
+def test_partial_saved_quote_does_not_move_deliveries_or_override_existing_line(tmp_path, monkeypatch):
+    monkeypatch.setattr(L, "logger", logging.getLogger(__name__), raising=False)
+    book = Book(sections=[BookSection([
+        _group("“First. ", Reason.SENTENCE, dialogue=True),
+        _group("Second.” ", Reason.PARAGRAPH, dialogue=True),
+        _group("“Third.” ", Reason.PARAGRAPH, dialogue=True),
+    ])])
+    fragment = UtteranceAttribution((0,), "ANNA", delivery=DeliveryCue(before="sighs"))
+    existing = AttributionsFile((RangeAttribution(0, 1, UtteranceUtil.range_text_hash(book, 0, 1), (fragment,)),))
+    session = web_backend.BookSession(
+        book, str(tmp_path), roster=Roster((RosterCharacter("ANNA", "Anna"),)), attributions=existing,
+    )
+
+    def post(_http, _url, **kwargs):
+        passage = kwargs["json"]["messages"][1]["content"]
+        assert '<q id="1">“First. Second.”</q>' in passage
+        assert '<q id="2" cue="true">“Third.”</q>' in passage
+        return _response(_reply({"1": "UNKNOWN", "2": "ANNA"}) | {"delivery": {
+            "1": {"after": "gasps"}, "2": {"after": "chuckles"},
+        }})
+
+    monkeypatch.setattr(requests.Session, "post", post)
+    result = web_backend.analyze_book_dialogue(session, "test-key", performance_cues=True)
+    quotes = result.attributions.by_first_line(book)
+    assert quotes[0] == fragment
+    assert quotes[1].speaker == "UNKNOWN"
+    assert quotes[1].delivery is None
+    assert quotes[2].delivery == DeliveryCue(after="chuckles")
+
+
+def test_invalid_optional_delivery_does_not_reject_valid_labels():
+    data = ('{"characters":[],"speakers":{"1":"UNKNOWN","2":"UNKNOWN","3":"NOT_SPEECH"},'
+            '"delivery":{"1":{"after":"laughs","after":"coughs"},'
+            '"2":{"direction":"(injected tag)","before":" GIGGLES ","after":42},'
+            '"3":{"after":"sighs"},"4":{"after":"gasps"}}}')
+    _, parsed = parse_chunk_reply(data, Roster(()), {1, 2, 3}, cue_requests={1, 2, 3})
+    assert parsed.speakers == {1: "UNKNOWN", 2: "UNKNOWN", 3: "NOT_SPEECH"}
+    assert parsed.delivery == {1: DeliveryCue(), 2: DeliveryCue(before="giggles")}
+    assert not DeliveryCue(direction="x" * 81, before="sings")
 
 
 def test_combined_reply_alias_deltas_keep_existing_ids_and_distinct_titles():

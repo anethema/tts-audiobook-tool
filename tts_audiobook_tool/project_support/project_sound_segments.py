@@ -1,10 +1,12 @@
 import os
 from pathlib import Path
-from typing import Callable, Collection
+from threading import Lock
+from typing import Callable, Collection, Iterator
 from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+from watchdog.events import FileSystemEvent, FileSystemEventHandler
 
 from tts_audiobook_tool.project_support.sound_segment_util import (
+    SOUND_SEGMENT_SUFFIXES,
     SoundSegment,
     SoundSegmentUtil,
     get_segment_error_rank,
@@ -14,109 +16,134 @@ from tts_audiobook_tool.project import Project
 from tts_audiobook_tool.project_support.project_util import ProjectUtil
 from tts_audiobook_tool.text_ops.text_normalizer import TextNormalizer
 from tts_audiobook_tool.app_support import app_text
-from tts_audiobook_tool.constants import COL_DIM_ITALICS, PROJECT_SOUND_SEGMENTS_SUBDIR
+from tts_audiobook_tool.constants import COL_DIM_ITALICS
 from tts_audiobook_tool.system_support.ansi import Ansi
 from tts_audiobook_tool.util import delete_silently, printt
 from tts_audiobook_tool.validator import Validator
 from tts_audiobook_tool.app_types.validation_findings import ValidationFindings
 
 class ProjectSoundSegments:
-    """
-    Keeps cached catalog of the project's sound segment files
-    List gets invalidated and refreshed using directory watcher
-    """
+    """Index the project's saved takes by text line and reconcile file changes."""
 
     def __init__(self, project: Project):
         self.project = project # TODO: circular reference, ng
+        self._lock = Lock()
         self._sound_segments_map: dict[int, list[SoundSegment]] = {}
         self._dirty = True
         self.dont_show_scan_message = False
-        self._segments_dir: str | None = None
+        self._segments_dir: Path | None = None
 
         event_handler = DirHandler(self.on_dir_contents_change)
         self.observer = Observer()
 
         if project.dir_path:
-            self._segments_dir = os.path.join(project.dir_path, PROJECT_SOUND_SEGMENTS_SUBDIR)
+            self._segments_dir = Path(os.path.abspath(project.sound_segments_path))
             # Watch the project directory (parent) instead of segments/ directly.
             # This is more reliable: watchdog can miss self-deletion events for the
             # watched directory itself, but child events (segments dir being deleted,
             # files created/deleted within segments/) are reliably delivered.
-            self.observer.schedule(event_handler, project.dir_path, recursive=True)
+            self.observer.schedule(event_handler, os.path.abspath(project.dir_path), recursive=True)
             self.observer.start()
 
     def force_invalidate(self) -> None:
-        # TODO: add logic "if am at some important point like GenMenu etc, and is WSL or MacOS, call this"
-        self._dirty = True
+        """Rebuild from disk on the next lookup, including changes missed by the watcher."""
+        with self._lock:
+            self._dirty = True
 
-    def on_dir_contents_change(self, event):
-        if not self._segments_dir:
+    def on_dir_contents_change(self, event: FileSystemEvent) -> None:
+        if self._segments_dir is None or (event.is_directory and event.event_type == 'modified'):
+            return
+        paths = tuple(
+            Path(os.path.abspath(os.fsdecode(path)))
+            for path in (event.src_path, event.dest_path) if path
+        )
+        if event.is_directory:
+            if event.event_type in ('created', 'deleted', 'moved') and self._segments_dir in paths:
+                self.force_invalidate()
             return
 
-        # The parent project dir is being watched, so events for the segments/
-        # subdirectory and its contents come through here.
-        # We only care about things inside or equal to the segments/ directory path.
-
-        # --- Directory-level events (segments/ itself) ---
-        # Detect when the segments/ subdirectory is created, deleted, or moved.
-        if event.is_directory:
-            # Disappeared (deleted or moved/renamed away)
-            if event.event_type in ('deleted', 'moved') and event.src_path == self._segments_dir:
-                self._sound_segments_map = {}
-                self._dirty = False
+        segment_paths = [
+            path for path in paths
+            if path.parent == self._segments_dir and path.suffix.lower() in SOUND_SEGMENT_SUFFIXES
+        ]
+        if not segment_paths:
+            return
+        with self._lock:
+            if self._dirty:
                 return
-            # Appeared (created or moved/renamed back to "segments")
-            if event.event_type in ('created', 'moved'):
-                dest = getattr(event, 'dest_path', None)
-                if event.src_path == self._segments_dir or dest == self._segments_dir:
-                    self._dirty = True
-                    return
+            try:
+                for path in segment_paths:
+                    # The disk may be ahead of the event queue. Reconcile both sides
+                    # of a move using the current state, including delayed self events.
+                    self._sync_file(path)
+            except OSError:
+                self._dirty = True
 
-        # --- File-level events within segments/ ---
-        # Eg: FileCreatedEvent(src_path='/xyz.flac', dest_path='', event_type='created', is_directory=False, is_synthetic=False)
-        if not event.src_path:
-            return
-        if event.is_directory:
-            # Not interested in sub-subdirectory creation etc.
-            return
-        # Only handle events inside the segments/ directory
-        if not event.src_path.startswith(self._segments_dir + os.sep):
-            return
+    def _sync_file(self, path: Path) -> SoundSegment | None:
+        """Reconcile a single supported path while holding the index lock."""
+        if path.parent != self._segments_dir or path.suffix.lower() not in SOUND_SEGMENT_SUFFIXES:
+            return None
+        segment = SoundSegmentUtil.make_from_file_name(path.name)
+        if segment is None:
+            return None
+        is_current = SoundSegmentUtil.is_current_segment(segment, self.project) and (
+            SoundSegmentUtil.is_nonempty_file(path)
+        )
+        items = self._sound_segments_map.get(segment.idx, [])
+        name = os.path.normcase(segment.file_name)
+        for position, item in enumerate(items):
+            if os.path.normcase(item.file_name) != name:
+                continue
+            if is_current:
+                items[position] = segment
+            else:
+                del items[position]
+                if not items:
+                    del self._sound_segments_map[segment.idx]
+            break
+        else:
+            if is_current:
+                items.append(segment)
+                self._sound_segments_map[segment.idx] = items
+        return segment if is_current else None
 
-        # Don't make dirty if new file is not a sound segment file (ie, debug files)
-        path = Path(event.src_path)
-        if path.suffix != ".flac":
+    def _rebuild_if_needed(self) -> None:
+        if not self._dirty:
             return
-        if not bool(SoundSegmentUtil.make_from_file_name(event.src_path)):
-            return
-
-        self._dirty = True
+        show_scan_message = not self.dont_show_scan_message
+        if show_scan_message:
+            printt(f"{COL_DIM_ITALICS}Project directory contents have changed. Scanning...", end="\r")
+        try:
+            self._sound_segments_map = SoundSegmentUtil.make_sound_segments_map(self.project)
+            self._dirty = False
+        finally:
+            if show_scan_message:
+                printt(f"{Ansi.ERASE_REST_OF_LINE}", end="\r")
 
     @property
     def sound_segments_map(self) -> dict[int, list[SoundSegment]]:
-        if self._dirty:
-            show_scan_message = not self.dont_show_scan_message
-            if show_scan_message:
-                printt(f"{COL_DIM_ITALICS}Project directory contents have changed. Scanning...", end="\r")
-            self._sound_segments_map = SoundSegmentUtil.make_sound_segments_map(self.project)
-            if show_scan_message:
-                printt(f"{Ansi.ERASE_REST_OF_LINE}", end="\r")
-            self._dirty = False
-        return self._sound_segments_map
+        with self._lock:
+            self._rebuild_if_needed()
+            return {index: items.copy() for index, items in self._sound_segments_map.items()}
 
     def get_filenames_for(self, index: int) -> list[str]:
-        sound_segments = self.sound_segments_map.get(index, [])
-        return [item.file_name for item in sound_segments]
+        with self._lock:
+            self._rebuild_if_needed()
+            return [item.file_name for item in self._sound_segments_map.get(index, [])]
 
     def get_best_item_for(self, index: int) -> SoundSegment | None:
-        """ For the given index, returns the sound segment with the least number of word fails """
-        sound_segments = self.sound_segments_map.get(index, [])
-        if len(sound_segments) <= 1:
+        """Return the take with the lowest word error rank for the given line."""
+        with self._lock:
+            self._rebuild_if_needed()
+            return self._best_item(self._sound_segments_map.get(index, []))
+
+    def _best_item(self, items: list[SoundSegment]) -> SoundSegment | None:
+        if len(items) <= 1:
             # The common case; ranking would only cost a sidecar lookup.
-            return sound_segments[0] if sound_segments else None
+            return items[0] if items else None
         # min() keeps the first of equally ranked takes.
         return min(
-            sound_segments,
+            items,
             key=lambda item: get_segment_error_rank(item, self.project.sound_segments_path),
         )
 
@@ -127,22 +154,23 @@ class ProjectSoundSegments:
     # ---
 
     def num_generated(self) -> int:
-        return len( self.sound_segments_map.keys() )
+        with self._lock:
+            self._rebuild_if_needed()
+            return len(self._sound_segments_map)
 
     def num_generated_in_current_range(self) -> int:
-        sett = ProjectUtil.get_indices_to_generate(self.project)
-        dic = self.sound_segments_map
-        count = 0
-        for key in dic.keys():
-            if key in sett:
-                count += 1
-        return count
+        indices = ProjectUtil.get_indices_to_generate(self.project)
+        with self._lock:
+            self._rebuild_if_needed()
+            return len(self._sound_segments_map.keys() & indices)
 
     def get_existing_indices(self) -> set[int]:
         """
         Returns the set of indices of existing sound segments
         """
-        return set(self.sound_segments_map.keys())
+        with self._lock:
+            self._rebuild_if_needed()
+            return set(self._sound_segments_map)
 
     def is_segment_failed(self, index: int, item: SoundSegment) -> bool:
         """
@@ -168,9 +196,10 @@ class ProjectSoundSegments:
         Uses dynamic failure detection based on num_errors and project strictness.
         """
         all_indices = ProjectUtil.get_indices_to_generate(self.project)
+        sound_segments_map = self.sound_segments_map
         failed_indices = set()
         for index in all_indices:
-            items = self.sound_segments_map.get(index, [])
+            items = sound_segments_map.get(index, [])
             if not items:
                 continue
             for item in items:
@@ -185,9 +214,10 @@ class ProjectSoundSegments:
         returns the fail counts of existing sound segment items
         """
         all_indices = ProjectUtil.get_indices_to_generate(self.project)
+        sound_segments_map = self.sound_segments_map
         fail_counts = {}
         for index in all_indices:
-            items = self.sound_segments_map.get(index, [])
+            items = sound_segments_map.get(index, [])
             if not items:
                 continue
             for item in items:
@@ -195,104 +225,159 @@ class ProjectSoundSegments:
         return fail_counts
 
     def delete_all(self) -> None:
-        for sound_segments in self.sound_segments_map.values():
-            for item in sound_segments:
-                sound_file_path = Path(self.project.sound_segments_path) / item.file_name
-                self.delete_sound_segment_and_sidecars(sound_file_path)
+        with self._lock:
+            self._rebuild_if_needed()
+            self._delete_indices(tuple(self._sound_segments_map))
 
-    def delete_sound_segment_and_sidecars(self, sound_file_path: Path) -> None:
-        """
-        Deletes a sound segment and its parallel sidecar files.
+    def delete_sound_segment_and_sidecars(self, sound_file_path: Path) -> bool:
+        """Delete a take and its timing sidecar. Return whether audio was removed."""
+        with self._lock:
+            return self._delete_file(Path(os.path.abspath(sound_file_path)))
 
-        The segment STT/timing JSON is expected to use the exact same stem as
-        the sound file, including any generated-time word-error count tag.
+    def _delete_file(self, path: Path) -> bool:
+        try:
+            path.unlink()
+        except (FileNotFoundError, NotADirectoryError):
+            removed = False
+        except OSError:
+            return False
+        else:
+            removed = True
+
+        segment = SoundSegmentUtil.make_from_file_name(path.name)
+        if not self._dirty:
+            self._sync_file(path)
+        sidecar = get_segment_stt_info_path(path)
+        # Two audio extensions can share a stem in a mixed-format project.
+        # Keep the timing sidecar when another take still uses that stem.
+        alternate_paths = {path.with_suffix(suffix) for suffix in SOUND_SEGMENT_SUFFIXES}
+        if segment is not None and path.parent == self._segments_dir:
+            alternate_paths.update(
+                path.parent / item.file_name
+                for item in self._sound_segments_map.get(segment.idx, [])
+                if get_segment_stt_info_path(item.file_name) == Path(sidecar.name)
+            )
+        alternate_paths.discard(path)
+        try:
+            shared_sidecar = any(alternate.is_file() for alternate in alternate_paths)
+        except OSError:
+            return removed
+        if not shared_sidecar:
+            delete_silently(str(sidecar))
+        return removed
+
+    def record_published_segment(
+        self,
+        sound_file_path: str | Path,
+        *,
+        prune: bool = True,
+        replaces: str | Path | None = None,
+    ) -> int:
+        """Index a published take, then optionally keep only its line's best take.
+
+        Call after publishing the audio and any timing sidecar. ``replaces``
+        identifies an earlier same-format take superseded by this publication.
+        Return the number of takes actually removed.
         """
-        delete_silently(str(sound_file_path))
-        delete_silently(str(get_segment_stt_info_path(sound_file_path)))
+        path = Path(os.path.abspath(sound_file_path))
+        if path.parent != self._segments_dir or path.suffix.lower() not in SOUND_SEGMENT_SUFFIXES:
+            return 0
+        with self._lock:
+            self._rebuild_if_needed()
+            segment = self._sync_file(path)
+            if segment is None:
+                return 0
+            removed = 0
+            if replaces is not None:
+                previous = Path(os.path.abspath(replaces))
+                if previous != path and previous.suffix.lower() == path.suffix.lower():
+                    old_segment = SoundSegmentUtil.make_from_file_name(previous.name)
+                    if (
+                        previous.parent == path.parent
+                        and old_segment is not None
+                        and old_segment.idx == segment.idx
+                        and old_segment.hash == segment.hash
+                    ):
+                        removed += self._delete_file(previous)
+            if prune:
+                removed += self._prune_line(segment.idx)
+            return removed
 
     def delete_redundants_for(self, index: int) -> int:
-        """ Keeps the item with the least word fails and deletes the rest """
-        items = self.sound_segments_map.get(index, [])
-        if not items:
-            return 0
+        """Keep the line's best take and return the number of audio files removed."""
+        with self._lock:
+            self._rebuild_if_needed()
+            return self._prune_line(index)
 
-        best_item = self.get_best_item_for(index)
-        if not best_item:
+    def _prune_line(self, index: int) -> int:
+        items = self._sound_segments_map.get(index, [])
+        if len(items) <= 1 or self._segments_dir is None:
             return 0
-
-        num_deleted = 0
-        for item in items:
-            if item != best_item:
-                path = Path(os.path.join(self.project.sound_segments_path, item.file_name))
-                self.delete_sound_segment_and_sidecars(path)
-                num_deleted += 1
-        return num_deleted
+        # An external edit may still be in the watcher queue. Check these
+        # takes before choosing the survivor or deleting any newly saved audio.
+        for item in items.copy():
+            self._sync_file(self._segments_dir / item.file_name)
+        best_item = self._best_item(items)
+        return sum(
+            self._delete_file(self._segments_dir / item.file_name)
+            for item in items.copy() if item != best_item
+        )
 
     def delete_by_indices(self, indices: Collection[int]) -> None:
-        """ Returns num deleted and num failed """
-        # Use the refreshed public catalog and tolerate files removed since the
-        # caller selected its indices.
-        sound_segments_map = self.sound_segments_map
+        """Delete present takes at the selected line indices."""
+        with self._lock:
+            self._rebuild_if_needed()
+            self._delete_indices(indices)
+
+    def _delete_indices(self, indices: Collection[int]) -> None:
+        if self._segments_dir is None:
+            return
         for index in indices:
-            items = sound_segments_map.get(index, [])
-            for item in items:
-                sound_file_path = Path(self.project.sound_segments_path) / item.file_name
-                self.delete_sound_segment_and_sidecars(sound_file_path)
+            for item in self._sound_segments_map.get(index, []).copy():
+                self._delete_file(self._segments_dir / item.file_name)
 
     def snapshot_paths_from_index(self, first_index: int) -> list[Path]:
         """Snapshot recognizable generated sound paths at or after an index."""
-        segments_path = Path(self.project.sound_segments_path)
-        if first_index < 0 or not segments_path.is_dir():
+        if first_index < 0:
             return []
-        result: list[Path] = []
-        for path in segments_path.iterdir():
-            if not path.is_file() or path.suffix.lower() != ".flac":
-                continue
-            sound_segment = SoundSegmentUtil.make_from_file_name(path.name)
-            if sound_segment is not None and sound_segment.idx >= first_index:
-                result.append(path)
-        return result
+        return [path for path, segment in self._recognizable_files() if segment.idx >= first_index]
 
     def snapshot_paths_at_indices(self, indices: Collection[int]) -> list[Path]:
         """Snapshot recognizable generated sound paths whose index is in ``indices``."""
         wanted = set(indices)
-        segments_path = Path(self.project.sound_segments_path)
-        if not wanted or not segments_path.is_dir():
+        if not wanted:
             return []
-        result: list[Path] = []
-        for path in segments_path.iterdir():
-            if not path.is_file() or path.suffix.lower() != ".flac":
-                continue
-            sound_segment = SoundSegmentUtil.make_from_file_name(path.name)
-            if sound_segment is not None and sound_segment.idx in wanted:
-                result.append(path)
-        return result
+        return [path for path, segment in self._recognizable_files() if segment.idx in wanted]
+
+    def _recognizable_files(self) -> Iterator[tuple[Path, SoundSegment]]:
+        if self._segments_dir is None:
+            return
+        try:
+            for path in self._segments_dir.iterdir():
+                if path.suffix.lower() not in SOUND_SEGMENT_SUFFIXES or not path.is_file():
+                    continue
+                segment = SoundSegmentUtil.make_from_file_name(path.name)
+                if segment is not None:
+                    yield path, segment
+        except (FileNotFoundError, NotADirectoryError):
+            return
 
     def delete_path_snapshot(self, paths: Collection[Path]) -> None:
         """Delete a pre-mutation path snapshot and invalidate the cached catalog."""
-        try:
-            for path in paths:
-                self.delete_sound_segment_and_sidecars(path)
-        finally:
-            self.force_invalidate()
+        with self._lock:
+            try:
+                for path in paths:
+                    self._delete_file(Path(os.path.abspath(path)))
+            finally:
+                self._dirty = True
 
 # ---
 
 class DirHandler(FileSystemEventHandler):
 
-    def __init__(self, callback: Callable):
+    def __init__(self, callback: Callable[[FileSystemEvent], None]):
         self.callback = callback
 
-    def on_created(self, event):
-        self.callback(event)
-
-    def on_deleted(self, event):
-        self.callback(event)
-
-    def on_moved(self, event):
-        self.callback(event)
-
-    def on_modified(self, event):
-        # No need to call back here for our use case atm
-        # FYI, just 'touching' file modifies file
-        pass
+    def on_any_event(self, event: FileSystemEvent) -> None:
+        if event.event_type in ('created', 'deleted', 'moved', 'modified', 'closed'):
+            self.callback(event)

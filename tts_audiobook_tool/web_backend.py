@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from itertools import groupby
 import json
 from pathlib import Path
 import re
@@ -16,6 +17,7 @@ from typing import TYPE_CHECKING
 import requests
 
 from tts_audiobook_tool.app_types import Book
+from tts_audiobook_tool.app_types.delivery_cue import DeliveryCue
 from tts_audiobook_tool.app_support.JsonSaveUtil import JsonArtifactType, JsonSaveUtil
 from tts_audiobook_tool.constants import MAX_WORDS_PER_SEGMENT_DEFAULT
 from tts_audiobook_tool.constants_config import PROJECT_DEFAULT_SEGMENTATION_STRATEGY
@@ -23,17 +25,21 @@ from tts_audiobook_tool.conversation.llm_session import LlmSession
 from tts_audiobook_tool.project_support.project_text_io_util import ProjectTextIOUtil
 from tts_audiobook_tool.prefs import Prefs
 from tts_audiobook_tool.speaker_assign.assign_plan import AssignPlan, PlannedChunk
-from tts_audiobook_tool.speaker_assign.attribution import AttributionsFile, RangeAttribution, UtteranceAttribution
+from tts_audiobook_tool.speaker_assign.attribution import (
+    UTTERANCE_TEXT_EXCERPT_CHARS, AttributionsFile, RangeAttribution, UtteranceAttribution,
+)
 from tts_audiobook_tool.speaker_assign.attribution_prompt_util import ATTRIBUTION_SYSTEM_PROMPT
 from tts_audiobook_tool.speaker_assign.attribution_reply_util import AttributionReplyUtil
 from tts_audiobook_tool.speaker_assign.combined_analysis import SYSTEM_PROMPT as COMBINED_ANALYSIS_SYSTEM_PROMPT
-from tts_audiobook_tool.speaker_assign.combined_analysis import build_prompt, parse_chunk_reply
+from tts_audiobook_tool.speaker_assign.combined_analysis import (
+    CHARACTER_VOICE_SYSTEM_INSTRUCTIONS, PERFORMANCE_CUE_SYSTEM_PROMPT, build_prompt, parse_chunk_reply,
+)
 from tts_audiobook_tool.speaker_assign.attribution_runner import AttributionRunner, AttributionRunListener
 from tts_audiobook_tool.speaker_assign.llm_request_util import LlmRequestResult, SPEAKER_ASSIGN_LLM_TIMEOUT
-from tts_audiobook_tool.speaker_assign.roster import Roster
+from tts_audiobook_tool.speaker_assign.roster import Roster, is_current_character_voice_direction
 from tts_audiobook_tool.speaker_assign.roster_util import ROSTER_SYSTEM_PROMPT, RosterUtil
 from tts_audiobook_tool.speaker_assign.speaker_assign_file_util import SpeakerAssignFileUtil
-from tts_audiobook_tool.speaker_assign.speaker_assign_types import Utterance
+from tts_audiobook_tool.speaker_assign.speaker_assign_types import NOT_SPEECH, Utterance
 from tts_audiobook_tool.speaker_assign.utterance_util import UtteranceUtil
 from tts_audiobook_tool.text_ops.epub_extractor import EpubExtractor
 
@@ -100,6 +106,8 @@ class CharacterRow:
     name: str
     line_count: int
     voice_hint: str
+    voice_direction: str = ""
+    gender: str = "unknown"
 
 
 def canonical_cast_role(speaker: str) -> str:
@@ -195,9 +203,14 @@ def character_rows(session: BookSession) -> list[CharacterRow]:
             narrator.name if narrator else "Narrator",
             len(session.book.phrase_groups) - lines_for_other_characters,
             narrator_hint,
+            voice_direction=narrator.voice_direction if narrator else "",
+            gender=narrator.gender if narrator else "unknown",
         ),
         *(
-            CharacterRow(character.id, character.name, counts[character.id], character.voice_hint)
+            CharacterRow(
+                character.id, character.name, counts[character.id], character.voice_hint,
+                voice_direction=character.voice_direction, gender=character.gender,
+            )
             for character in characters if not character.is_narrator and character.id != narrator_id
         ),
     ]
@@ -238,9 +251,11 @@ def analyze_book_dialogue(
         effort: str = DEFAULT_REASONING_EFFORT,
         endpoint: str = DEFAULT_LLM_ENDPOINT,
         settings_json: str = "",
+        performance_cues: bool = False,
+        character_voices: bool = False,
         on_log: Callable[[str], None] | None = None,
 ) -> BookSession:
-    """Discover characters and assign quote IDs together, checkpointing each chunk."""
+    """Analyze dialogue and optional voice directions and cues in one request per chunk."""
     log = on_log if on_log is not None else lambda _message: None
     directory = session.attribution_dir or session.project_dir
     checkpoint = Path(SpeakerAssignFileUtil.attributions_path(directory))
@@ -256,87 +271,226 @@ def analyze_book_dialogue(
     utterances_by_chunk = {
         chunk.number: UtteranceUtil.find_utterances(book, chunk.start, chunk.end) for chunk in plan.chunks
     }
-    saved_by_chunk = {
+    speakers_by_chunk = {
         number: {
-            quote_id: stored for quote_id, utterance in enumerate(utterances, 1)
-            if (stored := _covered_utterance(utterance, effective_by_line)) is not None
+            quote_id for quote_id, utterance in enumerate(utterances, 1)
+            if any(line not in effective_by_line for line in utterance.lines)
         }
         for number, utterances in utterances_by_chunk.items()
     }
-    fully_covered = {
-        number for number, utterances in utterances_by_chunk.items()
-        if all(line in effective_by_line for utterance in utterances for line in utterance.lines)
-    }
-    complete = len(fully_covered)
+    cues_by_chunk: dict[int, set[int]] = {}
+    if performance_cues:
+        whole_quotes = {
+            utterance.lines for utterance in UtteranceUtil.find_utterances(book, 0, len(book.flat_phrase_groups))
+        }
+        cues_by_chunk = {
+            number: {
+                quote_id for quote_id, utterance in enumerate(utterances, 1)
+                if utterance.lines in whole_quotes and _needs_delivery(utterance, effective_by_line)
+            }
+            for number, utterances in utterances_by_chunk.items()
+        }
+    voices_by_chunk = _character_voice_requests(roster, utterances_by_chunk, effective_by_line) if character_voices else {}
+    complete = sum(
+        not speakers and not cues_by_chunk.get(number) and not voices_by_chunk.get(number)
+        for number, speakers in speakers_by_chunk.items()
+    )
     prefs = None
     issue = ""
     log(f"Analyzing {total:,} dialogue chunks.\n")
     for chunk in plan.chunks:
         label = f"Chunk {chunk.number:,}/{total:,}"
         utterances = utterances_by_chunk[chunk.number]
-        covered = saved_by_chunk[chunk.number]
-        if chunk.number in fully_covered:
+        requested = speakers_by_chunk[chunk.number]
+        cue_requests = cues_by_chunk.get(chunk.number, set())
+        voice_requests = voices_by_chunk.get(chunk.number, set())
+        if not requested and not cue_requests and not voice_requests:
             quotes = _count_label(len(utterances), "quote")
-            log(f"{label} reused saved speaker labels for {quotes}.\n")
+            saved = "analysis" if performance_cues else "speaker labels"
+            log(f"{label} reused saved {saved} for {quotes}.\n")
             continue
-        requested = set(range(1, len(utterances) + 1)) - covered.keys()
         try:
             if prefs is None:
                 api_key, prefs = _request_settings(api_key, model, effort, endpoint, settings_json)
+            saved_speakers = {
+                number: next(iter(speakers))
+                for number, utterance in enumerate(utterances, 1) if number not in requested
+                if len(speakers := {effective_by_line[line].speaker for line in utterance.lines}) == 1
+            }
             prompt = build_prompt(
-                book, chunk, roster, prior_speakers,
-                {number: utterance.speaker for number, utterance in covered.items()},
+                book, chunk, roster, prior_speakers, saved_speakers,
+                speaker_requests=requested, cue_requests=cue_requests, voice_requests=voice_requests,
             )
-            quotes = _count_label(len(requested), "quote")
-            log(f"{label} requesting speakers for {quotes} (lines {chunk.start + 1:,}–{chunk.end:,}).\n")
-            reply = _send(_make_session(prefs, api_key, COMBINED_ANALYSIS_SYSTEM_PROMPT), prompt)
+            request_parts = []
+            if requested:
+                request_parts.append(f"speakers for {_count_label(len(requested), 'quote')}")
+            if cue_requests:
+                request_parts.append(f"delivery cues for {_count_label(len(cue_requests), 'quote')}")
+            if voice_requests:
+                request_parts.append(f"voice directions for {_count_label(len(voice_requests), 'character')}")
+            request_description = " and ".join(request_parts)
+            log(f"{label} requesting {request_description} (lines {chunk.start + 1:,}–{chunk.end:,}).\n")
+            system_prompt = PERFORMANCE_CUE_SYSTEM_PROMPT if cue_requests else COMBINED_ANALYSIS_SYSTEM_PROMPT
+            if character_voices:
+                system_prompt += CHARACTER_VOICE_SYSTEM_INSTRUCTIONS
+            reply = _send(_make_session(prefs, api_key, system_prompt), prompt)
             if reply.error is not None:
                 raise WebBackendError(_request_error_message(reply.error))
             if reply.hit_output_limit:
                 raise WebBackendError("The model reached its output limit. Try lower reasoning effort or a higher output limit.")
             try:
-                next_roster, parsed = parse_chunk_reply(reply.reply, roster, requested)
+                next_roster, parsed = parse_chunk_reply(
+                    reply.reply, roster, requested, cue_requests=cue_requests,
+                    voice_requests=voice_requests, character_voices=character_voices,
+                )
             except ValueError:
-                raise WebBackendError("The model returned incomplete or invalid speaker labels.") from None
+                message = "The model returned incomplete or invalid speaker labels."
+                if not requested and not cue_requests:
+                    message = "The model returned an unreadable character voice reply."
+                raise WebBackendError(message) from None
 
-            added = AttributionReplyUtil.make_range_attribution(
-                book, chunk.start, chunk.end, utterances, parsed, llm={"model": prefs.llm_model},
-            )
-            added = replace(added, utterances=tuple(
-                covered.get(number, utterance) for number, utterance in enumerate(added.utterances, 1)
-            ))
-            next_attributions = attributions.with_range(added)
-            _save_analysis_checkpoint(checkpoint, next_roster, next_attributions)
+            next_attributions, new_utterances = attributions, []
+            if requested or cue_requests:
+                added = AttributionReplyUtil.make_range_attribution(
+                    book, chunk.start, chunk.end, utterances, parsed, llm={"model": prefs.llm_model},
+                )
+                next_attributions, new_utterances = _merge_chunk_analysis(
+                    book, attributions, added, requested, effective_by_line,
+                )
+            if next_roster != roster or next_attributions != attributions:
+                _save_analysis_checkpoint(checkpoint, next_roster, next_attributions)
         except WebBackendError as exc:
             issue = str(exc)
             log(f"{label} stopped. {issue} Run Analyze book to retry this chunk.\n")
             break
+        expected_voices = voice_requests | (next_roster.ids - roster.ids) if character_voices else set()
+        added_voices = sum(
+            is_current_character_voice_direction(entry.voice_direction)
+            for entry in next_roster.characters if entry.id in expected_voices
+        )
+        missing_voices = len(expected_voices) - added_voices
         roster, attributions = next_roster, next_attributions
-        prior_speakers.update((utterance.first_line, utterance.speaker) for utterance in added.utterances)
-        complete += 1
+        prior_speakers.update((utterance.first_line, utterance.speaker) for utterance in new_utterances)
+        if not missing_voices:
+            complete += 1
         usage = ""
         if reply.input_tokens is not None and reply.output_tokens is not None:
             usage = f" {reply.input_tokens:,} input / {reply.output_tokens:,} output tokens."
-        labels = _count_label(len(requested), "speaker label")
-        log(f"{label} saved {labels} in {reply.elapsed:.1f}s.{usage}\n")
+        saved_parts = []
+        if requested:
+            saved_parts.append(_count_label(len(requested), "speaker label"))
+        if cue_requests:
+            saved_parts.append(_count_label(sum(bool(cue) for cue in parsed.delivery.values()), "delivery cue"))
+        if added_voices:
+            saved_parts.append(_count_label(added_voices, "character voice direction"))
+        if saved_parts:
+            log(f"{label} saved {' and '.join(saved_parts)} in {reply.elapsed:.1f}s.{usage}\n")
+        if missing_voices:
+            log(f"{label} did not receive {_count_label(missing_voices, 'usable character voice direction')}.\n")
 
     if issue and not attributions.ranges:
         raise WebBackendError(issue)
     notice = f"{complete:,} of {total:,} dialogue chunks complete."
+    remaining_voices = sum(
+        not is_current_character_voice_direction(entry.voice_direction) for entry in roster.characters
+    ) if character_voices else 0
+    if remaining_voices:
+        notice += f" Missing {_count_label(remaining_voices, 'character voice direction')}."
     if issue:
-        notice += f" {issue} Run Analyze book to continue."
+        notice += f" {issue}"
+    if issue or remaining_voices:
+        notice += " Run Analyze book to continue."
     log(notice + "\n")
     return replace(session, roster=roster, attributions=attributions, attribution_notice=notice)
 
 
-def _covered_utterance(utterance: Utterance, saved_by_line: dict[int, UtteranceAttribution]) -> UtteranceAttribution | None:
-    saved = [saved_by_line.get(line) for line in utterance.lines]
-    first = saved[0]
-    if first is None or any(item is None or item.speaker != first.speaker for item in saved):
-        return None
-    if first.lines == utterance.lines:
-        return first
-    return replace(first, lines=utterance.lines, uncertain=any(item.uncertain for item in saved if item is not None))
+def _character_voice_requests(
+        roster: Roster, utterances_by_chunk: dict[int, list[Utterance]],
+        saved_by_line: dict[int, UtteranceAttribution],
+) -> dict[int, set[str]]:
+    """Request each missing direction once, where its saved dialogue first appears."""
+    remaining = {entry.id for entry in roster.characters if not is_current_character_voice_direction(entry.voice_direction)}
+    redirects = {old_id: entry.id for entry in roster.characters for old_id in entry.merged_ids}
+    requests_by_chunk = {}
+    for number, utterances in utterances_by_chunk.items():
+        if not remaining:
+            break
+        speakers = {
+            redirects.get(saved_by_line[line].speaker, saved_by_line[line].speaker)
+            for utterance in utterances for line in utterance.lines if line in saved_by_line
+        }
+        requested = remaining & speakers
+        if requested:
+            requests_by_chunk[number] = requested
+            remaining.difference_update(requested)
+    if remaining:
+        # A roster can include characters whose dialogue was edited or removed.
+        # Their roster descriptions still supply evidence in this bounded request.
+        requests_by_chunk.setdefault(next(iter(utterances_by_chunk)), set()).update(remaining)
+    return requests_by_chunk
+
+
+def _needs_delivery(utterance: Utterance, saved_by_line: dict[int, UtteranceAttribution]) -> bool:
+    """Only attach delivery where the entire quote has a single exact identity."""
+    first = saved_by_line.get(utterance.first_line)
+    if first is None:
+        return all(line not in saved_by_line for line in utterance.lines)
+    return (
+        first.lines == utterance.lines and first.delivery is None and first.speaker != NOT_SPEECH
+        and all(saved_by_line.get(line) is first for line in utterance.lines)
+    )
+
+
+def _merge_chunk_analysis(
+        book: Book,
+        attributions: AttributionsFile,
+        candidate: RangeAttribution,
+        requested: set[int],
+        saved_by_line: dict[int, UtteranceAttribution],
+) -> tuple[AttributionsFile, list[UtteranceAttribution]]:
+    """Enrich effective saved quotes in place and add labels for uncovered lines."""
+    delivery_by_line: dict[int, DeliveryCue] = {}
+    new_utterances: list[UtteranceAttribution] = []
+    for number, utterance in enumerate(candidate.utterances, 1):
+        if number not in requested:
+            if utterance.delivery is not None:
+                delivery_by_line[utterance.first_line] = utterance.delivery
+            continue
+        for assigned, members in groupby(utterance.lines, key=saved_by_line.__contains__):
+            if assigned:
+                continue
+            lines = tuple(members)
+            if lines == utterance.lines:
+                new_utterances.append(utterance)
+            else:
+                text = UtteranceUtil.range_text(book, lines[0], lines[-1] + 1).strip()
+                new_utterances.append(replace(
+                    utterance, lines=lines, text=text[:UTTERANCE_TEXT_EXCERPT_CHARS], delivery=None,
+                ))
+
+    ranges = list(attributions.ranges)
+    for index in range(len(ranges) - 1, -1, -1):
+        if not delivery_by_line:
+            break
+        saved = ranges[index]
+        updated = tuple(
+            replace(utterance, delivery=delivery_by_line.pop(utterance.first_line))
+            if utterance.first_line in delivery_by_line and saved_by_line[utterance.first_line] is utterance
+            else utterance
+            for utterance in saved.utterances
+        )
+        if updated != saved.utterances:
+            ranges[index] = replace(saved, utterances=updated)
+
+    if new_utterances:
+        for index, saved in enumerate(ranges):
+            if saved.key == candidate.key:
+                updated = tuple(sorted((*saved.utterances, *new_utterances), key=lambda quote: quote.first_line))
+                ranges[index] = replace(saved, utterances=updated)
+                break
+        else:
+            ranges.append(replace(candidate, utterances=tuple(new_utterances)))
+    return AttributionsFile(tuple(ranges)), new_utterances
 
 
 def _count_label(count: int, singular: str) -> str:
@@ -353,7 +507,7 @@ def _load_analysis_checkpoint(session: BookSession, checkpoint: Path) -> tuple[R
         raise WebBackendError("Saved dialogue assignments could not be read.") from None
     try:
         saved = AttributionsFile(tuple(AttributionsFile.from_dict(value).valid_ranges(session.book)))
-        if "combined_roster" in value and saved.ranges:
+        if "combined_roster" in value:
             roster = Roster.from_dict(value["combined_roster"])
     except ValueError:
         raise WebBackendError("Saved dialogue assignments could not be read.") from None

@@ -19,6 +19,7 @@ from multiprocessing.context import BaseContext
 from typing import Any, Callable, TextIO
 
 from tts_audiobook_tool import text_util
+from tts_audiobook_tool.constants import AAC_BITRATE_DEFAULT
 from tts_audiobook_tool.l import L
 from tts_audiobook_tool.text_ops.language_util import normalize_language_code
 from tts_audiobook_tool.model_worker_protocol import (
@@ -354,6 +355,7 @@ def _make_generation_settings(state: Any) -> GenerationSettings:
         audio_cpp_model_id=getattr(state.project, "audio_cpp_model_id", ""),
         remote_tts_url=prefs.remote_tts_url,
         save_debug_files=prefs.save_debug_files,
+        aac_bitrate=getattr(prefs, "aac_bitrate", AAC_BITRATE_DEFAULT),
     )
 
 
@@ -373,6 +375,7 @@ def _make_worker_prefs(project_dir: str, settings: GenerationSettings) -> Any:
         tts_force_cpu=settings.tts_force_cpu,
         remote_tts_url=settings.remote_tts_url,
         save_debug_files=settings.save_debug_files,
+        aac_bitrate=settings.aac_bitrate,
     )
 
 

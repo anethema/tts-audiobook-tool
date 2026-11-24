@@ -7,6 +7,8 @@ GenerationEvents sink) expose what the header would render.
 """
 
 
+from unittest.mock import patch
+
 import pytest
 
 from tts_audiobook_tool import generate_util
@@ -43,6 +45,7 @@ def run_generate_files(
     state: State,
     batch_durations: list[float],
     results: list,
+    save_seconds: float = 0.0,
 ) -> list[GenerationProgress]:
     """Runs generate_files over one item per batch with scripted durations.
 
@@ -59,9 +62,14 @@ def run_generate_files(
         clock.advance(batch_durations[i])
         return [results[i]]
 
+    def save_and_prune(*_, **__):
+        clock.advance(save_seconds)
+        return "", "saved.wav"
+
     events: list = []
     with (
         generate_files_mock_stack(generate_and_validate_batch),
+        patch.object(GenerateUtil, "save_sound_and_timing_json", side_effect=save_and_prune),
         GenerationEvents.using_sink(events.append),
     ):
         did_interrupt = GenerateUtil.generate_files(
@@ -131,6 +139,12 @@ def test_eta_appears_only_once_minimum_samples_recorded(monkeypatch) -> None:
     # The pre-batch snapshot carries the previous batch's ETA so the header
     # does not blank the estimate during inference.
     assert pre[11].eta_seconds == pytest.approx(10.0)
+
+
+def test_eta_includes_time_spent_saving_and_pruning(monkeypatch) -> None:
+    state = make_generate_state(num_groups=12, max_retries=0)
+    emits = run_generate_files(monkeypatch, state, [10.0] * 12, [StubValidationResult(False)] * 12, save_seconds=3.0)
+    assert [event.eta_seconds for event in emits if not event.current_indices][-2:] == pytest.approx([13.0, 0.0])
 
 
 def test_model_error_batch_is_excluded_from_history(monkeypatch) -> None:

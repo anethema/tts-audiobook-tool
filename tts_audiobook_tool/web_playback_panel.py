@@ -53,7 +53,7 @@ class PlaybackPanel:
 
     def bind(
             self, book, cast, model, validate_audio, batch_size, model_settings, strictness, max_retries, voice_panel, *,
-            event_options, runtime_settings=None, remote_panel=None,
+            event_options, runtime_settings=None, remote_panel=None, performance_cues=None, character_voices=None,
             console_for: Callable[[str | None], Callable[[str], None]] | None = None,
     ):
         active: dict[str | None, Event] = {}
@@ -62,6 +62,9 @@ class PlaybackPanel:
         remote_inputs = () if remote_panel is None else remote_panel.selection_inputs
         runtime_end = len(runtime_inputs)
         remote_end = runtime_end + len(remote_inputs)
+        voice_options = (performance_cues, character_voices)
+        option_inputs = tuple(control for control in voice_options if control is not None)
+        options_end = remote_end + len(option_inputs)
 
         def stop(request: gr.Request):
             with guard:
@@ -81,7 +84,11 @@ class PlaybackPanel:
                     if remote_panel is None:
                         raise WebPlaybackError("Refresh and choose a remote model before starting playback.")
                     remote = remote_panel.selection_for(*fields[runtime_end:remote_end])
-                narrator = voice_panel.snapshot(*fields[remote_end:])
+                option_values = iter(fields[remote_end:options_end])
+                use_cues, use_character_voices = (
+                    next(option_values) if control is not None else False for control in voice_options
+                )
+                narrator = voice_panel.snapshot(*fields[options_end:])
             except (WebPlaybackError, WebRemoteTtsError, WebRenderError, WebRuntimeSettingsError) as error:
                 yield None, gr.skip(), _status(str(error)), gr.skip(), gr.skip()
                 return
@@ -113,6 +120,7 @@ class PlaybackPanel:
                             validate_audio=validate, batch_size=batch or 1, model_options=(settings or {}).get(selected),
                             strictness=tolerance or None, max_retries=retries if retries is not None else PROJECT_MAX_RETRIES_DEFAULT,
                             cancel_event=cancel, runtime_settings=runtime, remote_selection=remote, on_console=on_console,
+                            performance_cues=use_cues, character_voices=use_character_voices,
                         )
                         with closing(chunks):
                             for take in chunks:
@@ -152,7 +160,7 @@ class PlaybackPanel:
         self.start.click(
             start,
             [book, cast, model, validate_audio, batch_size, model_settings, strictness, max_retries,
-             self.lines, self.save, *runtime_inputs, *remote_inputs, *voice_panel.inputs],
+             self.lines, self.save, *runtime_inputs, *remote_inputs, *option_inputs, *voice_panel.inputs],
             [self.audio, self.download, self.status, self.start, self.stop], **event_options,
         )
         self.stop.click(

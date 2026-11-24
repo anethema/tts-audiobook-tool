@@ -14,7 +14,8 @@ import soundfile
 
 from tts_audiobook_tool import model_runtime, web_models, web_render
 from tts_audiobook_tool.app_types import Book, BookSection, RoomReverb, Sound, Strictness, SttConfig, SttVariant
-from tts_audiobook_tool.app_types.book_serialization import book_to_project_text_json_dict
+from tts_audiobook_tool.app_types.book_serialization import book_from_project_text_json_dict, book_to_project_text_json_dict
+from tts_audiobook_tool.app_types.delivery_cue import DeliveryCue
 from tts_audiobook_tool.app_types.phrase import Phrase, PhraseGroup, Reason
 from tts_audiobook_tool.constants import AAC_BITRATE_DEFAULT, AAC_BITRATES
 from tts_audiobook_tool.generation_events import GenerationPhase
@@ -25,8 +26,10 @@ from tts_audiobook_tool.model_worker_protocol import (
     GenerationUpdate,
     TtsPreviewFinished,
 )
-from tts_audiobook_tool.speaker_assign.attribution import AttributionsFile
-from tts_audiobook_tool.speaker_assign.roster import Roster, RosterCharacter
+from tts_audiobook_tool.speaker_assign.attribution import AttributionsFile, RangeAttribution, UtteranceAttribution
+from tts_audiobook_tool.speaker_assign.roster import NEUTRAL_CHARACTER_VOICE_DIRECTION, Roster, RosterCharacter
+from tts_audiobook_tool.speaker_assign.speaker_assign_types import NOT_SPEECH
+from tts_audiobook_tool.speaker_assign.utterance_util import UtteranceUtil
 from tts_audiobook_tool.tts_models.tts_model_type import TtsModelType
 from tts_audiobook_tool.web_backend import BookSession
 
@@ -289,10 +292,15 @@ def test_web_model_options_round_trip_through_worker_json(monkeypatch, tmp_path,
     options = {"temperature": 0.65, "seed": 1024}
     book = Book([BookSection(phrase_groups=[PhraseGroup([Phrase("Hello.", Reason.SENTENCE)])])])
     manual = web_render.RenderVoice(name="Line voice")
+    roster = Roster((RosterCharacter("RUE", "Rue", voice_direction="Slightly warmer tone."),))
     session = BookSession(
-        book, str(tmp_path), project_language="", word_substitutions={"rue": "roo"}, line_voices={7: manual},
+        book, str(tmp_path), roster=roster, project_language="", word_substitutions={"rue": "roo"},
+        line_voices={7: manual},
     )
-    controls = dict(first_line=1, last_line=1, regenerate=True, auto_concat=False, strictness="high", max_retries=3)
+    controls = dict(
+        first_line=1, last_line=1, regenerate=True, auto_concat=False, strictness="high", max_retries=3,
+        performance_cues=True, character_voices=True,
+    )
     runtime = WebRuntimeSettings(force_cpu=True, whisper_variant=SttVariant.LARGE_V3.id, save_generation_logs=True)
     sample = tmp_path / "recorded.wav"
     sample.touch()
@@ -301,6 +309,7 @@ def test_web_model_options_round_trip_through_worker_json(monkeypatch, tmp_path,
         assert model_options == options
         assert callbacks["runtime_settings"] == runtime
         if action == "book":
+            assert arguments[0].roster == roster
             assert arguments[0].language_code == ""
             assert arguments[0].word_substitutions == {"rue": "roo"}
             assert arguments[0].line_voices == {7: manual}
@@ -344,7 +353,7 @@ def test_cancelled_stuck_worker_is_shut_down(monkeypatch):
     assert calls == [("cancel", "job"), ("shutdown",)]
 
 
-def test_cast_uses_shared_voices_and_falls_back_to_the_named_narrator(monkeypatch):
+def test_cast_uses_shared_voices_and_falls_back_to_the_named_narrator():
     lines = ("Opening", "A named speaker", "A manual voice", "Unknown", "Uncast speaker",
              "An unidentified woman", "An unidentified man", "Another unidentified man", "The custodian")
     book = Book([BookSection(phrase_groups=[
@@ -360,7 +369,10 @@ def test_cast_uses_shared_voices_and_falls_back_to_the_named_narrator(monkeypatc
         7: "OTHER:UNIDENTIFIED_MALE",
         8: "OTHER:Custodian",
     }
-    monkeypatch.setattr(AttributionsFile, "speaker_of_each_line", lambda _self, _book: speakers)
+    attributions = AttributionsFile((RangeAttribution(
+        0, len(lines), UtteranceUtil.range_text_hash(book, 0, len(lines)),
+        tuple(UtteranceAttribution((line,), speaker) for line, speaker in speakers.items()),
+    ),))
 
     manual = web_render.RenderVoice(name="Line voice")
     book.phrase_groups[2].voice_index = 12
@@ -369,7 +381,7 @@ def test_cast_uses_shared_voices_and_falls_back_to_the_named_narrator(monkeypatc
         RosterCharacter("ALEX", "Alex"),
         RosterCharacter("SAM", "Sam"),
     ))
-    session = BookSession(book, "", roster=roster, line_voices={12: manual})
+    session = BookSession(book, "", roster=roster, attributions=attributions, line_voices={12: manual})
     nina = web_render.RenderVoice(instructions="Calm")
     alex = web_render.RenderVoice(instructions="Quiet")
     female = web_render.RenderVoice(instructions="Measured")
@@ -392,6 +404,166 @@ def test_cast_uses_shared_voices_and_falls_back_to_the_named_narrator(monkeypatc
     cast_book, voices = web_render._cast_book(session, {"NINA": nina, "ALEX": web_render.RenderVoice()})
     assert voices == [nina, manual]
     assert [group.voice_index for group in cast_book.phrase_groups] == [0, 0, 1, 0, 0, 0, 0, 0, 0]
+
+
+def test_only_effective_local_breeze_cues_change_render_checkpoint(monkeypatch, tmp_path):
+    book = Book([BookSection([
+        PhraseGroup([Phrase(text, Reason.SENTENCE)], is_dialog=index != 0)
+        for index, text in enumerate(("Narration.", "“First part, ", "then this, ", "then this.”", "“A title.”"))
+    ])])
+    cue = DeliveryCue("Relieved", "gasps", "sighs")
+    attributions = AttributionsFile((RangeAttribution(
+        0, 5, UtteranceUtil.range_text_hash(book, 0, 5), (
+            UtteranceAttribution((1, 2, 3), "RUE", delivery=cue),
+            UtteranceAttribution((4,), NOT_SPEECH, delivery=cue),
+        ),
+    ),))
+    session = BookSession(book, str(tmp_path), attributions=attributions, word_substitutions={"first": "1st"})
+    original = book_to_project_text_json_dict(book)
+    captured = []
+
+    def record(work, cast_book, *_args, **_options):
+        captured.append((work.name, cast_book))
+
+    model_id = "breeze_tts_2_local"
+    monkeypatch.setattr(web_render, "_detect_model", lambda: TtsModelType.require_by_id(model_id))
+    monkeypatch.setattr(web_render, "_render_book_checkpoint", record)
+    web_render.render_book(session, {}, first_line=2, last_line=4)
+    web_render.render_book(session, {}, first_line=2, last_line=4, performance_cues=True)
+    web_render.render_book(session, {}, first_line=3, last_line=3, performance_cues=True)
+    (plain_id, plain), (cue_id, directed), (resume_id, _) = captured
+    assert cue_id == resume_id != plain_id
+    assert book_to_project_text_json_dict(plain) == original == book_to_project_text_json_dict(book)
+
+    reopened = book_from_project_text_json_dict(book_to_project_text_json_dict(directed))
+    assert isinstance(reopened, Book)
+    assert [group.delivery for group in reopened.phrase_groups] == [
+        None, DeliveryCue("Relieved", "gasps"), DeliveryCue("Relieved"), DeliveryCue("Relieved", after="sighs"), None,
+    ]
+    assert [group.text for group in reopened.phrase_groups] == [group.text for group in book.phrase_groups]
+
+    # Other local models and old (or text-invalidated) assignments retain the plain render identity.
+    model_id = "chatterbox_local"
+    web_render.render_book(session, {})
+    web_render.render_book(session, {}, performance_cues=True)
+    assert captured[-2][0] == captured[-1][0]
+    model_id = "breeze_tts_2_local"
+    book.phrase_groups[2].phrases[0].text = "edited."
+    web_render.render_book(session, {})
+    web_render.render_book(session, {}, performance_cues=True)
+    assert captured[-2][0] == captured[-1][0]
+
+
+def test_character_profiles_only_cast_unassigned_named_dialogue_and_reuse_one_voice(tmp_path):
+    from tts_audiobook_tool.project import Project
+
+    book = Book([BookSection([
+        PhraseGroup([Phrase(f"Line {index}.", Reason.SENTENCE)], is_dialog=index not in (0, 11))
+        for index in range(12)
+    ])])
+    speakers = {
+        1: "RUE", 2: "RUE", 3: "NINA", 4: "SAM", 5: "PAT", 6: "FINN",
+        7: "LEE", 8: "UNKNOWN", 9: NOT_SPEECH, 10: "OTHER:unidentified female", 11: "RUE",
+    }
+    delivery_by_line = {1: DeliveryCue("Subdued", "gasps"), 2: DeliveryCue("Annoyed")}
+    attributions = AttributionsFile((RangeAttribution(
+        0, 12, UtteranceUtil.range_text_hash(book, 0, 12),
+        tuple(UtteranceAttribution((index,), role, delivery=delivery_by_line.get(index))
+              for index, role in speakers.items()),
+    ),))
+    roster = Roster((
+        RosterCharacter("NINA", "Nina", is_narrator=True, voice_direction="Warm and clear."),
+        RosterCharacter("RUE", "Rue", gender="Female", voice_direction="Slightly warmer tone."),
+        RosterCharacter("SAM", "Sam", gender="male"),
+        RosterCharacter("PAT", "Pat", voice_direction="Slightly brighter tone."),
+        RosterCharacter("FINN", "Finn", voice_direction="Slightly softer tone."),
+        RosterCharacter("LEE", "Lee", voice_direction=NEUTRAL_CHARACTER_VOICE_DIRECTION),
+    ))
+    line_voice = web_render.RenderVoice(instructions="Brisk and breathy.")
+    book.phrase_groups[4].voice_index = 3
+    session = BookSession(book, "", roster=roster, attributions=attributions, line_voices={3: line_voice})
+    model_id = "breeze_tts_2_local"
+    clip = tmp_path / "reference.wav"
+    rate = 24_000
+    soundfile.write(clip, 0.2 * np.sin(np.arange(2 * rate) * (2 * np.pi * 220 / rate)), rate)
+    narrator = web_render.RenderVoice(
+        reference_path=str(clip), transcript="This is the narrator’s sample.",
+        instructions="Read neutrally by default.", trim_start=0.25, trim_end=1.25,
+        pan=0.15, volume=90, max_reference_silence=0.25,
+        model_instructions=((model_id, "Read evenly and clearly."),),
+    )
+    finn = web_render.RenderVoice(model_instructions=((model_id, "Soft and airy."),))
+    cast = {"NINA": narrator, "PAT": web_render.RenderVoice(), "FINN": finn}
+
+    rendered, voices = web_render._cast_book(session, cast, character_voices=True, performance_cues=True)
+
+    assert [group.voice_index for group in rendered.phrase_groups] == [0, 1, 1, 0, 2, 0, 3, 0, 0, 0, 0, 0]
+    auto_voice = replace(narrator, model_instructions=((
+        model_id, "Read evenly and clearly.\nUse a female voice. Slightly warmer tone.",
+    ),))
+    assert voices == [narrator, auto_voice, line_voice, finn]
+    project = Project(dir_path=str(tmp_path), tts_model_type=model_id)
+    try:
+        native = web_render._build_voice(project, 1, auto_voice)
+    finally:
+        project.kill()
+        project.sound_segments.observer.join()
+    assert native.transcript == narrator.transcript
+    assert soundfile.info(tmp_path / "voice" / native.file_name).duration == pytest.approx(1.0, abs=0.03)
+    assert native.instructions == dict(auto_voice.model_instructions)
+    assert [group.delivery for group in rendered.phrase_groups[1:3]] == list(delivery_by_line.values())
+    assert all(group.delivery is None for group in book.phrase_groups)
+
+    # Gender-only rosters still have a usable baseline when the line has no manual override.
+    book.phrase_groups[4].voice_index = 0
+    narrator_without_sample = web_render.RenderVoice(instructions="Read evenly.")
+    rendered, voices = web_render._cast_book(
+        session, {**cast, "NINA": narrator_without_sample}, character_voices=True,
+    )
+    assert voices[rendered.phrase_groups[4].voice_index].model_instructions == (
+        (model_id, "Read evenly.\nUse a male voice."),
+    )
+    assert not any(group.delivery for group in rendered.phrase_groups)
+    assert web_render.character_voice_instruction(
+        RosterCharacter("KAI", "Kai", gender="Non-binary", voice_direction="Slightly deeper tone.")
+    ) == "The speaker is nonbinary. Slightly deeper tone."
+    assert web_render.character_voice_instruction(
+        RosterCharacter("KAI", "Kai", gender="female", voice_direction="Light and steady.")
+    ) == "Use a female voice."
+
+
+def test_only_effective_local_breeze_character_profiles_change_render_checkpoint(monkeypatch, tmp_path):
+    book = Book([BookSection([
+        PhraseGroup([Phrase("Narration.", Reason.SENTENCE)]),
+        PhraseGroup([Phrase("“Dialogue.”", Reason.SENTENCE)], is_dialog=True),
+    ])])
+    character = RosterCharacter("RUE", "Rue", voice_direction="Slightly warmer tone.")
+    attributions = AttributionsFile((RangeAttribution(
+        1, 2, UtteranceUtil.range_text_hash(book, 1, 2),
+        (UtteranceAttribution((1,), "RUE"),),
+    ),))
+    session = BookSession(book, str(tmp_path), roster=Roster((character,)), attributions=attributions)
+    model = TtsModelType.require_by_id("breeze_tts_2_local")
+    monkeypatch.setattr(web_render, "_detect_model", lambda: model)
+    monkeypatch.setattr(web_render, "_render_book_checkpoint", lambda work, *_args, **_kwargs: work.name)
+
+    plain = web_render.render_book(session, {})
+    designed = web_render.render_book(session, {}, character_voices=True)
+    assert designed != plain
+    assert web_render.render_book(session, {}, character_voices=True, first_line=2) == designed
+
+    overridden = {"RUE": web_render.RenderVoice()}
+    assert web_render.render_book(session, overridden, character_voices=True) == plain
+    renamed = replace(session, roster=Roster((replace(character, name="Rue Marlow"),)))
+    assert web_render.render_book(renamed, {}, character_voices=True) == designed
+    changed = replace(session, roster=Roster((replace(character, voice_direction="Slightly softer tone."),)))
+    assert web_render.render_book(changed, {}, character_voices=True) not in {plain, designed}
+    for direction in ("Low and raspy.", NEUTRAL_CHARACTER_VOICE_DIRECTION):
+        unchanged = replace(session, roster=Roster((replace(character, voice_direction=direction),)))
+        assert web_render.render_book(unchanged, {}, character_voices=True) == plain
+
+    model = TtsModelType.require_by_id("chatterbox_local")
+    assert web_render.render_book(session, {}, character_voices=True) == web_render.render_book(session, {})
 
 
 def test_process_exit_reaps_idle_model_worker(tmp_path):
@@ -484,7 +656,10 @@ def test_book_retries_only_missing_audio_and_keeps_completed_export(monkeypatch,
     assert pronunciations == [{}, {}, {}, {"fox": "focks"}]
 
 
-def test_selective_generation_shares_checkpoint_and_regeneration_retains_existing_takes(monkeypatch, tmp_path):
+@pytest.mark.parametrize(("checkpoint_format", "suffix"), [("flac", ".flac"), ("aac", ".m4a")])
+def test_selective_generation_shares_checkpoint_and_regeneration_retains_existing_takes(
+    monkeypatch, tmp_path, checkpoint_format, suffix,
+):
     from tts_audiobook_tool.app_types.validation_result import SkippedResult
     from tts_audiobook_tool.generate_util import GenerateUtil
     from tts_audiobook_tool.project_support.sound_segment_util import get_segment_stt_info_path
@@ -532,7 +707,10 @@ def test_selective_generation_shares_checkpoint_and_regeneration_retains_existin
         web_render.ModelWorker, "get_event", lambda **_: GenerationFinished("job", next(statuses), ""),
     )
     options = dict(validate_audio=False, strictness="high", max_retries=0, on_progress=lambda *args: events.append(args))
-    assert web_render.render_book(session, {}, first_line=2, last_line=2, **options) is None
+    assert web_render.render_book(
+        session, {}, first_line=2, last_line=2,
+        runtime_settings=WebRuntimeSettings(checkpoint_format=checkpoint_format), **options,
+    ) is None
     assert events == [(0, 1), (1, 1)]
     assert web_render.render_book(session, {}, first_line=2, last_line=2, auto_concat=False, **options) is None
     assert requests == [({1}, False)]
@@ -540,19 +718,19 @@ def test_selective_generation_shares_checkpoint_and_regeneration_retains_existin
     export_path = Path(web_render.render_book(session, {}, **options))
     before = export_path.read_bytes()
     directory = export_path.parent
-    originals = sorted((directory / "segments").glob("*.flac"))
+    originals = sorted((directory / "segments").glob(f"*{suffix}"))
     assert len(originals) == 3
     assert len(list((tmp_path / "renders").iterdir())) == 1
 
     with pytest.raises(web_render.WebRenderError, match="stopped"):
         web_render.render_book(session, {}, first_line=2, last_line=2, regenerate=True, **options)
     assert export_path.read_bytes() == before
-    assert sorted((directory / "segments").glob("*.flac")) == originals
+    assert sorted((directory / "segments").glob(f"*{suffix}")) == originals
 
     replace_path = Path.replace
 
     def fail_audio_move(source, target):
-        if source.suffix == ".flac" and "[take " in Path(target).name:
+        if source.suffix == suffix and "[take " in Path(target).name:
             raise OSError("test failed audio move")
         return replace_path(source, target)
 
@@ -567,11 +745,12 @@ def test_selective_generation_shares_checkpoint_and_regeneration_retains_existin
         session, {}, first_line=2, last_line=2, regenerate=True, auto_concat=False, **options,
     ) is None
     assert not export_path.exists()
-    takes = set((directory / "segments").glob("*.flac"))
+    takes = set((directory / "segments").glob(f"*{suffix}"))
     assert set(originals) < takes
     new, = takes - set(originals)
     assert new.name.startswith("[00002]")
-    assert soundfile.info(new).frames == sample.sr
+    from tts_audiobook_tool.sound.sound_file_util import SoundFileUtil
+    assert SoundFileUtil.load(str(new)).duration == sample.duration
     assert get_segment_stt_info_path(new).is_file()
     assert web_render.render_book(session, {}, **options) == str(export_path)
     assert export_path.is_file()
@@ -717,6 +896,9 @@ def test_automatic_export_rebuilds_for_bitrate_without_regenerating_takes(monkey
     assert sorted((output.parent / "segments").glob("*.flac")) == files
     assert files[0].read_bytes() == rendered_audio
     assert len(list((tmp_path / "renders").iterdir())) == 1
+    # Replacing word timings externally invalidates the assembled book.
+    files[0].with_suffix(".json").write_text("{}", encoding="utf-8")
+    assert not web_render._automatic_export_matches(output, other_bitrate)
 
 
 def test_reference_transcription_uses_cached_cpu_model(monkeypatch, tmp_path):

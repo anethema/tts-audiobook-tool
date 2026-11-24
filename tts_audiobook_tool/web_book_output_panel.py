@@ -98,6 +98,7 @@ def create_book_output_panel(book: gr.State, *, private_event: dict) -> None:
         choices = [
             (
                 f"{run.model_label} · {run.generated_lines:,}/{run.total_lines:,} lines · "
+                f"{'Performance cues · ' if run.performance_cues else ''}"
                 f"{datetime.fromtimestamp(run.updated_at):%Y-%m-%d %H:%M:%S}" + (f" · {run.title}" if run.title else ""),
                 run.run_id,
             )

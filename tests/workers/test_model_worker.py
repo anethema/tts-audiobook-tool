@@ -708,7 +708,7 @@ def test_submit_tts_preview_queues_prompt_project_and_settings(
     tmp_path, monkeypatch
 ) -> None:
     project = Project(dir_path=str(tmp_path))
-    prefs = Prefs(project_dir=str(tmp_path), stt_variant=SttVariant.DISABLED)
+    prefs = Prefs(project_dir=str(tmp_path), stt_variant=SttVariant.DISABLED, aac_bitrate="64k")
     state = SimpleNamespace(project=project, prefs=prefs)
     commands: list[object] = []
 
@@ -745,6 +745,7 @@ def test_submit_tts_preview_queues_prompt_project_and_settings(
     )
     assert command.apply_word_substitutions is False
     assert command.settings.stt_variant_id == SttVariant.DISABLED.id
+    assert command.settings.aac_bitrate == "64k"
     assert cancellation_event.clear_calls == 1
     assert ModelWorker.is_busy()
 
@@ -1488,7 +1489,7 @@ def test_worker_state_overrides_disk_selection_before_binding(tmp_path, monkeypa
     command = TtsPreviewCommand(
         "snapshot", str(tmp_path),
         GenerationSettings("disabled", "cpu_int8_float32", False, "higgs_v3_audiocpp", "http://example.test", False,
-                           audio_cpp_model_id=server_id),
+                           audio_cpp_model_id=server_id, aac_bitrate="64k"),
         "Hello",
     )
 
@@ -1497,6 +1498,7 @@ def test_worker_state_overrides_disk_selection_before_binding(tmp_path, monkeypa
     assert state.project is project
     assert calls == [("refresh", True), "load", ("bind", "higgs_v3_audiocpp", server_id)]
     assert state.project.audio_cpp_model_id == server_id
+    assert state.prefs.aac_bitrate == "64k"
     assert state.prefs.remote_tts_url == "http://example.test"
     assert not hasattr(state.prefs, "remote_tts_type")
     assert not hasattr(state.prefs, "remote_tts_model_id")

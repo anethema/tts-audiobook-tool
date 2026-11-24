@@ -148,6 +148,8 @@ def test_join_preserves_phrases_and_requires_a_matching_speaker():
 
 
 def test_chapter_edits_preserve_line_assignments_and_formatting():
+    from tts_audiobook_tool.app_types.delivery_cue import DeliveryCue
+
     book = Book([
         BookSection([
             PhraseGroup([Phrase("“First.\n", Reason.PARAGRAPH, "<i>“First.</i>\n")], voice_index=4, is_dialog=True),
@@ -156,7 +158,7 @@ def test_chapter_edits_preserve_line_assignments_and_formatting():
         BookSection([PhraseGroup([Phrase("Last.", Reason.SECTION_BREAK)])], "Last chapter"),
     ], title="A book", text_source_kind="epub")
     assignment = RangeAttribution(0, 3, UtteranceUtil.range_text_hash(book, 0, 3), (
-        UtteranceAttribution((0, 1), "RUE", uncertain=True),
+        UtteranceAttribution((0, 1), "RUE", uncertain=True, delivery=DeliveryCue("Hushed", "gasps", "sighs")),
     ))
     session = new_book_session(book, attributions=AttributionsFile((assignment,)), line_voices={4: RenderVoice(name="Guest")})
     try:
@@ -176,6 +178,9 @@ def test_chapter_edits_preserve_line_assignments_and_formatting():
         assert split.book.phrase_groups[0].last_reason is Reason.SECTION_BREAK
         assert session.book.phrase_groups[0].last_reason is Reason.PARAGRAPH
         assert {line: item.lines for line, item in split.attributions.by_first_line(split.book).items()} == {0: (0,), 1: (1,)}
+        assert [item.delivery for item in split.attributions.by_first_line(split.book).values()] == [
+            DeliveryCue("Hushed", "gasps"), DeliveryCue("Hushed", after="sighs"),
+        ]
         assert all(item.uncertain for item in split.attributions.by_first_line(split.book).values())
         assert SpeakerAssignFileUtil.load_attributions_file(session.attribution_dir) == split.attributions
 

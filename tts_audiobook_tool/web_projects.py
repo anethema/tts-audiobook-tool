@@ -68,6 +68,9 @@ class SavedProject:
     strictness: str = ""
     max_retries: int = PROJECT_MAX_RETRIES_DEFAULT
     auto_concat: bool = True
+    performance_cues: bool = False
+    character_voices: bool = False
+    analyze_performance_cues: bool = False
 
 
 def list_projects(*, root: str | os.PathLike[str] | None = None) -> list[ProjectSummary]:
@@ -124,6 +127,9 @@ def create_project(
         strictness: str = "",
         max_retries: int = PROJECT_MAX_RETRIES_DEFAULT,
         auto_concat: bool = True,
+        performance_cues: bool = False,
+        character_voices: bool = False,
+        analyze_performance_cues: bool = False,
         root: str | os.PathLike[str] | None = None,
 ) -> ProjectSummary:
     printable = "".join(char if char.isprintable() and char not in "/\\" else " " for char in (name or ""))
@@ -143,6 +149,8 @@ def create_project(
                 project_dir, name, session, narrator, voices, model_id, source_epub, validate_audio, batch_size,
                 model_options={} if model_options is None else model_options,
                 strictness=strictness, max_retries=max_retries, auto_concat=auto_concat,
+                performance_cues=performance_cues, character_voices=character_voices,
+                analyze_performance_cues=analyze_performance_cues,
             )
         except Exception:
             if _is_directory(project_dir):
@@ -164,6 +172,9 @@ def save_project(
         strictness: str | None = None,
         max_retries: int | None = None,
         auto_concat: bool | None = None,
+        performance_cues: bool | None = None,
+        character_voices: bool | None = None,
+        analyze_performance_cues: bool | None = None,
         root: str | os.PathLike[str] | None = None,
 ) -> ProjectSummary:
     with _LOCK:
@@ -180,6 +191,12 @@ def save_project(
             strictness=previous.get("strictness", "") if strictness is None else strictness,
             max_retries=previous.get("max_retries", PROJECT_MAX_RETRIES_DEFAULT) if max_retries is None else max_retries,
             auto_concat=previous.get("auto_concat", True) if auto_concat is None else auto_concat,
+            performance_cues=previous.get("performance_cues", False) if performance_cues is None else performance_cues,
+            character_voices=previous.get("character_voices", False) if character_voices is None else character_voices,
+            analyze_performance_cues=(
+                previous.get("analyze_performance_cues", False)
+                if analyze_performance_cues is None else analyze_performance_cues
+            ),
         )
 
 
@@ -219,6 +236,9 @@ def load_project(
         strictness = metadata.get("strictness", "")
         max_retries = metadata.get("max_retries", PROJECT_MAX_RETRIES_DEFAULT)
         auto_concat = metadata.get("auto_concat", True)
+        performance_cues = metadata.get("performance_cues", False)
+        character_voices = metadata.get("character_voices", False)
+        analyze_performance_cues = metadata.get("analyze_performance_cues", False)
         _check_generation_settings(strictness, max_retries, auto_concat)
         if project_language is not None and not isinstance(project_language, str):
             raise ValueError
@@ -228,6 +248,8 @@ def load_project(
         ):
             raise ValueError
         if not isinstance(model_id, str) or not isinstance(validate_audio, bool):
+            raise ValueError
+        if not all(type(setting) is bool for setting in (performance_cues, character_voices, analyze_performance_cues)):
             raise ValueError
         if type(batch_size) is not int or batch_size < 1:
             raise ValueError
@@ -251,7 +273,8 @@ def load_project(
 
     return SavedProject(
         summary, session, narrator, voices, model_id, source_epub, validate_audio, batch_size,
-        model_options, strictness, max_retries, auto_concat,
+        model_options, strictness, max_retries, auto_concat, performance_cues, character_voices,
+        analyze_performance_cues,
     )
 
 
@@ -276,6 +299,9 @@ def _save_snapshot(
         strictness: str,
         max_retries: int,
         auto_concat: bool,
+        performance_cues: bool,
+        character_voices: bool,
+        analyze_performance_cues: bool,
 ) -> ProjectSummary:
     try:
         model_options = _copy_model_options(model_options)
@@ -296,6 +322,10 @@ def _save_snapshot(
         raise WebProjectError("Choose an EPUB file for the project source.")
     if not isinstance(validate_audio, bool) or type(batch_size) is not int or batch_size < 1:
         raise WebProjectError("Choose a valid audio validation setting and batch size.")
+    if type(performance_cues) is not bool or type(analyze_performance_cues) is not bool:
+        raise WebProjectError("Choose a valid performance cue setting.")
+    if type(character_voices) is not bool:
+        raise WebProjectError("Choose a valid character voice setting.")
 
     updated = datetime.now(timezone.utc).isoformat()
     narrator_data = _save_voice(assets, narrator)
@@ -320,6 +350,9 @@ def _save_snapshot(
                 "strictness": strictness,
                 "max_retries": max_retries,
                 "auto_concat": auto_concat,
+                **({"performance_cues": True} if performance_cues else {}),
+                "character_voices": character_voices,
+                "analyze_performance_cues": analyze_performance_cues,
                 "model_options": model_options,
                 "project_language": session.project_language,
                 "word_substitutions": session.word_substitutions,

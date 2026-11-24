@@ -165,6 +165,8 @@ class TestWebProjects(unittest.TestCase):
         path = self.root / summary.project_id / PROJECT_TEXT_FILE_NAME
         snapshot = json.loads(path.read_text(encoding="utf-8"))
         del snapshot["web_project"]["model_options"]
+        del snapshot["web_project"]["character_voices"]
+        del snapshot["web_project"]["analyze_performance_cues"]
         snapshot["web_project"]["narrator"] = {
             "reference": None, "transcript": "Sample words.", "instructions": "Read gently.",
         }
@@ -172,6 +174,31 @@ class TestWebProjects(unittest.TestCase):
         saved = self._open(summary.project_id)
         self.assertEqual(saved.narrator, RenderVoice(None, "Sample words.", "Read gently."))
         self.assertEqual(saved.model_options, {})
+        self.assertFalse(saved.performance_cues)
+        self.assertFalse(saved.character_voices)
+        self.assertFalse(saved.analyze_performance_cues)
+
+    def test_delivery_settings_survive_save_and_can_be_disabled_independently(self):
+        narrator = RenderVoice()
+        summary = web_projects.create_project(
+            "Project", self.session, narrator=narrator, voices={}, model_id="venv-breeze",
+            performance_cues=True, character_voices=True, analyze_performance_cues=True, root=self.root,
+        )
+        web_projects.save_project(
+            summary.project_id, self.session, narrator=narrator, voices={}, model_id="venv-breeze", root=self.root,
+        )
+        saved = self._open(summary.project_id)
+        self.assertTrue(saved.performance_cues)
+        self.assertTrue(saved.character_voices)
+        self.assertTrue(saved.analyze_performance_cues)
+        web_projects.save_project(
+            summary.project_id, self.session, narrator=narrator, voices={}, model_id="venv-breeze",
+            character_voices=False, analyze_performance_cues=False, root=self.root,
+        )
+        saved = self._open(summary.project_id)
+        self.assertTrue(saved.performance_cues)
+        self.assertFalse(saved.character_voices)
+        self.assertFalse(saved.analyze_performance_cues)
 
     def test_model_options_round_trip_for_each_environment_and_can_be_cleared(self):
         options = {

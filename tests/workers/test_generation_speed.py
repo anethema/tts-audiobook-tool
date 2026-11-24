@@ -37,18 +37,19 @@ def test_generation_speed_counts_retained_takes_and_time_spent_retrying(monkeypa
         result.path = path
         return [result]
 
-    def save(_state, _phrase_group, _index, result, **_):
+    def save(_state, _phrase_group, _index, result, *, on_published, **_):
         if result.path is None:
             return "Save failed", ""
         result.path.touch()
+        on_published(result.path, None)
         return "", str(result.path)
 
-    def prune(_index):
+    def prune(_path, *, replaces):
         discarded.unlink(missing_ok=True)
         if replacement.exists():
             first.unlink(missing_ok=True)
 
-    state.project.sound_segments.delete_redundants_for.side_effect = prune
+    state.project.sound_segments.record_published_segment.side_effect = prune
     monkeypatch.setattr(generate_util, "monotonic", lambda: clock)
     events = []
     with (
@@ -57,10 +58,12 @@ def test_generation_speed_counts_retained_takes_and_time_spent_retrying(monkeypa
         patch.object(generate_util.GenerateUtil, "save_sound_and_timing_json", side_effect=save),
         GenerationEvents.using_sink(events.append),
     ):
-        assert not generate_util.GenerateUtil.generate_files(state, {0, 1}, batch_size=1, is_regen=False)
+        with pytest.raises(generate_util.CheckpointWriteError, match="Save failed"):
+            generate_util.GenerateUtil.generate_files(state, {0, 1}, batch_size=1, is_regen=False)
 
     progress = [event for event in events if isinstance(event, GenerationProgress)]
     assert progress[0].speed_multiplier is None
     completed_batches = [event for event in progress if not event.current_indices]
     assert [event.processed for event in completed_batches] == [0, 0, 1, 2]
+    assert [event.saved for event in completed_batches] == [0, 0, 1, 1]
     assert [event.speed_multiplier for event in completed_batches] == pytest.approx([8, 4, 10, 8])

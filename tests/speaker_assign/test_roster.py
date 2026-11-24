@@ -3,12 +3,16 @@ import dataclasses
 import pytest
 
 from tts_audiobook_tool.speaker_assign.roster import (
+    MAX_CHARACTER_VOICE_DIRECTION_CHARS,
+    NEUTRAL_CHARACTER_VOICE_DIRECTION,
     NarrativePerson,
     Prominence,
     Roster,
     RosterCharacter,
     RosterNarration,
+    is_current_character_voice_direction,
 )
+from tts_audiobook_tool.speaker_assign.roster_util import RosterUtil
 
 
 # A roster in the on-disk shape the prototype's speaker_attribution.json uses.
@@ -54,6 +58,26 @@ def test_lookups() -> None:
     assert roster.narrator is not None and roster.narrator.id == "NARRATOR"
     assert roster.get("OLD_DOC") is roster.characters[1]
     assert roster.get("NOBODY") is None
+
+
+def test_voice_direction_round_trips_and_follows_the_kept_character() -> None:
+    baron = RosterCharacter("BARON", "Baron", voice_direction=NEUTRAL_CHARACTER_VOICE_DIRECTION)
+    his_alias = RosterCharacter("OLD_BARON", "Old Baron", voice_direction="Slightly deeper tone.")
+    assert RosterCharacter.from_dict(baron.to_dict()) == baron
+    assert is_current_character_voice_direction(baron.voice_direction)
+    assert RosterUtil.merge_character(baron, his_alias).voice_direction == NEUTRAL_CHARACTER_VOICE_DIRECTION
+    empty = dataclasses.replace(baron, voice_direction="")
+    assert RosterUtil.merge_character(empty, his_alias).voice_direction == his_alias.voice_direction
+    assert "voice_direction" not in empty.to_dict()
+    legacy = dataclasses.replace(baron, voice_direction="Rich resonance with steady pacing.")
+    assert RosterCharacter.from_dict(legacy.to_dict()) == legacy
+    assert not is_current_character_voice_direction(legacy.voice_direction)
+    assert RosterUtil.merge_character(legacy, his_alias).voice_direction == his_alias.voice_direction
+
+
+@pytest.mark.parametrize("direction", [None, 123, "", "<whisper>", "(laughs)", "a" * (MAX_CHARACTER_VOICE_DIRECTION_CHARS + 1)])
+def test_invalid_optional_voice_direction_is_ignored(direction: object) -> None:
+    assert RosterCharacter.from_dict({"id": "BARON", "voice_direction": direction}).voice_direction == ""
 
 
 @pytest.mark.parametrize("bad_id", ["Old Doc", "OLD DOC", "old_doc", "OLD__DOC", "_OLD", "OLD_", "", "OLD-DOC"])

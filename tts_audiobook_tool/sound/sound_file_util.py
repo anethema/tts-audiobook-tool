@@ -59,6 +59,10 @@ class SoundFileUtil:
         which gives the same samples librosa.load did; anything else (eg AAC/M4A)
         through the PyAV decoder. Never an external decoder.
         """
+        from tts_audiobook_tool.sound.aac_checkpoint import is_take_path, read_take
+
+        if is_take_path(path):
+            return read_take(path)
         try:
             data, sr = soundfile.read(path, dtype="float32", always_2d=True)
         except soundfile.LibsndfileError:
@@ -81,6 +85,17 @@ class SoundFileUtil:
             return ""
         except Exception as e:
             return f"Error saving sound file {flac_path}: {type(e)} {e}"
+
+    @staticmethod
+    def save_aac(sound: Sound, path: str, bitrate: str = AAC_BITRATE_DEFAULT) -> str:
+        """Saves a mono AAC checkpoint and returns any write error."""
+        from tts_audiobook_tool.sound.aac_checkpoint import save_take
+
+        try:
+            save_take(sound, path, bitrate)
+        except Exception as e:
+            return f"Error saving sound file {path}: {type(e)} {e}"
+        return ""
 
     @staticmethod
     def is_valid_sound_file(path: str) -> str:

@@ -51,10 +51,11 @@ def test_routine_validation_pass_output_is_optional(monkeypatch, quiet: bool) ->
         save = cast(MagicMock, GenerateUtil.save_sound_and_timing_json)
 
         def save_segment(_state, _group, index, _result, **_):
-            return ("disk full" if index == 2 else "", "saved.wav")
+            return ("disk full" if index == 3 else "", "saved.wav")
 
         save.side_effect = save_segment
-        assert not GenerateUtil.generate_files(state, {0, 1, 2, 3}, batch_size=1, is_regen=False, **options)
+        with pytest.raises(generate_util.CheckpointWriteError, match="disk full"):
+            GenerateUtil.generate_files(state, {0, 1, 2, 3}, batch_size=1, is_regen=False, **options)
         assert [item.kwargs["stt_info"] for item in save.call_args_list] == [
             "STT line 1", "STT line 2", "STT line 2", "STT line 3", "STT line 4",
         ]
@@ -149,7 +150,7 @@ def test_staged_generation_leaves_project_segments_and_range_alone(monkeypatch) 
 
     with (
         generate_files_mock_stack(lambda **_: [results.pop(0)]),
-        patch.object(generate_util, "prune_staged_segments") as prune,
+        patch.object(generate_util, "StagedCheckpoints") as staged,
     ):
         save = cast(MagicMock, GenerateUtil.save_sound_and_timing_json)
         did_interrupt = GenerateUtil.generate_files(
@@ -159,8 +160,9 @@ def test_staged_generation_leaves_project_segments_and_range_alone(monkeypatch) 
 
     assert not did_interrupt
     assert save_dirs == ["/staging/job", "/staging/job"]
-    assert prune.call_args_list == [call("/staging/job", 0), call("/staging/job", 0)]
-    sound_segments.delete_redundants_for.assert_not_called()
+    staged.assert_called_once_with("/staging/job")
+    assert all(c.kwargs["on_published"] is staged.return_value.record for c in save.call_args_list)
+    sound_segments.record_published_segment.assert_not_called()
     assert project.generate_range_string == "all"
     project.save.assert_not_called()
 

@@ -31,6 +31,9 @@ class GenerationProgress:
     # durations have been recorded in generate_files().
     eta_seconds: float | None = None
     speed_multiplier: float | None = None
+    # Lines whose final attempt has a durable checkpoint. Model errors can
+    # still contribute to processed, but never to saved.
+    saved: int | None = None
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,7 @@ class BookRenderTelemetry:
     total: int
     speed_multiplier: float | None = None
     eta_seconds: float | None = None
+    assembling: bool = False
 
 
 @dataclass(frozen=True)
@@ -105,8 +109,8 @@ class GenerationEvents:
     """Process-local, optional structured telemetry for synchronous generation.
 
     The active sink lives in a ``contextvar`` rather than a class attribute.
-    For the synchronous, single-threaded ``generate_files()`` path the
-    behavior of sequential and nested ``using_sink`` calls is identical to a
+    For events emitted by ``generate_files()`` the behavior of sequential
+    and nested ``using_sink`` calls is identical to a
     plain attribute swap. The contextvar additionally scopes the sink to the
     running context: an unrelated thread never inherits it (a fresh thread
     starts with an empty context), so a stray emit from another thread cannot

@@ -42,7 +42,10 @@ class BookActivity:
             counts = f"{done:,} of {progress.total:,} segments · {done / progress.total:.0%}"
             bar_values = f'max="{progress.total}" value="{done}"'
             eta = progress.eta_seconds
-            if not self.ended and done < progress.total and eta is not None and math.isfinite(eta) and eta > 0:
+            if (
+                not self.ended and not progress.assembling and done < progress.total
+                and eta is not None and math.isfinite(eta) and eta > 0
+            ):
                 duration = duration_string(math.ceil(eta), pad_seconds=True).replace("h", "h ").replace("m", "m ")
                 estimate = f' · <span title="Estimated time to finish generating audio">ETA {duration}</span>'
         else:
@@ -87,7 +90,7 @@ class SessionActivity:
             self._book_version += 1
 
     def update_book(self, value: BookRenderTelemetry) -> None:
-        label = "Finalizing audio" if value.total > 0 and value.processed >= value.total else "Generating audiobook"
+        label = "Assembling M4B" if value.assembling else "Generating audiobook"
         with self._lock:
             self._book = BookActivity(label, value)
             self._book_version += 1

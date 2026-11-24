@@ -20,10 +20,11 @@ class RuntimePanel:
     @staticmethod
     def snapshot(
         force_cpu, whisper_variant, whisper_device, save_generation_logs, aac_bitrate=AAC_BITRATE_DEFAULT,
+        checkpoint_format="flac",
     ) -> WebRuntimeSettings:
         return WebRuntimeSettings(
             force_cpu=force_cpu, whisper_variant=whisper_variant or None, whisper_device=whisper_device or None,
-            save_generation_logs=save_generation_logs, aac_bitrate=aac_bitrate,
+            save_generation_logs=save_generation_logs, aac_bitrate=aac_bitrate, checkpoint_format=checkpoint_format,
         )
 
 
@@ -54,6 +55,10 @@ def create_runtime_panel(book: gr.State, *, private_event: dict, app: gr.Blocks 
             )
         with gr.Row():
             bitrate = gr.Dropdown(label="Automatic M4B bitrate", choices=AAC_BITRATES, value=defaults.aac_bitrate)
+            checkpoint_format = gr.Radio(
+                label="Segment format for new renders", choices=[("FLAC", "flac"), ("AAC", "aac")],
+                value=defaults.checkpoint_format, info="Resuming a render uses its saved segment format.",
+            )
             save = gr.Button("Save browser preferences")
         status = gr.Textbox(label="Browser preferences", value=initial_status, interactive=False, visible=bool(initial_status))
         with gr.Row():
@@ -61,13 +66,14 @@ def create_runtime_panel(book: gr.State, *, private_event: dict, app: gr.Blocks 
             log = gr.File(label="Download generation log", interactive=False, visible=False)
         log_status = gr.Textbox(label="Generation log", interactive=False, visible=False)
 
-    panel = RuntimePanel((force_cpu, whisper_model, whisper_device, save_logs, bitrate))
+    panel = RuntimePanel((force_cpu, whisper_model, whisper_device, save_logs, bitrate, checkpoint_format))
 
     def restore_preferences():
         settings, message = read_preferences()
         return (
             settings.force_cpu, settings.whisper_variant or "", settings.whisper_device or "",
-            settings.save_generation_logs, settings.aac_bitrate, gr.update(value=message, visible=bool(message)),
+            settings.save_generation_logs, settings.aac_bitrate, settings.checkpoint_format,
+            gr.update(value=message, visible=bool(message)),
         )
 
     def save_preferences(*values):

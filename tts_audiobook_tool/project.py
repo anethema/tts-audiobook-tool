@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import replace
 import os
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationInfo, field_validator, model_validator
 
@@ -228,6 +228,7 @@ class Project(BaseModel):
     marker_indices: set[int] = Field(default_factory=set, alias="markers")
     subdivide_phrases: bool = False
     export_type: ExportType = list(ExportType)[0]
+    checkpoint_format: Literal["flac", "aac"] = "flac"
     use_break_sound_effect: bool = Field(default=PROJECT_DEFAULT_BREAK_EFFECT, alias="use_section_sound_effect")
     normalization_type: NormalizationType = list(NormalizationType)[0]
     high_shelf: str = HighShelfEq.DISABLED.id

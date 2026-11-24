@@ -1,5 +1,6 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 import os
 from typing import Any, Callable, TYPE_CHECKING
 
@@ -145,7 +146,7 @@ class TtsBaseModel(ABC):
             voice_selection_index: int = 0,
             print_params: bool = False,
             max_random_seed: int = -1,
-    ) -> list[Sound] | str:
+    ) -> Sequence[Sound | str] | str:
         """
         Generates Sound/s using the relevant TTS model attributes in the `project` object.
         Typically delegates-to/wraps a more "parameter-specific" concrete method.
@@ -173,7 +174,7 @@ class TtsBaseModel(ABC):
         :param print_params:
             If True, implementations should print the resolved generation parameters
         Returns:
-            A list of Sounds (one per prompt), or error string
+            A list of Sounds or row errors in prompt order, or a batch error string.
             Sound.data must be of np.dtype("float32")
 
         """

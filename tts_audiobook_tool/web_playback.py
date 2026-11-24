@@ -62,6 +62,8 @@ def play_book(
         cancel_event: Event | None = None, runtime_settings: WebRuntimeSettings | None = None,
         remote_selection: RemoteTtsSelection | None = None,
         on_console: Callable[[str], None] | None = None,
+        performance_cues: bool = False,
+        character_voices: bool = False,
 ) -> Iterator[PlaybackChunk]:
     """Yield ordered WAV chunks while the selected environment prepares the range."""
     from tts_audiobook_tool.app_types.book_serialization import book_to_project_text_json_dict
@@ -69,6 +71,10 @@ def play_book(
     cancel = cancel_event or Event()
     if type(first) is not int or type(last) is not int or not 1 <= first <= last <= len(session.book.phrase_groups):
         raise WebPlaybackError("Choose a valid playback range.")
+    if type(performance_cues) is not bool:
+        raise WebPlaybackError("Choose a valid performance cue setting.")
+    if type(character_voices) is not bool:
+        raise WebPlaybackError("Choose a valid character voice setting.")
     if (model_id == REMOTE_MODEL_ID) != (remote_selection is not None):
         raise WebPlaybackError("Choose a verified remote model before starting remote playback.")
     while not _RENDER_LOCK.acquire(timeout=0.1):
@@ -89,6 +95,8 @@ def play_book(
                 "voices": {role: asdict(voice) for role, voice in voices.items()},
                 "first": first, "last": last, "validate_audio": validate_audio, "batch_size": batch_size,
                 "model_options": model_options, "strictness": strictness, "max_retries": max_retries,
+                "performance_cues": performance_cues,
+                "character_voices": character_voices,
                 "runtime_settings": asdict(runtime_settings) if runtime_settings is not None else None,
                 "remote_selection": asdict(remote_selection) if remote_selection is not None else None,
             })
@@ -152,7 +160,7 @@ def _check_cancelled(cancel: Event) -> None:
 
 def _best_takes(work: Path, book: Book, first: int, last: int) -> dict[int, Path]:
     from tts_audiobook_tool.project_support.sound_segment_util import SoundSegmentUtil, get_segment_error_rank
-    from tts_audiobook_tool.web_render import _has_complete_audio
+    from tts_audiobook_tool.sound.checkpoint_audio import has_complete_audio
 
     audio = work / PROJECT_SOUND_SEGMENTS_SUBDIR
     if work.is_symlink() or audio.is_symlink() or not audio.is_dir():
@@ -164,7 +172,7 @@ def _best_takes(work: Path, book: Book, first: int, last: int) -> dict[int, Path
         candidates = sorted(takes.get(index, ()), key=lambda take: get_segment_error_rank(take, audio))
         for take in candidates:
             path = audio / take.file_name
-            if not path.is_symlink() and _has_complete_audio(path):
+            if not path.is_symlink() and has_complete_audio(path):
                 result[index + 1] = path
                 break
     return result
@@ -237,6 +245,7 @@ def _run_playback(
 ) -> None:
     from tts_audiobook_tool.app_types import Strictness
     from tts_audiobook_tool.reason_pauses import ReasonPauseTypes
+    from tts_audiobook_tool.tts_models.breeze_base_model import BreezeBaseModel
     from tts_audiobook_tool.tts_models.tts_model_type import TtsModelType
     from tts_audiobook_tool.web_render import (
         _cast_book, _checkpoint_id, _detect_model, _render_job, _validated_model_options, render_book,
@@ -247,6 +256,8 @@ def _run_playback(
     validate = payload["validate_audio"]
     strictness = payload["strictness"]
     retries = payload["max_retries"]
+    performance_cues = payload.get("performance_cues", False)
+    character_voices = payload.get("character_voices", False)
     renderer_options = (
         {"runtime_settings": WebRuntimeSettings(**payload["runtime_settings"])} if payload["runtime_settings"] else {}
     )
@@ -254,7 +265,12 @@ def _run_playback(
         renderer_options["remote_selection"] = remote_selection
     with _render_job(cancel):
         model = TtsModelType.require_by_id(remote_selection.catalog_id) if remote_selection is not None else _detect_model()
-        book, references = _cast_book(session, voices)
+        local_breeze = remote_selection is None and model.id == BreezeBaseModel.INFO.id
+        book, references = _cast_book(
+            session, voices,
+            performance_cues=performance_cues and local_breeze,
+            character_voices=character_voices and local_breeze,
+        )
         options = _validated_model_options(model.id, payload["model_options"])
         batch = payload["batch_size"] if model.can_batch() else 1
         run_id = _checkpoint_id(
@@ -307,6 +323,7 @@ def _run_playback(
     render_book(
         replace(session, project_dir=str(work)), voices, validate_audio=validate, batch_size=batch,
         model_options=options, strictness=strictness, max_retries=retries, first_line=next_line, last_line=last,
+        performance_cues=performance_cues, character_voices=character_voices,
         auto_concat=False, cancel_event=cancel, on_progress=report, on_console=on_console, **renderer_options,
     )
     report(0, 0)

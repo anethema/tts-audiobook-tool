@@ -56,6 +56,8 @@ class StubValidationResult:
 @contextmanager
 def generate_files_mock_stack(
         batch_side_effect: Any,
+        *,
+        mock_save: bool = True,
 ) -> Iterator[None]:
     patches = [
         patch(
@@ -82,12 +84,13 @@ def generate_files_mock_stack(
             "tts_audiobook_tool.generate_util.GenerateUtil.generate_and_validate_batch",
             side_effect=batch_side_effect,
         ),
-        patch(
-            "tts_audiobook_tool.generate_util.GenerateUtil.save_sound_and_timing_json",
-            return_value=("", "saved.wav"),
-        ),
         patch("tts_audiobook_tool.generate_util.Stt.has_instance", return_value=False),
     ]
+    if mock_save:
+        patches.append(patch(
+            "tts_audiobook_tool.generate_util.GenerateUtil.save_sound_and_timing_json",
+            return_value=("", "saved.wav"),
+        ))
 
     for patcher in patches:
         patcher.start()

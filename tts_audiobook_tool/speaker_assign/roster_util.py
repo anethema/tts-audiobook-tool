@@ -12,6 +12,7 @@ from tts_audiobook_tool.speaker_assign.roster import (
     Roster,
     RosterCharacter,
     RosterNarration,
+    is_current_character_voice_direction,
     name_key,
 )
 from tts_audiobook_tool.speaker_assign.speaker_assign_types import RESERVED_SPEAKER_IDS
@@ -210,18 +211,25 @@ class RosterUtil:
     def merge_character(target: RosterCharacter, other: RosterCharacter) -> RosterCharacter:
         """A duplicate entry folded into the first one: union of names/aliases, the
         first non-empty description, voice hint and known gender, the higher
-        prominence."""
+        prominence, and a preference for current voice directions."""
         aliases = list(target.aliases)
         known = target.name_keys()
         for alias in (other.name, *other.aliases):
             if name_key(alias) not in known:
                 aliases.append(alias)
                 known.add(name_key(alias))
+        voice_direction = target.voice_direction or other.voice_direction
+        if (
+            not is_current_character_voice_direction(voice_direction)
+            and is_current_character_voice_direction(other.voice_direction)
+        ):
+            voice_direction = other.voice_direction
         return dataclasses.replace(
             target,
             aliases=tuple(aliases),
             description=target.description or other.description,
             voice_hint=target.voice_hint or other.voice_hint,
+            voice_direction=voice_direction,
             gender=other.gender if target.gender == "unknown" else target.gender,
             prominence=max(target.prominence, other.prominence, key=lambda p: p.rank),
             is_narrator=target.is_narrator or other.is_narrator,

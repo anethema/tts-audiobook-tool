@@ -6,15 +6,15 @@ import hashlib
 import json
 import math
 import multiprocessing
+import os
 import tempfile
 import threading
 import time
 from collections.abc import Callable, Collection, Iterator
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from functools import cache
-from os import SEEK_END
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -24,7 +24,7 @@ from tts_audiobook_tool.app_support.interrupts import Interrupts
 from tts_audiobook_tool.app_types import Book, ExportType, RoomReverb, Sound, Strictness, SttConfig, SttVariant
 from tts_audiobook_tool.app_types.book_serialization import book_to_project_text_json_dict
 from tts_audiobook_tool.app_types.voice import VOLUME_DEFAULT, VOLUME_MAX, VOLUME_MIN, Voice
-from tts_audiobook_tool.constants import AAC_BITRATE_DEFAULT, PROJECT_JSON_FILE_NAME
+from tts_audiobook_tool.constants import AAC_BITRATE_DEFAULT, PROJECT_JSON_FILE_NAME, PROJECT_SOUND_SEGMENTS_SUBDIR
 from tts_audiobook_tool.constants_config import (
     IMPORT_LIMIT_SILENCE_DURATION_MAX,
     IMPORT_LIMIT_SILENCE_DURATION_MIN,
@@ -60,14 +60,22 @@ from tts_audiobook_tool.project import Project
 from tts_audiobook_tool.project_support.project_load_util import ProjectLoadUtil
 from tts_audiobook_tool.project_support.project_text_io_util import ProjectTextIOUtil
 from tts_audiobook_tool.project_support.project_voice_util import ProjectVoiceUtil
+from tts_audiobook_tool.sound.checkpoint_audio import has_complete_audio as _has_complete_audio
+from tts_audiobook_tool.speaker_assign.roster import (
+    NEUTRAL_CHARACTER_VOICE_DIRECTION,
+    is_current_character_voice_direction,
+)
+from tts_audiobook_tool.speaker_assign.speaker_assign_types import NOT_SPEECH
 from tts_audiobook_tool.state import State
 from tts_audiobook_tool.tts import Tts
+from tts_audiobook_tool.tts_models.breeze_base_model import BreezeBaseModel
 from tts_audiobook_tool.tts_models.model_spec import TtsBackendKind
 from tts_audiobook_tool.tts_models.tts_model_type import TtsModelType
 from tts_audiobook_tool.web_backend import UNIDENTIFIED_CAST_ROLES, canonical_cast_role
 from tts_audiobook_tool.web_runtime_settings import WebRuntimeSettings, WebRuntimeSettingsError
 
 if TYPE_CHECKING:
+    from tts_audiobook_tool.speaker_assign.roster import RosterCharacter
     from tts_audiobook_tool.textual.generation_app import GenerationTranscript
     from tts_audiobook_tool.web_backend import BookSession
     from tts_audiobook_tool.web_remote_models import RemoteTtsSelection
@@ -296,6 +304,7 @@ def _project_state(
                 language_code=language_code,
                 tts_model_type=model.id,
                 export_type=ExportType.AAC,
+                checkpoint_format=runtime_settings.checkpoint_format,
                 gen_auto_concat=False,
                 word_substitutions=word_substitutions or {},
                 strictness=strictness.id if strictness is not None else "",
@@ -416,6 +425,8 @@ def _wait_for_job(
                     L.w(event.message)
                 if event.status is GenerationTerminalStatus.CANCELLED:
                     raise WebRenderError("Rendering stopped.")
+                if event.message and event.message.startswith("CheckpointWriteError: "):
+                    raise WebRenderError(event.message.removeprefix("CheckpointWriteError: "))
                 raise WebRenderError("The model could not finish rendering the audio.")
             if isinstance(event, WorkerCommandCancelled):
                 raise WebRenderError("Rendering stopped.")
@@ -596,26 +607,69 @@ def transcribe_reference(
         return transcript
 
 
-def _cast_book(session: BookSession, voices: dict[str, RenderVoice]) -> tuple[Book, list[RenderVoice]]:
+def character_voice_instruction(character: RosterCharacter) -> str:
+    """Return the small, stable adjustment for automatic character casting."""
+    if character.is_narrator or character.id == _NARRATOR:
+        return ""
+    gender = character.gender.strip().casefold().replace("-", "").replace(" ", "")
+    gender_direction = {
+        "male": "Use a male voice.",
+        "female": "Use a female voice.",
+        "nonbinary": "The speaker is nonbinary.",
+    }.get(gender, "")
+    trait = character.voice_direction
+    if trait == NEUTRAL_CHARACTER_VOICE_DIRECTION or not is_current_character_voice_direction(trait):
+        trait = ""
+    return " ".join(filter(None, (gender_direction, trait)))
+
+
+def _cast_book(
+    session: BookSession, voices: dict[str, RenderVoice], *,
+    performance_cues: bool = False, character_voices: bool = False,
+) -> tuple[Book, list[RenderVoice]]:
     narrator = session.roster.narrator if session.roster else None
     narrator_id = narrator.id if narrator else _NARRATOR
     default_voice = RenderVoice()
     narrator_voice = voices.get(narrator_id, voices.get(_NARRATOR, default_voice))
-    speakers = session.attributions.speaker_of_each_line(session.book)
+    character_references: dict[str, RenderVoice] = {}
+    if character_voices and session.roster:
+        model_id = BreezeBaseModel.INFO.id
+        base_instructions = dict(narrator_voice.model_instructions)
+        base_direction = base_instructions.get(model_id, narrator_voice.instructions).strip()
+        for character in session.roster.characters:
+            if character.id not in voices and (instruction := character_voice_instruction(character)):
+                instructions = {**base_instructions, model_id: "\n".join(filter(None, (base_direction, instruction)))}
+                character_references[character.id] = replace(
+                    narrator_voice, model_instructions=tuple(instructions.items()),
+                )
+    attributions = {
+        line: utterance
+        for utterance in session.attributions.by_first_line(session.book).values()
+        for line in utterance.lines
+    }
     book = deepcopy(session.book)
     references = [narrator_voice]
     voice_indices = {narrator_voice: 0}
     for index, group in enumerate(book.phrase_groups):
+        utterance = attributions.get(index)
         settings = session.line_voices.get(group.voice_index) if group.voice_index > 0 else None
         if settings is None:
-            speaker = canonical_cast_role(speakers.get(index, narrator_id))
-            settings = voices.get(speaker, default_voice)
-            if settings == default_voice:
+            speaker = canonical_cast_role(utterance.speaker if utterance else narrator_id)
+            settings = voices.get(speaker)
+            if settings is None and group.is_dialog and utterance:
+                settings = character_references.get(speaker)
+            if settings is None or settings == default_voice:
                 settings = narrator_voice
         if settings not in voice_indices:
             voice_indices[settings] = len(references)
             references.append(settings)
         group.voice_index = voice_indices[settings]
+        group.delivery = None
+        if performance_cues and group.is_dialog and utterance and utterance.speaker != NOT_SPEECH and utterance.delivery:
+            delivery = utterance.delivery.with_boundaries(
+                before=index == utterance.first_line, after=index == utterance.lines[-1],
+            )
+            group.delivery = delivery if delivery else None
     return book, references
 
 
@@ -699,22 +753,8 @@ def _checkpoint_id(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _has_complete_audio(path: Path) -> bool:
-    import soundfile
-
-    try:
-        with soundfile.SoundFile(path) as audio:
-            audio.seek(-1, SEEK_END)
-            return bool(audio.read(1).size)
-    except (OSError, ValueError, soundfile.LibsndfileError):
-        return False
-
-
 def _missing_segments(project: Project, indices: Collection[int]) -> set[int]:
     """Scan requested takes, discarding files left incomplete by an interrupted write."""
-    from tts_audiobook_tool.project_support.sound_segment_util import get_segment_stt_info_path
-
-    project.sound_segments.force_invalidate()
     missing = set()
     for index in indices:
         while file_name := project.sound_segments.get_best_file_for(index):
@@ -722,9 +762,9 @@ def _missing_segments(project: Project, indices: Collection[int]) -> set[int]:
             if _has_complete_audio(path):
                 break
             L.w(f"Discarding unreadable segment {file_name} for resumed generation")
-            path.unlink(missing_ok=True)
-            get_segment_stt_info_path(path).unlink(missing_ok=True)
-            project.sound_segments.force_invalidate()
+            project.sound_segments.delete_sound_segment_and_sidecars(path)
+            if path.exists():
+                raise WebRenderError(f"The unreadable audio take could not be removed: {file_name}")
         else:
             missing.add(index)
     return missing
@@ -750,6 +790,8 @@ def render_book(
     runtime_settings: WebRuntimeSettings | None = None,
     remote_selection: RemoteTtsSelection | None = None,
     on_console: Callable[[str], None] | None = None,
+    performance_cues: bool = False,
+    character_voices: bool = False,
 ) -> str | None:
     """Generate a requested range and export when the whole book is ready."""
     from filelock import FileLock, Timeout
@@ -767,7 +809,7 @@ def render_book(
         raise WebRenderError("Choose a word error tolerance.")
     if type(max_retries) is not int or not PROJECT_MAX_RETRIES_MIN <= max_retries <= PROJECT_MAX_RETRIES_MAX:
         raise WebRenderError(f"Choose a retry count from {PROJECT_MAX_RETRIES_MIN} to {PROJECT_MAX_RETRIES_MAX}.")
-    if type(regenerate) is not bool or type(auto_concat) is not bool:
+    if not all(type(value) is bool for value in (regenerate, auto_concat, performance_cues, character_voices)):
         raise WebRenderError("Choose valid generation and export settings.")
     runtime_settings = runtime_settings or WebRuntimeSettings()
     selected = set(range(first_line - 1, last_line))
@@ -776,7 +818,12 @@ def render_book(
         options = _validated_model_options(model.id, model_options)
         if not model.can_batch():
             batch_size = 1
-        book, references = _cast_book(session, voices)
+        local_breeze = remote_selection is None and model.id == BreezeBaseModel.INFO.id
+        book, references = _cast_book(
+            session, voices,
+            performance_cues=performance_cues and local_breeze,
+            character_voices=character_voices and local_breeze,
+        )
         language_code = session.language_code if language_code is None else language_code
         voice_labels = _cast_voice_labels(session, voices, references)
         if on_console is not None:
@@ -850,11 +897,14 @@ def _render_book_checkpoint(
     eta_seconds = None
     previous_telemetry = None
 
-    def report_telemetry() -> None:
+    def report_telemetry(*, assembling: bool = False) -> None:
         nonlocal previous_telemetry
         if on_telemetry is not None:
             rate = audio_seconds / synthesis_seconds if synthesis_seconds else None
-            telemetry = BookRenderTelemetry(processed, total, rate, eta_seconds if processed < total else None)
+            telemetry = BookRenderTelemetry(
+                processed, total, rate, eta_seconds if not assembling and processed < total else None,
+                assembling=assembling,
+            )
             if telemetry != previous_telemetry:
                 on_telemetry(telemetry)
                 previous_telemetry = telemetry
@@ -898,7 +948,8 @@ def _render_book_checkpoint(
             def report_generation_progress(update: GenerationProgress) -> None:
                 nonlocal eta_seconds
                 eta_seconds = update.eta_seconds
-                report_progress(total - update.total + update.processed)
+                completed = update.saved if update.saved is not None else update.processed
+                report_progress(total - update.total + completed)
 
             def report_generation_stats(update: GenerationStats) -> None:
                 nonlocal synthesis_seconds, audio_seconds
@@ -925,6 +976,10 @@ def _render_book_checkpoint(
                 _check_cancelled(cancel_event)
                 if regenerate:
                     _publish_regenerated_takes(state.project, staging_dir, selected, output)
+                else:
+                    # The model worker owns a separate index. Its final write may
+                    # reach disk before the host receives its filesystem event.
+                    state.project.sound_segments.force_invalidate()
                 if missing := _missing_segments(state.project, selected):
                     raise WebRenderError(
                         f"The model did not produce audio for {len(missing)} of {total} text segments."
@@ -942,9 +997,15 @@ def _render_book_checkpoint(
             if on_console is not None:
                 on_console(f"Automatic export pending. {len(unrendered)} segments elsewhere in the book need audio.\n")
             return None
+        _check_cancelled(cancel_event)
         if on_console is not None:
             on_console("Proceeding to concatenation...\n")
-        return _export_checkpoint(state, output, len(book.phrase_groups), cancel_event)
+        report_telemetry(assembling=True)
+        assembly_start = time.monotonic()
+        result = _export_checkpoint(state, output, len(book.phrase_groups), cancel_event)
+        if on_console is not None:
+            on_console(f"M4B assembly completed in {time.monotonic() - assembly_start:.1f} seconds.\n")
+        return result
 
 
 @contextmanager
@@ -1009,6 +1070,7 @@ def _publish_regenerated_takes(project: Project, staging_dir: str, selected: set
                 published.append(destination_sidecar)
             path.replace(destination)
             published.append(destination)
+            project.sound_segments.record_published_segment(destination, prune=False)
     except OSError as error:
         L.w(str(error))
         try:
@@ -1018,14 +1080,28 @@ def _publish_regenerated_takes(project: Project, staging_dir: str, selected: set
                 previous_output.replace(output)
         except OSError as rollback_error:
             L.w(str(rollback_error))
-        raise WebRenderError("The new audio takes could not be saved.") from error
-    finally:
         project.sound_segments.force_invalidate()
+        raise WebRenderError("The new audio takes could not be saved.") from error
 
 
 def _export_stamp(audio: Path, bitrate: str) -> dict[str, str | int]:
     stat = audio.stat()
     return {"bitrate": bitrate, "size": stat.st_size, "modified_ns": stat.st_mtime_ns}
+
+
+def _segment_fingerprint(directory: Path) -> str:
+    """Detect changed audio and word timings, including in-place external edits."""
+    from tts_audiobook_tool.project_support.sound_segment_util import SOUND_SEGMENT_SUFFIXES
+
+    entries = []
+    with os.scandir(directory) as files:
+        for item in files:
+            suffix = os.path.splitext(item.name)[1].lower()
+            if suffix != ".json" and suffix not in SOUND_SEGMENT_SUFFIXES:
+                continue
+            stat = item.stat(follow_symlinks=False)
+            entries.append((item.name, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
+    return hashlib.sha256(json.dumps(sorted(entries)).encode("ascii")).hexdigest()
 
 
 def _automatic_export_matches(output: Path, bitrate: str) -> bool:
@@ -1042,7 +1118,10 @@ def _automatic_export_matches(output: Path, bitrate: str) -> bool:
     except (OSError, ValueError):
         return False
     try:
-        return saved == _export_stamp(output, bitrate)
+        expected = _export_stamp(output, bitrate)
+        if isinstance(saved, dict) and "segments" in saved:
+            expected["segments"] = _segment_fingerprint(output.parent / PROJECT_SOUND_SEGMENTS_SUBDIR)
+        return saved == expected
     except OSError:
         return False
 
@@ -1053,6 +1132,7 @@ def _export_checkpoint(state: State, output: Path, total: int, cancel_event: thr
     staging_dir = output.parent / "export"
     staging_dir.mkdir(exist_ok=True)
     interrupts = Interrupts()
+    source_signature = _segment_fingerprint(Path(state.project.sound_segments_path))
     interrupts.set_external_event(cancel_event)
     try:
         path, error = ConcatUtil.make_file(
@@ -1072,7 +1152,9 @@ def _export_checkpoint(state: State, output: Path, total: int, cancel_event: thr
     replacement = Path(path)
     prepared_marker = staging_dir / "aac-bitrate.json"
     try:
-        prepared_marker.write_text(json.dumps(_export_stamp(replacement, state.prefs.aac_bitrate)), encoding="utf-8")
+        stamp = _export_stamp(replacement, state.prefs.aac_bitrate)
+        stamp["segments"] = source_signature
+        prepared_marker.write_text(json.dumps(stamp), encoding="utf-8")
         # Publish the new file's stamp first. If interrupted before the audio
         # rename, the stamp cannot be mistaken for a matching old export.
         prepared_marker.replace(output.with_suffix(".bitrate.json"))

@@ -238,6 +238,8 @@ class AacWriter(AudioWriter):
             channels: int,
             bitrate: str = AAC_BITRATE_DEFAULT,
             metadata: dict[str, str] | None = None,
+            *,
+            checkpoint: bool = False,
     ) -> None:
         super().__init__(dest_path, sample_rate, channels)
         import av
@@ -259,10 +261,10 @@ class AacWriter(AudioWriter):
         except Exception as e:
             self._fail_on_open(e)
         try:
-            self._container = av.open(
-                self._file, mode="w", format=container_format,
-                options={"movflags": "+faststart"},
-            )
+            options = {"movflags": "+faststart", "movie_timescale": str(sample_rate)}
+            if checkpoint:
+                options["movflags"] += "+use_metadata_tags"
+            self._container = av.open(self._file, mode="w", format=container_format, options=options)
             for key, value in (metadata or {}).items():
                 self._container.metadata[key] = value
             self._stream = self._container.add_stream("aac", rate=sample_rate, layout=self._layout)
@@ -302,17 +304,7 @@ class AacWriter(AudioWriter):
             # Flush the encoder's delayed packets
             self._container.mux(self._stream.encode(None))
             if self._chapters:
-                time_base = Fraction(1, 1000)
-                self._container.set_chapters([
-                    {
-                        "id": index + 1,
-                        "start": round(chapter.start * 1000),
-                        "end": round(chapter.end * 1000),
-                        "time_base": time_base,
-                        "metadata": {"title": chapter.title},
-                    }
-                    for index, chapter in enumerate(self._chapters)
-                ])
+                set_mp4_chapters(self._container, self._chapters, self.sample_rate)
             self._container.close()
         finally:
             # Flushes Python's buffer; raises if that fails
@@ -408,6 +400,20 @@ def open_writer(
     if suffix == ".flac":
         return FlacWriter(dest_path, sample_rate, channels)
     raise ValueError(f"Unsupported output file type: {dest_path}")
+
+
+def set_mp4_chapters(container, chapters: Sequence[Chapter], time_scale: int) -> None:
+    time_base = Fraction(1, time_scale)
+    container.set_chapters([
+        {
+            "id": index + 1,
+            "start": round(chapter.start * time_scale),
+            "end": round(chapter.end * time_scale),
+            "time_base": time_base,
+            "metadata": {"title": chapter.title},
+        }
+        for index, chapter in enumerate(chapters)
+    ])
 
 
 def _delete_silently(path: str) -> None:

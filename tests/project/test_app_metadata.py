@@ -418,6 +418,7 @@ class TestAppMetadata(unittest.TestCase):
                  patch.object(ConcatUtil, "concatenate_sound_segments", return_value=ConcatRenderResult(durations=[1.0, 2.0, 3.0, 4.0])) as concat_mock, \
                  patch("tts_audiobook_tool.concat_util.make_app_metadata_sections", return_value=sections), \
                  patch("tts_audiobook_tool.concat_util.AppMetadata.save_to_mp4", return_value="") as save_to_mp4_mock, \
+                 patch("tts_audiobook_tool.concat_util.os.replace") as publish_mock, \
                  patch("tts_audiobook_tool.concat_util.delete_silently"):
                 result_path, err = ConcatUtil.make_file(
                     state=cast(State, state),
@@ -439,8 +440,8 @@ class TestAppMetadata(unittest.TestCase):
             save_to_mp4_mock.assert_called_once()
             self.assertEqual(save_to_mp4_mock.call_args.args[0].version, ABR_VERSION)
             self.assertEqual(save_to_mp4_mock.call_args.args[0].type, "generated")
-            self.assertEqual(save_to_mp4_mock.call_args.args[1], stem_path + " [concat].m4b")
-            self.assertEqual(save_to_mp4_mock.call_args.args[2], stem_path + ".abr.m4b")
+            self.assertEqual(save_to_mp4_mock.call_args.args[1:], (stem_path + " [concat].m4b",))
+            publish_mock.assert_called_once_with(stem_path + " [concat].m4b", stem_path + ".abr.m4b")
 
     @pytest.mark.no_ffmpeg_exe
     def test_concat_make_file_chapters_use_only_the_output_ranges_durations(self):

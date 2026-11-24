@@ -3,6 +3,7 @@ from enum import Enum
 from functools import total_ordering
 
 from tts_audiobook_tool.app_support import app_text
+from tts_audiobook_tool.app_types.delivery_cue import DeliveryCue
 from tts_audiobook_tool.text_ops import roman_heading, text_format
 from tts_audiobook_tool.util import *
 from tts_audiobook_tool.constants import *
@@ -124,6 +125,8 @@ class PhraseGroup:
             phrases: list[Phrase] | None = None,
             voice_index: int = 0,
             is_dialog: bool = False,
+            *,
+            delivery: DeliveryCue | None = None,
     ):
         self._presentable_text_memo: str | None = None
         self._presentable_text_lf_ansi_memo: str | None = None
@@ -134,6 +137,7 @@ class PhraseGroup:
         # segmentation, which isolates dialog into groups of its own).
         # Independent of voice_index. See docs-dev/dialog-segmentation.md
         self.is_dialog = is_dialog
+        self.delivery = delivery if delivery else None
 
     @property
     def phrases(self) -> list[Phrase]:
@@ -242,6 +246,8 @@ class PhraseGroup:
         if self.is_dialog:
             # Written only when set
             result["is_dialog"] = True
+        if self.delivery:
+            result["delivery"] = self.delivery.to_dict()
         result["phrases"] = self.to_json_dict_list()
         return result
 
@@ -268,10 +274,12 @@ class PhraseGroup:
                     else 0
                 )
                 is_dialog = value.get("is_dialog", False) is True
+                delivery = DeliveryCue.from_dict(value.get("delivery"))
             else:
                 phrase_dicts = value
                 voice_index = 0
                 is_dialog = False
+                delivery = None
 
             if not isinstance(phrase_dicts, list):
                 return f"Expected phrase list: {phrase_dicts}"
@@ -293,7 +301,7 @@ class PhraseGroup:
                 return err
 
             phrases = result
-            group = PhraseGroup(phrases, voice_index=voice_index, is_dialog=is_dialog)
+            group = PhraseGroup(phrases, voice_index=voice_index, is_dialog=is_dialog, delivery=delivery)
             text_groups.append(group)
 
         return text_groups

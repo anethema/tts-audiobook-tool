@@ -5,13 +5,14 @@ from enum import Enum
 from importlib import metadata
 from importlib import util
 import os
-from typing import TYPE_CHECKING, Callable, cast
+from typing import TYPE_CHECKING, Any, Callable, cast
 
 if TYPE_CHECKING:
     from tts_audiobook_tool.app_support.remote_tts_discovery import RemoteTtsSnapshot
     from tts_audiobook_tool.project import Project
 
 from tts_audiobook_tool.app_types import DeviceType, ReadinessIssue, StreamChunkCallback, StreamEndCallback
+from tts_audiobook_tool.app_types.delivery_cue import DeliveryCue
 from tts_audiobook_tool.app_types.phrase import Reason
 
 from tts_audiobook_tool.tts_models.breeze_base_model import BreezeBaseModel
@@ -636,6 +637,7 @@ class Tts:
             max_random_seed: int = -1,
             *,
             log_prompts: bool = False,
+            delivery_cues: list[DeliveryCue | None] | None = None,
     ):
         """
         All app-level TTS generation goes through this function.
@@ -653,7 +655,8 @@ class Tts:
         only the catalog policy applies; unconfigured models keep their native
         ranges. Fixed seeds are never limited by this cap. With log_prompts,
         each fully prepared prompt (the exact text handed to the model) is
-        written to the debug log.
+        written to the debug log. Local Breeze accepts delivery cues in prompt
+        order and adds their event tags after spoken text preparation.
         """
         if (project.get_tts_model_type().id == "none" or Tts.get_active_type() != project.get_tts_model_type()
                 or (project.audio_cpp_model_id and project.audio_cpp_model_id != Tts._selected_server_model_id)):
@@ -682,10 +685,7 @@ class Tts:
             )
             for prompt in prompts
         ]
-        if log_prompts:
-            for prepared_prompt in prepared_prompts:
-                L.d(f"TTS prompt: chars={len(prepared_prompt)} | {prepared_prompt!r}")
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "on_stream_chunk": on_stream_chunk,
             "on_stream_end": on_stream_end if on_stream_end is not None else project.on_stream_end,
             "voice_selection_index": voice_selection_index,
@@ -693,6 +693,19 @@ class Tts:
         }
         if Tts._type.value.backend_kind in (TtsBackendKind.SGL_OMNI, TtsBackendKind.AUDIO_CPP):
             kwargs["print_generation_request"] = print_generation_request
+        if delivery_cues is not None and Tts._type.id == BreezeBaseModel.INFO.id:
+            if len(delivery_cues) != len(prepared_prompts):
+                return "Breeze delivery cues must match the number of prompts"
+            prepared_prompts = [
+                BreezeBaseModel.apply_delivery_events(prompt, cue)
+                for prompt, cue in zip(prepared_prompts, delivery_cues)
+            ]
+            delivery_directions = [cue.direction if cue is not None else "" for cue in delivery_cues]
+            if any(delivery_directions):
+                kwargs["delivery_directions"] = delivery_directions
+        if log_prompts:
+            for prepared_prompt in prepared_prompts:
+                L.d(f"TTS prompt: chars={len(prepared_prompt)} | {prepared_prompt!r}")
 
         return instance.generate_using_project(
             project=project,

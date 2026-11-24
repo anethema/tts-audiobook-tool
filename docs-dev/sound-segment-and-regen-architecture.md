@@ -14,13 +14,11 @@ This document describes:
 
 ### 1. Where Sound Segment Files Are Saved
 
-Generated audio for each text segment is saved as a `.flac` file in the project's `sound_segments/` subdirectory.
+The project's `segments/` directory stores FLAC takes by default. In the browser, **Speech runtime preferences → Segment format for new renders** also offers AAC (`.m4a`). Each render project records its checkpoint format in `project.json`. Older projects resume in FLAC.
 
-- **Directory path**: `{project.dir_path}/sound_segments/` (the subdirectory name is defined by the constant `PROJECT_SOUND_SEGMENTS_SUBDIR`).
-- **Project model** (`project.py`): exposes this path via the `sound_segments_path` property.
-- **Directory watcher** (`ProjectSoundSegments.__init__` in `project_sound_segments.py`): uses `watchdog` to monitor this directory for file creation/deletion/move events. When a `.flac` file that parses as a valid `SoundSegment` is added or removed, the in-memory catalog is marked dirty and rebuilt on next access.
-- **Saving** (`GenerateUtil.save_sound_and_timing_json` in `generate_util.py`, line 463): calls `SoundFileUtil.save_flac()` to write the `.flac`, and optionally writes a parallel `.json` file containing timing/alignment metadata (generated via `ForceAlignUtil`).
-- **Parallel files**: For each `[tags]...text.flac`, there can be a `[tags]...text.json` (timing data) and a `[tags]...text.debug.json` (debug info, if debug saving is enabled).
+`ProjectSoundSegments` builds the index from disk on first use. The writer publishes the timing JSON, then the audio, and updates the affected line before reporting a save. The watcher reconciles individual paths against disk, including both ends of a rename. Directory replacement and explicit recovery trigger a full rebuild.
+
+AAC encoding, publication and pruning run on a bounded CPU worker while synthesis continues. Generation waits for outstanding writes before exporting. Compatible mono AAC takes can be copied into the M4B. The exporter adjusts pauses to fit AAC packet boundaries and records the resulting line durations in chapter and reader metadata. Joins without enough silence and takes needing different processing can be rebuilt. Effects spanning the mix use continuous waveform export.
 
 ### 2. Sound Segment Filename Schema
 
@@ -82,7 +80,7 @@ num_errors = int(tags[4]) if len(tags) >= 5 and tags[4].isdigit() else -1
 
 **File eligibility for inclusion in the catalog** (`SoundSegmentUtil.make_sound_segments_map()`, line 22):
 
-A `.flac` file is only included in the sound segments map if:
+FLAC and M4A files enter the sound segment map when they meet these conditions.
 
 1. It has a valid `SoundSegment` structure (parsable tags).
 2. Its index is within bounds of the current `phrase_groups` list.

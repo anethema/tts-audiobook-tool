@@ -23,6 +23,7 @@ from tts_audiobook_tool.app_types.validation_findings import ValidationFindings
 from tts_audiobook_tool.constants import PROJECT_SEGMENTS_TEMP_SUBDIR
 from tts_audiobook_tool.project import Project
 from tts_audiobook_tool.project_support.sound_segment_util import (
+    SOUND_SEGMENT_SUFFIXES,
     UNKNOWN_ERROR_RANK,
     SoundSegmentUtil,
     get_segment_error_rank,
@@ -52,7 +53,7 @@ def list_staged_segments(
         return []
     result: list[tuple[Path, SoundSegment]] = []
     for path in sorted(directory.iterdir()):
-        if not path.is_file() or path.suffix.lower() != ".flac":
+        if path.suffix.lower() not in SOUND_SEGMENT_SUFFIXES or not path.is_file():
             continue
         if path.stat().st_size == 0:
             continue
@@ -108,10 +109,16 @@ def accept_staged_segment(project: Project, phrase_index: int, staged_path: Path
     # The catalog lists only segments matching the line's current text, the
     # same set a delete of the line's generated sound would remove.
     old_paths = [
-        dest_dir / segment.file_name
-        for segment in project.sound_segments.sound_segments_map.get(phrase_index, [])
+        dest_dir / name for name in project.sound_segments.get_filenames_for(phrase_index)
     ]
     dest_path = dest_dir / staged_path.name
+    # A FLAC and an AAC take with the same stem share one JSON path.
+    # Publish under a fresh stem while the other format still owns its timings.
+    if any(
+        dest_path.with_suffix(suffix).exists()
+        for suffix in SOUND_SEGMENT_SUFFIXES if suffix != dest_path.suffix.lower()
+    ):
+        dest_path = dest_path.with_stem(f"{dest_path.stem} [take {uuid.uuid4().hex}]")
     staged_json = get_segment_stt_info_path(staged_path)
     dest_json = get_segment_stt_info_path(dest_path)
     backup_dir = staged_path.parent / "replaced"
@@ -145,8 +152,10 @@ def accept_staged_segment(project: Project, phrase_index: int, staged_path: Path
         if rollback_failed:
             message += " (previous sound could not be restored)"
         return message
-    stale_paths = [path for path in old_paths if path.name != dest_path.name]
-    project.sound_segments.delete_path_snapshot(stale_paths)
+    project.sound_segments.record_published_segment(dest_path, prune=False)
+    for old_path in old_paths:
+        if old_path != dest_path:
+            project.sound_segments.delete_sound_segment_and_sidecars(old_path)
     shutil.rmtree(backup_dir, ignore_errors=True)
     return ""
 

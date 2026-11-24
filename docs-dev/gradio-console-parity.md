@@ -35,6 +35,8 @@ The browser interface should cover each console workflow with the same project, 
 | LoRA | Adapter options in Speech Models for Breeze, OmniVoice and VibeVoice. |
 | Assign voice selections to arbitrary lines | Inclusive line and range assignment from the named library, including clear and review. Console manual assignments copy where references are available. |
 | Build character roster and attribute dialogue | **Analyze book** discovers characters and attributes dialogue in the same request per chunk. The browser log shows progress, and completed chunks can be reused. |
+| Add subtle character voice direction with Breeze TTS 2 | **Use subtle Breeze direction for unassigned characters** uses the narrator voice and reference settings during local Breeze generation and realtime playback. Analysis records character gender where the text supports it and can add one slight change in tone or pace. The roster and dialogue review show these optional traits. Explicit voice assignments take precedence. Choose **Automatic** in the character's voice source and save the assignment to restore automatic casting. The switch starts on for new browser sessions, is saved with the project, and opens off for older projects without the setting. |
+| Direct a dialogue performance with Breeze TTS 2 | **Ask the LLM for dialogue performance cues** and **Use saved Breeze performance cues** start on for new browser books. Each setting is saved with the project and opens off when missing from older projects. **Review dialogue assignments** shows the proposed directions and vocal events. Toggle **Use saved Breeze performance cues** in generation settings to compare directed and plain renders of the same chapter. |
 | Review attribution and map named characters to voices | Per-section correction, direct character references, and named library selection. |
 
 ## Generate and export
@@ -51,6 +53,8 @@ The browser interface should cover each console workflow with the same project, 
 | Section sound effect, phrase subdivisions, normalization and loudness | Available in Export options. |
 | Upsampling, stereo reverb, room tone, and treble EQ | Available in Export options. Live LavaSR is unverified. |
 | Open generated book in synchronized player | Served locally from the bundled reader and launched from the export history. |
+
+For a line-by-line Breeze comparison, set a **Seed** under **Speech Models** and click **Apply model settings**. Use batch size 1, maximum retries 0, and leave **Generate new takes for this range** unchecked in both renders. Breeze seeds each batch, and retries and new takes deliberately draw fresh seeds.
 
 ## Playback, chat, preferences, and tools
 

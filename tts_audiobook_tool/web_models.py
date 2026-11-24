@@ -107,6 +107,8 @@ def render_model_book(
     runtime_settings: WebRuntimeSettings | None = None,
     remote_selection: RemoteTtsSelection | None = None,
     on_console: Callable[[str], None] | None = None,
+    performance_cues: bool = False,
+    character_voices: bool = False,
 ) -> str | None:
     from tts_audiobook_tool.app_types.book_serialization import book_to_project_text_json_dict
 
@@ -115,6 +117,7 @@ def render_model_book(
         dict(
             action="book",
             include_progress_eta=True,
+            include_progress_assembly=True,
             book=book_to_project_text_json_dict(session.book),
             project_dir=session.project_dir,
             roster=session.roster.to_dict() if session.roster else None,
@@ -130,6 +133,8 @@ def render_model_book(
             last_line=last_line,
             regenerate=regenerate,
             auto_concat=auto_concat,
+            performance_cues=performance_cues,
+            character_voices=character_voices,
             strictness=strictness,
             max_retries=max_retries,
             runtime_settings=asdict(runtime_settings) if runtime_settings is not None else None,
@@ -304,9 +309,12 @@ def _worker(directory: Path) -> None:
 
             def report(telemetry: BookRenderTelemetry) -> None:
                 snapshot = asdict(telemetry)
+                # A running browser server can launch a newer child while
+                # its own progress decoder still uses an older schema.
                 if not payload.get("include_progress_eta"):
-                    # An already running browser server may use the old telemetry schema.
                     snapshot.pop("eta_seconds", None)
+                if not payload.get("include_progress_assembly"):
+                    snapshot.pop("assembling", None)
                 _write_json(directory / "progress.json", snapshot)
 
             voices = {name: RenderVoice(**voice) for name, voice in payload["voices"].items()}
@@ -316,6 +324,8 @@ def _worker(directory: Path) -> None:
                 model_options=payload.get("model_options"),
                 first_line=payload.get("first_line", 1), last_line=payload.get("last_line"),
                 regenerate=payload.get("regenerate", False), auto_concat=payload.get("auto_concat", True),
+                performance_cues=payload.get("performance_cues", False),
+                character_voices=payload.get("character_voices", False),
                 strictness=payload.get("strictness"),
                 max_retries=payload.get("max_retries", PROJECT_MAX_RETRIES_DEFAULT),
                 runtime_settings=runtime_settings,

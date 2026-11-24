@@ -77,17 +77,18 @@ def make_project(tmp_path: Path) -> Project:
         return result
 
     class SoundSegments:
-        @property
-        def sound_segments_map(self) -> dict:
-            return sound_segments_map()
+        def get_filenames_for(self, index) -> list[str]:
+            return [segment.file_name for segment in sound_segments_map().get(index, [])]
+
+        def record_published_segment(self, path, *, prune):
+            assert path.is_file() and not prune
 
         def force_invalidate(self) -> None:
             pass
 
-        def delete_path_snapshot(self, paths) -> None:
-            for path in paths:
-                Path(path).unlink(missing_ok=True)
-                Path(path).with_suffix(".json").unlink(missing_ok=True)
+        def delete_sound_segment_and_sidecars(self, path) -> None:
+            path.unlink(missing_ok=True)
+            path.with_suffix(".json").unlink(missing_ok=True)
 
     return cast(
         Project,
@@ -157,6 +158,23 @@ def test_failed_accept_restores_same_named_old_pair(tmp_path, monkeypatch, fail_
     assert staged.with_suffix(".json").read_text() == "new json"
 
 
+def test_accept_aac_with_existing_flac_stem_keeps_original_pair_until_publication(tmp_path, monkeypatch):
+    old = write_segment(tmp_path / "segments", segment_name(None))
+    staged = write_segment(tmp_path / "temp", old.with_suffix(".m4a").name)
+    move = staging._move
+
+    def observe_move(source, target):
+        assert old.exists()
+        assert old.with_suffix(".json").read_text() == old.name
+        move(source, target)
+
+    monkeypatch.setattr(staging, "_move", observe_move)
+    assert staging.accept_staged_segment(make_project(tmp_path), 2, staged) == ""
+    kept, = old.parent.glob("*.m4a")
+    assert kept.stem != old.stem and kept.with_suffix(".json").read_text() == staged.name
+    assert not old.exists() and not old.with_suffix(".json").exists()
+
+
 def test_failed_rollback_is_reported(tmp_path, monkeypatch) -> None:
     # When publishing the new audio fails (move 4) and restoring the old
     # audio also fails (move 7, the last undo), the error says the previous
@@ -183,23 +201,19 @@ def test_project_best_item_prefers_validated_clean_take(tmp_path) -> None:
     # The project catalog uses the same ranking as staging: a clean take
     # (untagged, with sidecar) beats a take with word errors, while an
     # untagged take without a sidecar (unknown) ranks worst.
-    from tts_audiobook_tool.project_support.project_sound_segments import ProjectSoundSegments
+    from tts_audiobook_tool.app_types.phrase import Phrase, PhraseGroup, Reason
 
+    project = Project(dir_path=str(tmp_path))
+    project.phrase_groups = [PhraseGroup([Phrase("Text", Reason.SENTENCE)]) for _ in range(3)]
     segments = tmp_path / "segments"
-    failed = SoundSegmentUtil.make_from_file_name(segment_name(4, "A"))
-    clean = SoundSegmentUtil.make_from_file_name(
-        write_segment(segments, segment_name(None, "B")).name
-    )
-    unknown = SoundSegmentUtil.make_from_file_name(
-        write_segment(segments, segment_name(None, "C"), sidecar=False).name
-    )
-    catalog = cast(ProjectSoundSegments, SimpleNamespace(
-        project=SimpleNamespace(sound_segments_path=str(segments)),
-        sound_segments_map={2: [unknown, failed, clean]},
-    ))
-    assert ProjectSoundSegments.get_best_item_for(catalog, 2) == clean
-    catalog.sound_segments_map[2] = [unknown, failed]
-    assert ProjectSoundSegments.get_best_item_for(catalog, 2) == failed
+    digest = SoundSegmentUtil.calc_segment_hash(2, project.phrase_groups[2].text)
+    failed = write_segment(segments, segment_name(4, "A").replace(HASH, digest))
+    clean = write_segment(segments, segment_name(None, "B").replace(HASH, digest))
+    write_segment(segments, segment_name(None, "C").replace(HASH, digest), sidecar=False)
+    catalog = project.sound_segments
+    assert catalog.get_best_file_for(2) == clean.name
+    catalog.delete_sound_segment_and_sidecars(clean)
+    assert catalog.get_best_file_for(2) == failed.name
 
 
 def test_describe_word_errors(tmp_path) -> None:

@@ -186,7 +186,8 @@ def test_encoder_write_failure_is_reported_not_swallowed(out_dir: Path) -> None:
     assert_no_handles(dest, "/dev/full")
 
 
-def test_make_file_end_to_end_m4b(out_dir: Path) -> None:
+@pytest.mark.parametrize("checkpoint_suffix", [".flac", ".m4a"])
+def test_make_file_end_to_end_m4b(out_dir: Path, checkpoint_suffix: str) -> None:
     # The whole export flow with little stubbed: real segment rendering, the
     # AAC writer with chapters, then the ABR tag on the final file. Only the
     # final file remains. Segment files go through the real SoundFileUtil.load.
@@ -198,6 +199,7 @@ def test_make_file_end_to_end_m4b(out_dir: Path) -> None:
     from tts_audiobook_tool.app_types.app_metadata import AppMetadata
     from tts_audiobook_tool.concat_util import ConcatUtil
     from tts_audiobook_tool.project_support.project_text_io_util import ProjectTextIOUtil
+    from tts_audiobook_tool.sound.sound_file_util import SoundFileUtil
     from tts_audiobook_tool.state import State
     from no_ffmpeg_guard import no_ffmpeg_exe
 
@@ -208,8 +210,11 @@ def test_make_file_end_to_end_m4b(out_dir: Path) -> None:
         if not seconds:
             segment_paths.append("")
             continue
-        path = out_dir / f"segment {i} ü.flac"
-        soundfile.write(str(path), burst(seconds), SR, subtype="PCM_16")
+        path = out_dir / f"segment {i} ü{checkpoint_suffix}"
+        if checkpoint_suffix == ".m4a":
+            assert SoundFileUtil.save_aac(Sound(burst(seconds), SR), str(path)) == ""
+        else:
+            soundfile.write(str(path), burst(seconds), SR, subtype="PCM_16")
         segment_paths.append(str(path))
     pairs = [(phrase, path) for (phrase, _), path in zip(phrases_and_paths(), segment_paths)]
     state = SimpleNamespace(project=project, prefs=SimpleNamespace(aac_bitrate="96k", save_debug_files=False))

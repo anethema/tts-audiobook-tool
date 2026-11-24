@@ -1,5 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
+from stat import S_ISREG
 from tts_audiobook_tool.app_support import app_hashing
 from tts_audiobook_tool.app_types import SoundSegment
 from tts_audiobook_tool.constants import *
@@ -15,6 +16,7 @@ from tts_audiobook_tool.app_types.validation_result import ValidationResult
 # Voice tag written into segment file names when no voice clone was used
 # (see ProjectVoiceUtil / base TtsModel.get_voice_tag).
 NONE_VOICE_TAG = "none"
+SOUND_SEGMENT_SUFFIXES = frozenset({".flac", ".m4a"})
 
 
 def get_segment_stt_info_path(sound_path: str | Path) -> Path:
@@ -68,7 +70,7 @@ class SoundSegmentUtil:
 
         try:
             idx_1b = int(tags[0])
-        except:
+        except ValueError:
             return None
         if idx_1b < 1:
             return None
@@ -80,7 +82,7 @@ class SoundSegmentUtil:
 
         model = tags[2] if len(tags) >= 3 and tags[2] in TtsModelType.all_file_tags() else ""
         voice = tags[3] if len(tags) >= 4 else ""
-        num_errors = int(tags[4]) if len(tags) >= 5 and tags[4].isdigit() else -1
+        num_errors = int(tags[4]) if len(tags) >= 5 and tags[4].isdecimal() else -1
 
         return SoundSegment(
             file_name=file_name, idx=index_0b, hash=hash,
@@ -88,42 +90,43 @@ class SoundSegmentUtil:
         )
 
     @staticmethod
+    def is_current_segment(segment: SoundSegment, project: Project) -> bool:
+        phrase_groups = project.phrase_groups
+        if not 0 <= segment.idx < len(phrase_groups):
+            return False
+        return segment.hash == SoundSegmentUtil.calc_segment_hash(
+            segment.idx, phrase_groups[segment.idx].text
+        )
+
+    @staticmethod
+    def is_nonempty_file(path: Path) -> bool:
+        try:
+            info = path.stat()
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        return S_ISREG(info.st_mode) and info.st_size > 0
+
+    @staticmethod
     def make_sound_segments_map(project: Project) -> dict[int, list[SoundSegment]]:
-        """
-        """
+        """Scan the project for nonempty takes matching the current text."""
+        result: dict[int, list[SoundSegment]] = {}
         if not project.dir_path:
+            return result
+
+        try:
+            for path in Path(project.sound_segments_path).iterdir():
+                if path.suffix.lower() not in SOUND_SEGMENT_SUFFIXES:
+                    continue
+                segment = SoundSegmentUtil.make_from_file_name(path.name)
+                if (
+                    segment is not None
+                    and SoundSegmentUtil.is_current_segment(segment, project)
+                    and SoundSegmentUtil.is_nonempty_file(path)
+                ):
+                    result.setdefault(segment.idx, []).append(segment)
+        except (FileNotFoundError, NotADirectoryError):
             return {}
-        if not os.path.exists(project.sound_segments_path):
-            return {}
-
-        map = dict[int, list[SoundSegment]]()
-
-        for path in Path(project.sound_segments_path).iterdir():
-
-            if not path.is_file():
-                continue
-            if os.path.getsize(path) == 0:
-                continue
-            if path.suffix.lower() != ".flac":
-                continue
-
-            sound_segment = SoundSegmentUtil.make_from_file_name(path.name)
-            if sound_segment is None:
-                continue
-            index = sound_segment.idx
-            if index >= len(project.phrase_groups):
-                continue
-
-            phrase_group = project.phrase_groups[sound_segment.idx]
-            segment_hash = SoundSegmentUtil.calc_segment_hash(index, phrase_group.text)
-            if sound_segment.hash != segment_hash:
-                continue
-
-            if not map.get(index, []):
-                map[sound_segment.idx] = []
-            map[index].append(sound_segment)
-
-        return map
+        return result
 
     @staticmethod
     def make_file_name(

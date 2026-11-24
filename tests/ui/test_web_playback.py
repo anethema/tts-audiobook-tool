@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import nullcontext
+from dataclasses import replace
 from io import BytesIO
 import json
 import os
@@ -19,9 +20,13 @@ import soundfile
 from tts_audiobook_tool import web_playback, web_render
 from tts_audiobook_tool.app_support.remote_tts_discovery import RemoteTtsDiscovery, RemoteTtsSnapshot
 from tts_audiobook_tool.app_types import Book, BookSection
+from tts_audiobook_tool.app_types.delivery_cue import DeliveryCue
 from tts_audiobook_tool.app_types.phrase import Phrase, PhraseGroup, Reason
 from tts_audiobook_tool.constants import APP_SAMPLE_RATE, PROJECT_SOUND_SEGMENTS_SUBDIR
 from tts_audiobook_tool.project_support.sound_segment_util import SoundSegmentUtil
+from tts_audiobook_tool.speaker_assign.attribution import AttributionsFile, RangeAttribution, UtteranceAttribution
+from tts_audiobook_tool.speaker_assign.roster import Roster, RosterCharacter
+from tts_audiobook_tool.speaker_assign.utterance_util import UtteranceUtil
 from tts_audiobook_tool.tts import Tts, WEB_REMOTE_ENTRY_ID_ENV
 from tts_audiobook_tool.tts_models.tts_model_type import TtsBackendKind, TtsModelType
 from tts_audiobook_tool.web_backend import BookSession
@@ -131,10 +136,65 @@ class TestWebPlayback(unittest.TestCase):
             stop.assert_called_once_with(process)
             self.assertFalse(temporary[0].exists())
 
+    def test_playback_switches_select_the_matching_performance_and_character_take(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            session = _session(root / "project")
+            session.book.phrase_groups[0].is_dialog = True
+            session = replace(
+                session,
+                roster=Roster((RosterCharacter("RUE", "Rue", voice_direction="Slightly warmer tone."),)),
+                attributions=AttributionsFile((RangeAttribution(
+                    0, 1, UtteranceUtil.range_text_hash(session.book, 0, 1),
+                    (UtteranceAttribution((0,), "RUE", delivery=DeliveryCue("Hushed")),),
+                ),)),
+            )
+            model = TtsModelType.require_by_id("breeze_tts_2_local")
+            reference = root / "reference.wav"
+            reference.write_bytes(_wave())
+            cast = {"NARRATOR": RenderVoice(reference_path=str(reference), transcript="The narrator sample.")}
+
+            def spawn(command, **_):
+                web_playback._worker(Path(command[-1]))
+                return SimpleNamespace(poll=lambda: 0)
+
+            variants = ((False, False, 0.125), (True, False, 0.25), (False, True, 0.375), (True, True, 0.5))
+            with (
+                patch.object(web_render, "_render_job", side_effect=lambda _: nullcontext()),
+                patch.object(web_render, "_detect_model", return_value=model),
+                patch.object(web_render, "render_book", side_effect=AssertionError("Expected a cached take")),
+                patch.object(web_render.ModelWorker, "shutdown"),
+                patch.object(web_playback, "_python_for", return_value="/test/python"),
+                patch.object(web_playback.subprocess, "Popen", side_effect=spawn),
+                patch.object(web_playback.signal, "signal"),
+            ):
+                for use_cues, use_design, amplitude in variants:
+                    book, references = web_render._cast_book(
+                        session, cast, performance_cues=use_cues, character_voices=use_design,
+                    )
+                    run_id = web_render._checkpoint_id(book, references, model.id, session.language_code, False, 1)
+                    _write_take(session, 1, amplitude, run_id)
+                for use_cues, use_design, amplitude in reversed(variants):
+                    [chunk] = web_playback.play_book(
+                        "venv-breeze", session, cast, first=1, last=1, validate_audio=False,
+                        performance_cues=use_cues, character_voices=use_design,
+                    )
+                    audio, _ = soundfile.read(BytesIO(chunk.wave), always_2d=True)
+                    np.testing.assert_allclose(audio[:100], np.full((100, 2), amplitude), atol=0.001)
+
     def test_remote_playback_reuses_only_the_exact_checkpoint(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             session = _session(root / "project")
+            session.book.phrase_groups[0].is_dialog = True
+            session = replace(
+                session,
+                roster=Roster((RosterCharacter("RUE", "Rue", voice_direction="Slightly warmer tone."),)),
+                attributions=AttributionsFile((RangeAttribution(
+                    0, 1, UtteranceUtil.range_text_hash(session.book, 0, 1),
+                    (UtteranceAttribution((0,), "RUE", delivery=DeliveryCue("Hushed")),),
+                ),)),
+            )
             model = TtsModelType.require_by_id("higgs_v3_sglomni")
             selected = RemoteTtsSelection("https://first.example", model.id, "org/higgs")
             other = RemoteTtsSelection("https://other.example", model.id, "org/higgs")
@@ -157,6 +217,8 @@ class TestWebPlayback(unittest.TestCase):
 
             def generate(staged, voices, **settings):
                 self.assertEqual(settings["remote_selection"], selected)
+                self.assertTrue(settings["performance_cues"])
+                self.assertTrue(settings["character_voices"])
                 self.assertEqual(os.environ[WEB_REMOTE_ENTRY_ID_ENV], selected.server_model_id)
                 self.assertEqual((settings["first_line"], settings["last_line"]), (2, 2))
                 self.assertTrue(web_playback._ready_path(Path(staged.project_dir).parent, 1).is_file())
@@ -185,6 +247,7 @@ class TestWebPlayback(unittest.TestCase):
             ):
                 chunks = list(web_playback.play_book(
                     REMOTE_MODEL_ID, session, {}, first=1, last=2, validate_audio=False, remote_selection=selected,
+                    performance_cues=True, character_voices=True,
                 ))
             self.assertEqual(launched, [str(executable)])
             self.assertEqual([chunk.line for chunk in chunks], [1, 2])

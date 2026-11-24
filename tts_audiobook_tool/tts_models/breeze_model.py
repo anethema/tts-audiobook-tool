@@ -122,7 +122,9 @@ class BreezeModel(BreezeBaseModel):
             voice_selection_index: int = 0,
             print_params: bool = False,
             max_random_seed: int = -1,
-    ) -> list[Sound] | str:
+            *,
+            delivery_directions: list[str] | None = None,
+    ) -> list[Sound | str] | str:
 
         model_type = TtsModelType.require_by_id("breeze_tts_2_local")
         voice_file_name, transcript = ProjectVoiceUtil.current_voice_reference_pair(
@@ -139,7 +141,11 @@ class BreezeModel(BreezeBaseModel):
             transcript = ""
         # Instructions belong to the selected voice, keyed by model id
         voice = ProjectVoiceUtil.current_voice(project, model_type, voice_selection_index)
-        instructions = (voice.instructions.get(model_type.id, "") if voice is not None else "").strip()
+        voice_instructions = (voice.instructions.get(model_type.id, "") if voice is not None else "").strip()
+        directions = [""] * len(prompts) if delivery_directions is None else delivery_directions
+        instructions = [
+            "\n".join(filter(None, (voice_instructions, direction))) for direction in directions
+        ]
 
         sampling = BreezeBaseModel.resolve_sampling(project)
 
@@ -155,13 +161,12 @@ class BreezeModel(BreezeBaseModel):
                 "repetition_penalty": sampling.repetition_penalty,
                 "seed": seed,
             }
-            if instructions:
+            if any(instructions):
                 params["cfg"] = sampling.cfg
             if self._has_lora:
                 params["lora_strength"] = self._lora_strength
             BreezeBaseModel.print_params(params)
 
-        # The prompts arrive as one batch (orchestration `batch_size`, one voice per batch)
         return self.generate(
             prompts, voice_path=voice_path, transcript=transcript, instructions=instructions,
             sampling=sampling, seed=seed,
@@ -172,40 +177,66 @@ class BreezeModel(BreezeBaseModel):
             texts: list[str],
             voice_path: str,
             transcript: str,
-            instructions: str,
+            instructions: str | list[str],
             sampling: BreezeSampling,
             seed: int,
-    ) -> list[Sound] | str:
+    ) -> list[Sound | str] | str:
         """
-        Generates all texts in one batched `generate()` call (as upstream `api.py` `_generate_batch_pcm`).
-        Rows are left-padded by `prepare_inputs()` and each is trimmed at its own EOS.
-        With CFG (instructions only), depth decoding replays upstream's batch CUDA graph (`_prepare_cfg_depth_graph()`);
-        everything else is eager.
-        One seed per call, so a given text's output depends on the batch it's in.
+        Batch rows that use the same Breeze template, and return results in input order.
+        Instructions are either shared by every row or supplied in prompt order.
         `voice_path` and `transcript` are both set or both empty.
         """
         if self._model is None:
             return "Logic error - model not initialized"
         if not texts:
             return []
+        if isinstance(instructions, str):
+            instructions = [instructions] * len(texts)
+        if len(instructions) != len(texts):
+            return "Breeze instructions must match the number of prompts"
 
-        requests = []
-        for index, text in enumerate(texts):
-            request = {"id": f"seg-{index}", "text": text, "speaker": BreezeBaseModel.SPEAKER}
-            if voice_path:
-                request["ref_audio_path"] = voice_path
-                request["ref_text"] = transcript
-            if instructions:
-                request["instruction"] = instructions
-            requests.append(request)
-        # Only the instruction templates define a CFG negative prompt; upstream raises for CFG != 1 otherwise
-        cfg = sampling.cfg if instructions else 1.0
+        # Upstream prepares one template for a batch. Only instruction templates
+        # require the instruction field and provide a CFG negative prompt.
+        batches: dict[str, list[tuple[int, dict[str, str]]]] = {}
+        try:
+            for index, (text, instruction) in enumerate(zip(texts, instructions)):
+                request = {"id": f"seg-{index}", "text": text, "speaker": self.SPEAKER}
+                if voice_path:
+                    request["ref_audio_path"] = voice_path
+                    request["ref_text"] = transcript
+                if instruction:
+                    request["instruction"] = instruction
+                name = select_template_name(request)
+                batches.setdefault(name, []).append((index, request))
+        except Exception as exc:
+            return make_error_string(exc)
 
+        results: dict[int, Sound | str] = {}
+        for name, rows in batches.items():
+            batch_result = self._generate_batch([request for _, request in rows], name, sampling, seed)
+            if isinstance(batch_result, str):
+                if len(batches) == 1 or is_oom_error_message(batch_result):
+                    return batch_result
+                results.update((index, batch_result) for index, _ in rows)
+                continue
+            for (index, _), result in zip(rows, batch_result):
+                results[index] = result
+        return [results[index] for index in range(len(texts))]
+
+    def _generate_batch(
+            self,
+            requests: list[dict[str, str]],
+            template_name: str,
+            sampling: BreezeSampling,
+            seed: int,
+    ) -> list[Sound] | str:
+        """Run one homogeneous Breeze batch, left-padded and trimmed at each row's EOS."""
         # Print something here b/c model library code does not
         printt(f"{COL_DIM_ITALICS}Generating...")
 
         try:
-            template = get_template(select_template_name(requests[0]))
+            template = get_template(template_name)
+            cfg = sampling.cfg if template.build_negative_segments is not None else 1.0
             # Same values for the backbone and the depth decoder, as upstream
             update_generation_config_for_breeze(self._model, {
                 "do_sample": True,
@@ -231,7 +262,7 @@ class BreezeModel(BreezeBaseModel):
             )
             cfg_depth_graph = nullcontext()
             if cfg != 1.0 and self.USE_CFG_DEPTH_GRAPH:
-                batch_depth_decoder = self._prepare_cfg_depth_graph(len(texts), sampling)
+                batch_depth_decoder = self._prepare_cfg_depth_graph(len(requests), sampling)
                 # As upstream: graph warmup/capture consumes RNG, so re-seed after it
                 set_all_seeds(seed)
                 cfg_depth_graph = batch_depth_decoder.bound(self._model)
@@ -243,8 +274,8 @@ class BreezeModel(BreezeBaseModel):
                     logits_processor=logits_processor,
                     max_new_tokens=BreezeBaseModel.MAX_NEW_TOKENS,
                 )
-            if len(audio) != len(texts):
-                return f"Batch size mismatch: sent {len(texts)} texts, got {len(audio)} audio segments"
+            if len(audio) != len(requests):
+                return f"Batch size mismatch: sent {len(requests)} texts, got {len(audio)} audio segments"
             datas = [segment.detach().float().cpu().numpy().reshape(-1) for segment in audio]
             del audio, inputs
         except Exception as e:
@@ -257,7 +288,7 @@ class BreezeModel(BreezeBaseModel):
 
         sr = self.INFO.default_output_sample_rate
         for index, (data, prompt_length) in enumerate(zip(datas, prompt_lengths)):
-            BreezeModel._warn_if_truncated(index, len(texts), len(data) / sr, prompt_length)
+            BreezeModel._warn_if_truncated(index, len(requests), len(data) / sr, prompt_length)
 
         return [Sound(data, sr) for data in datas]
 

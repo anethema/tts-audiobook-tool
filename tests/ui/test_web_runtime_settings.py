@@ -53,7 +53,7 @@ def test_preferences_round_trip_without_console_writes_and_save_failure_keeps_ol
     selected_bitrate = next(item for item in AAC_BITRATES if item != AAC_BITRATE_DEFAULT)
     options = WebRuntimeSettings(
         force_cpu=True, whisper_variant=SttVariant.LARGE_V3.id, whisper_device=SttConfig.CPU_INT8FLOAT32.id,
-        save_generation_logs=True, aac_bitrate=selected_bitrate,
+        save_generation_logs=True, aac_bitrate=selected_bitrate, checkpoint_format="aac",
     )
     save_runtime_settings(options, path=browser)
     assert load_runtime_settings(path=browser) == options
@@ -61,7 +61,7 @@ def test_preferences_round_trip_without_console_writes_and_save_failure_keeps_ol
     if os.name != "nt":
         assert not stat.S_IMODE(browser.stat().st_mode) & 0o077
     assert set(json.loads(browser.read_text(encoding="utf-8"))["runtime"]) == {
-        "force_cpu", "whisper_variant", "whisper_device", "save_generation_logs", "aac_bitrate",
+        "force_cpu", "whisper_variant", "whisper_device", "save_generation_logs", "aac_bitrate", "checkpoint_format",
     }
 
     def fail_replace(self, destination):
@@ -85,11 +85,11 @@ def test_runtime_panel_restores_saved_fields_for_a_fresh_page(monkeypatch, tmp_p
 
     with gr.Blocks() as app:
         panel = web_runtime_panel.create_runtime_panel(gr.State(None), app=app, private_event={"api_visibility": "private"})
-    assert len(panel.inputs) == 5
+    assert len(panel.inputs) == 6
     assert panel.snapshot(False, "", "", False) == WebRuntimeSettings()
     handlers = {item.name: item.fn for item in app.fns.values()}
     selected_bitrate = next(item for item in AAC_BITRATES if item != AAC_BITRATE_DEFAULT)
-    values = (True, SttVariant.LARGE_V3.id, SttConfig.CPU_INT8FLOAT32.id, True, selected_bitrate)
+    values = (True, SttVariant.LARGE_V3.id, SttConfig.CPU_INT8FLOAT32.id, True, selected_bitrate, "aac")
     assert handlers["save_preferences"](*values)["value"] == "Saved browser preferences."
-    assert handlers["restore_preferences"]()[:5] == values
+    assert handlers["restore_preferences"]()[:6] == values
     assert "show_log" in handlers

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 from tts_audiobook_tool.app_types import ReadinessIssue
+from tts_audiobook_tool.app_types.delivery_cue import DeliveryCue
 from tts_audiobook_tool.project import Project
 from tts_audiobook_tool.tts_models.tts_base_model import TtsBaseModel
 from tts_audiobook_tool.tts_models.tts_model_type import TtsModelType
@@ -14,7 +15,7 @@ class BreezeSampling:
     top_k: int
     top_p: float
     repetition_penalty: float
-    # Used only when the voice has instructions (no CFG negative prompt exists for pure cloning / plain TTS)
+    # Used only for requests with instructions (pure cloning and plain TTS lack a negative prompt).
     cfg: float
 
 
@@ -42,6 +43,17 @@ class BreezeBaseModel(TtsBaseModel):
     MAX_POSITIONS = 2048
     FRAME_RATE = 12.5
     SPEAKER = "S0"
+
+    @staticmethod
+    def apply_delivery_events(text: str, cue: DeliveryCue | None) -> str:
+        """Place Breeze's event tags around an already prepared spoken prompt."""
+        if cue is None:
+            return text
+        if cue.before:
+            text = f"({cue.before}) {text}"
+        if cue.after:
+            text = f"{text} ({cue.after})"
+        return text
 
     @staticmethod
     def resolve_sampling(project: Project) -> BreezeSampling:

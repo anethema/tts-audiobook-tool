@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+from tts_audiobook_tool.constants import AAC_BITRATE_DEFAULT
 from tts_audiobook_tool.generation_events import GenerationEvent
 from tts_audiobook_tool.real_time_playback_events import RealTimePlaybackEvent
 
@@ -60,6 +61,7 @@ class GenerationSettings:
     remote_tts_url: str
     save_debug_files: bool
     audio_cpp_model_id: str = ""
+    aac_bitrate: str = AAC_BITRATE_DEFAULT
 
 
 @dataclass(frozen=True)

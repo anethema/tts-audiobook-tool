@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tts_audiobook_tool.app_types.delivery_cue import DeliveryCue
 from tts_audiobook_tool.app_support.sgl_omni_util import SglOmniUtil
 from tts_audiobook_tool.project import Project
 from tts_audiobook_tool.project_support.project_voice_util import ProjectVoiceUtil
@@ -127,6 +128,25 @@ def test_dispatch_uses_live_catalog_cap_not_cached_instance_metadata(monkeypatch
     assert Tts.generate_using_project(Project(tts_model_type=model_type.id), ["hello"]) == []
     assert captured[0]["max_random_seed"] == 7
     assert model.INFO.max_random_seed == -1
+
+
+def test_dispatch_applies_delivery_only_for_local_breeze(monkeypatch):
+    model_id = "breeze_tts_2_audiocpp"
+    project = Project(tts_model_type=model_id)
+    captured = []
+    model = SimpleNamespace(
+        prepare_text_for_inference=lambda _project, text, **_kwargs: text,
+        generate_using_project=lambda **kwargs: captured.append(kwargs) or [],
+    )
+    monkeypatch.setattr(Tts, "_type", TtsModelType.require_by_id(model_id))
+    monkeypatch.setattr(Tts, "get_instance", lambda: model)
+
+    Tts.generate_using_project(project, ["Stay there!"], delivery_cues=[
+        DeliveryCue(direction="Urgently", before="gasps"),
+    ])
+
+    assert captured[0]["prompts"] == ["Stay there!"]
+    assert "delivery_directions" not in captured[0]
 
 
 @pytest.mark.parametrize("invalid", [True, -2, 1.5, "10"])

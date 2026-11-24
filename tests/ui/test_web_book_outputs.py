@@ -61,6 +61,30 @@ def rendered_book(tmp_path):
     return BookSession(edited, str(tmp_path)), directory, best
 
 
+def test_review_and_resume_share_aac_take_validation(rendered_book):
+    from tts_audiobook_tool import web_render
+    from tts_audiobook_tool.sound.audio_writers import AacWriter
+
+    session, directory, best = rendered_book
+    original = directory / "segments" / best
+    path = original.with_suffix(".m4a")
+    samples, rate = soundfile.read(original, dtype="float32")
+    writer = AacWriter(str(path), rate, 1)
+    writer.write(samples)
+    writer.close()
+    original.unlink()
+    assert web_book_outputs.get_book_take_path(session, RUN_ID, 1, path.name) == str(path)
+    with web_book_outputs._open_render_project(directory) as project:
+        assert web_render._missing_segments(project, {0}) == set()
+        assert path.exists()
+        with path.open("r+b") as audio:
+            audio.truncate(path.stat().st_size // 2)
+        # The older take with two errors can still be resumed.
+        assert web_render._missing_segments(project, {0}) == set()
+        assert not path.exists()
+        assert project.sound_segments.get_best_item_for(0).num_errors == 2
+
+
 def test_render_review_uses_stored_text_and_native_take_ranking(rendered_book):
     session, directory, best = rendered_book
     (directory.parent / ("b" * 64)).mkdir()

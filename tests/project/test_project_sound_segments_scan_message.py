@@ -7,17 +7,8 @@ from tts_audiobook_tool.project_support.sound_segment_util import SoundSegmentUt
 from tts_audiobook_tool.state import State
 
 
-def make_sound_segments() -> ProjectSoundSegments:
-    sound_segments = object.__new__(ProjectSoundSegments)
-    sound_segments.project = cast(Project, object())
-    sound_segments._sound_segments_map = {}
-    sound_segments._dirty = True
-    sound_segments.dont_show_scan_message = False
-    return sound_segments
-
-
 def test_initial_scan_can_suppress_transient_progress_message(monkeypatch) -> None:
-    sound_segments = make_sound_segments()
+    sound_segments = ProjectSoundSegments(cast(Project, SimpleNamespace(dir_path="")))
     sound_segments.dont_show_scan_message = True
     expected = {1: []}
     output: list[tuple[object, str]] = []

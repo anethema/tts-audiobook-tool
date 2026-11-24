@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Set
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import re
 from typing import Any
 
 from tts_audiobook_tool.app_types import Book
+from tts_audiobook_tool.app_types.delivery_cue import DeliveryCue
 from tts_audiobook_tool.speaker_assign.attribution import (
     UTTERANCE_TEXT_EXCERPT_CHARS,
     RangeAttribution,
@@ -24,6 +25,7 @@ class ParsedReply:
     speakers: dict[int, str]
     uncertain: frozenset[int]
     missing: tuple[int, ...]
+    delivery: dict[int, DeliveryCue] = field(default_factory=dict)
 
 
 class AttributionReplyUtil:
@@ -83,6 +85,7 @@ class AttributionReplyUtil:
             speakers,
             first.uncertain | follow_up.uncertain,
             tuple(i for i in first.missing if i not in speakers),
+            {**first.delivery, **follow_up.delivery},
         )
 
     @staticmethod
@@ -108,6 +111,7 @@ class AttributionReplyUtil:
                     speaker=reply.speakers.get(number, UNKNOWN),
                     uncertain=number in reply.uncertain,
                     text=utterance.text.strip()[:UTTERANCE_TEXT_EXCERPT_CHARS],
+                    delivery=reply.delivery.get(number),
                 )
                 for number, utterance in enumerate(utterances, 1)
             ),

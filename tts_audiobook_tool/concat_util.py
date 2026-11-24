@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from typing import Callable, Sequence
 
+import numpy as np
+
 from tts_audiobook_tool import app_support
 from tts_audiobook_tool.app_support import app_hint_util
 from tts_audiobook_tool.app_support import app_paths
@@ -22,6 +24,14 @@ from tts_audiobook_tool.project_support.project_text_io_util import ProjectTextI
 from tts_audiobook_tool.project_support.segment_transcript_util import SegmentTranscriptUtil
 from tts_audiobook_tool.sound.loudness_leveling import LevelingStats, LoudnessLeveling
 from tts_audiobook_tool.sound import audio_writers, m4b_chapter_util
+from tts_audiobook_tool.sound.aac_checkpoint import (
+    CHECKPOINT_NORMALIZATION, is_take_path,
+    PSEUDO_SILENCE_MAX_SECONDS as CHECKPOINT_SILENCE_MAX_SECONDS,
+    PSEUDO_SILENCE_THRESHOLD_DB as CHECKPOINT_SILENCE_THRESHOLD_DB,
+)
+from tts_audiobook_tool.sound.aac_packet_export import (
+    AacPacketExport, PacketExportUnavailable, PacketTake, is_packet_copy_candidate,
+)
 from tts_audiobook_tool.sound.audio_writers import AudioWriteError, AudioWriter, Chapter
 from tts_audiobook_tool.l import L
 from tts_audiobook_tool.project import Project
@@ -134,8 +144,8 @@ class ConcatUtil:
     # same way: only the silence padding around the effect shrinks (the effect
     # itself is never trimmed), keeping it centered in the whole gap.
     PSEUDO_SILENCE_COMPENSATION_ENABLED = True
-    PSEUDO_SILENCE_MAX_SECONDS = 1.0
-    PSEUDO_SILENCE_THRESHOLD_DB = -20.0 # very permissive
+    PSEUDO_SILENCE_MAX_SECONDS = CHECKPOINT_SILENCE_MAX_SECONDS
+    PSEUDO_SILENCE_THRESHOLD_DB = CHECKPOINT_SILENCE_THRESHOLD_DB
 
     @staticmethod
     def make_files(
@@ -313,16 +323,9 @@ class ConcatUtil:
 
         final_path = stem_path + ".abr" + suffix
 
-        def delete_intermediate_files(keep_final: bool=False) -> None:
-            # TODO: add delete-as-you-go logic instead
-            if state.prefs.save_debug_files:
-                return
-            paths = [concat_path]
-            if not keep_final:
-                paths.append(final_path)
-            for path in paths:
-                if path:
-                    delete_silently(path)
+        def delete_intermediate_files() -> None:
+            if not state.prefs.save_debug_files:
+                delete_silently(concat_path)
 
         # [0] Prep data
 
@@ -455,16 +458,23 @@ class ConcatUtil:
             err = save_abr_metadata_debug_json(app_meta, debug_json_path)
             if err:
                 L.w(f"Couldn't save ABR metadata debug JSON: {err}")
-        if is_aac:
-            err = AppMetadata.save_to_mp4(app_meta, concat_path, final_path)
-        else:
-            err = AppMetadata.save_to_flac(app_meta, concat_path, final_path)
-        if err:
+        save_metadata = AppMetadata.save_to_mp4 if is_aac else AppMetadata.save_to_flac
+        publish_path = audio_writers.staging_path_for(final_path) if state.prefs.save_debug_files else concat_path
+        try:
+            if state.prefs.save_debug_files:
+                err = save_metadata(app_meta, concat_path, publish_path)
+            else:
+                err = save_metadata(app_meta, concat_path)
+            if err:
+                return "", err
+            os.replace(publish_path, final_path)
+        except OSError as error:
+            return "", make_error_string(error)
+        finally:
+            if state.prefs.save_debug_files:
+                delete_silently(publish_path)
             delete_intermediate_files()
-            return "", err
-        else:
-            delete_intermediate_files(keep_final=True)
-            return final_path, "" # success
+        return final_path, ""
 
     @staticmethod
     def make_phrases_and_paths(
@@ -536,6 +546,8 @@ class ConcatUtil:
         loudness: NormalizationSpecs | None = None,
         make_chapters: Callable[[list[float]], Sequence[Chapter]] | None = None,
         container_metadata: dict[str, str] | None = None,
+        *,
+        _allow_packet_export: bool = True,
     ) -> ConcatRenderResult | str:
         """
         Concatenates a list of files to a destination file (FLAC or AAC/M4B by
@@ -636,14 +648,33 @@ class ConcatUtil:
         channels = 2 if (stereo_required or any(pan != 0 for pan in voice_pans)
                          or (has_reverb and room_reverb_stereo.is_stereo)) else 1
 
+        Interrupts().set("concat")
+        packet_export = None
+        if (_allow_packet_export and Path(dest_path).suffix.lower() == ".m4b"
+                and channels == 1 and not has_reverb and room_tone_db is None and not use_upsampler
+                and high_shelf == HighShelfEq.DISABLED
+                and loudness in (None, CHECKPOINT_NORMALIZATION)
+                and ConcatUtil.PSEUDO_SILENCE_MAX_SECONDS == CHECKPOINT_SILENCE_MAX_SECONDS
+                and ConcatUtil.PSEUDO_SILENCE_THRESHOLD_DB == CHECKPOINT_SILENCE_THRESHOLD_DB):
+            for (_, path), volume_db in zip(phrases_and_paths, voice_volume_dbs):
+                if Interrupts().did_interrupt:
+                    Interrupts().clear()
+                    return "Interrupted by user"
+                if not path or not is_take_path(path) or not is_packet_copy_candidate(path, aac_bitrate, loudness, volume_db):
+                    continue
+                try:
+                    packet_export = AacPacketExport(dest_path, path, aac_bitrate, container_metadata)
+                    break
+                except PacketExportUnavailable as error:
+                    L.d(f"Can't copy AAC takes for this export: {error}")
+                    break
+
         # Levels authored against un-leveled speech (room tone, break effects)
         # move with the loudness target
         level_offset_db = LoudnessLeveling.reference_offset_db(loudness, channels) if loudness is not None else 0.0
         if room_tone_db is not None:
             room_tone_db += level_offset_db
         leveling_stats = LevelingStats()
-
-        Interrupts().set("concat")
 
         # Render-time break effect rules. The tracker is fed one entry per
         # flushed (present) segment, in emission order.
@@ -657,7 +688,7 @@ class ConcatUtil:
         # so the inserted pause can be adjusted using the pseudo-silence measured
         # at the end of the held segment and the start of the next one.
         # pending = (sound_no_pause, phrase, index, path)
-        pending: tuple[Sound, Phrase, int, str] | None = None
+        pending: tuple[Sound | PacketTake, Phrase, int, str] | None = None
 
         # Room tone setting: a constant noise bed under the whole output.
         # Created on first use, at the rendered audio's sample rate.
@@ -665,7 +696,7 @@ class ConcatUtil:
         # One shared spatial processor; its room tails span voice changes.
         spatial = VoiceSpatialProcessor(channels=channels, room_reverb_stereo=room_reverb_stereo)
 
-        def flush_pending(next_sound: Sound | None) -> None:
+        def flush_pending(next_sound: Sound | PacketTake | None) -> None:
             """
             Appends the (possibly compensated) trailing pause to the held
             segment and streams it to the output writer. `next_sound` is the following
@@ -675,7 +706,6 @@ class ConcatUtil:
             nonlocal duration_sum, noise_bed
             assert pending is not None
             sound, phrase, idx, path = pending
-            narration_end = len(sound.data)
             is_final_segment = next_sound is None
 
             break_effect = tracker.next_break_effect(
@@ -690,68 +720,96 @@ class ConcatUtil:
             end_pseudo = start_pseudo = 0.0
             if ConcatUtil.PSEUDO_SILENCE_COMPENSATION_ENABLED and next_sound is not None:
                 # FYI, start/end silence measurements not idempotent wrt upsampling vs not
-                end_silence_start = SilenceUtil.get_end_silence(
-                    sound,
-                    max_seconds=ConcatUtil.PSEUDO_SILENCE_MAX_SECONDS,
-                    threshold_db_relative_to_peak=ConcatUtil.PSEUDO_SILENCE_THRESHOLD_DB,
-                )
-                end_pseudo = (sound.duration - end_silence_start) if end_silence_start is not None else 0.0
-                end_pseudo = max(0.0, min(end_pseudo, sound.duration))
-                start_pseudo = SilenceUtil.get_start_silence(
-                    next_sound,
-                    max_seconds=ConcatUtil.PSEUDO_SILENCE_MAX_SECONDS,
-                    threshold_db_relative_to_peak=ConcatUtil.PSEUDO_SILENCE_THRESHOLD_DB,
-                ) or 0.0
+                if isinstance(sound, PacketTake):
+                    end_pseudo = sound.profile.trailing_silence
+                else:
+                    end_silence_start = SilenceUtil.get_end_silence(
+                        sound,
+                        max_seconds=ConcatUtil.PSEUDO_SILENCE_MAX_SECONDS,
+                        threshold_db_relative_to_peak=ConcatUtil.PSEUDO_SILENCE_THRESHOLD_DB,
+                    )
+                    if end_silence_start is not None:
+                        end_pseudo = max(0.0, min(sound.duration - end_silence_start, sound.duration))
+                if isinstance(next_sound, PacketTake):
+                    start_pseudo = next_sound.profile.leading_silence
+                else:
+                    start_pseudo = SilenceUtil.get_start_silence(
+                        next_sound,
+                        max_seconds=ConcatUtil.PSEUDO_SILENCE_MAX_SECONDS,
+                        threshold_db_relative_to_peak=ConcatUtil.PSEUDO_SILENCE_THRESHOLD_DB,
+                    ) or 0.0
 
                 if end_pseudo + start_pseudo > 0:
                     base = reason_pauses.get_pause_for(break_effect if break_effect is not None else phrase.reason)
                     L.d(f"\n\npseudosilence - effect={break_effect} base={base:.3f} end={end_pseudo:.3f} start={start_pseudo:.3f} AMOUNT={end_pseudo + start_pseudo}\n")
 
-            sound = SoundPipeline.append_pause_or_section_effect(
-                sound,
-                reason=phrase.reason,
-                reason_pauses=reason_pauses,
-                break_effect=break_effect,
-                preceding_silence=end_pseudo,
-                following_silence=start_pseudo,
-                effect_level_offset_db=level_offset_db,
-            )
+            if isinstance(sound, PacketTake) and break_effect is None:
+                assert packet_export is not None
+                pause = max(0.0, reason_pauses.get_pause_for(phrase.reason) - end_pseudo - start_pseudo)
+                samples = sound.profile.samples + int(pause * APP_SAMPLE_RATE)
+                packet_export.append(idx, sound, samples, final=is_final_segment)
+                duration = samples / APP_SAMPLE_RATE
+            else:
+                if isinstance(sound, PacketTake):
+                    sound = Sound(sound.audio(), APP_SAMPLE_RATE)
+                narration_end = len(sound.data)
+                sound = SoundPipeline.append_pause_or_section_effect(
+                    sound,
+                    reason=phrase.reason,
+                    reason_pauses=reason_pauses,
+                    break_effect=break_effect,
+                    preceding_silence=end_pseudo,
+                    following_silence=start_pseudo,
+                    effect_level_offset_db=level_offset_db,
+                )
 
-            # Pan only direct narration; room sound stays independent of voice
-            # position. The narration feeds its voice's room only. Appended
-            # effects stay dry and centered.
-            sound = spatial.apply(
-                sound, pan=voice_pans[idx], send_end=narration_end,
-                is_last=is_final_segment, room_reverb=voice_reverbs[idx],
-            )
+                # Only direct narration feeds the room. Appended effects stay centered.
+                sound = spatial.apply(
+                    sound, pan=voice_pans[idx], send_end=narration_end,
+                    is_last=is_final_segment, room_reverb=voice_reverbs[idx],
+                )
+                if room_tone_db is not None:
+                    if noise_bed is None:
+                        noise_bed = NoiseBed(sound.sr, room_tone_db)
+                    sound = noise_bed.apply(sound, is_last=is_final_segment)
+                if loudness is not None:
+                    sound, mix_reduction_db = LoudnessLeveling.limit_mix(sound, loudness)
+                    leveling_stats.add_mix(mix_reduction_db)
+                if packet_export is not None:
+                    # Keep waveform processing local by encoding just through the last
+                    # effect sample. Only the appended digital silence can host a join.
+                    effect = np.flatnonzero(sound.data[narration_end:])
+                    content_end = narration_end + int(effect[-1]) + 1 if len(effect) else narration_end
+                    packet_export.append(idx, sound.data[:content_end], len(sound.data), final=is_final_segment)
+                else:
+                    writer.write(sound.data)
+                duration = sound.duration
 
-            # Constant noise bed under the segment and its pause or break
-            # effect alike. Same duration.
-            if room_tone_db is not None:
-                if noise_bed is None:
-                    noise_bed = NoiseBed(sound.sr, room_tone_db)
-                sound = noise_bed.apply(sound, is_last=is_final_segment)
-
-            # Room reverb adds to the leveled narration's peaks
-            if loudness is not None:
-                sound, mix_reduction_db = LoudnessLeveling.limit_mix(sound, loudness)
-                leveling_stats.add_mix(mix_reduction_db)
-
-            durations[idx] = sound.duration
-            duration_sum += sound.duration
-            writer.write(sound.data)
+            durations[idx] = duration
+            duration_sum += duration
 
             if print_progress:
                 s = f"{time_stamp(duration_sum, with_tenth=False)} {Path(path).stem[:80]} ... "
                 print("\x1b[1G" + s, end="\033[K", flush=True)
 
         try:
-            writer = ConcatUtil.open_output_writer(
+            writer = packet_export or ConcatUtil.open_output_writer(
                 dest_path, aac_bitrate=aac_bitrate, channels=channels, metadata=container_metadata,
             )
         except AudioWriteError as e:
             Interrupts().clear()
             return f"Error creating audio file: {e}"
+
+        def hold_segment(sound: Sound | PacketTake, phrase: Phrase, index: int, path: str) -> None:
+            nonlocal pending
+            if isinstance(sound, PacketTake) and loudness is not None:
+                leveling_stats.count += 1
+                leveling_stats.unmeasured += sound.profile.measured_lufs is None
+                leveling_stats.clamped += sound.profile.gain_clamped
+            # The next segment supplies the start of the pause compensation.
+            if pending is not None:
+                flush_pending(sound)
+            pending = (sound, phrase, index, path)
 
         try:
             for i, (phrase, path) in enumerate(phrases_and_paths):
@@ -763,6 +821,13 @@ class ConcatUtil:
                     Interrupts().clear()
                     writer.abort()
                     return "Interrupted by user"
+
+                take = None
+                if packet_export is not None and is_take_path(path):
+                    take = packet_export.read_take(path, loudness, voice_volume_dbs[i])
+                    if take is not None and not limit_silence_gaps and min_sentence_silence <= 0:
+                        hold_segment(take, phrase, i, path)
+                        continue
 
                 render_path = path
                 temporary_upscaled_path = ""
@@ -813,6 +878,9 @@ class ConcatUtil:
                 )
                 if gap_trims or insertions:
                     gap_trim_maps[i] = GapTrimMap(result.duration, gap_trims, insertions)
+                elif take is not None:
+                    hold_segment(take, phrase, i, path)
+                    continue
 
                 # Loudness leveling: after all per-segment shaping (high shelf
                 # included, which affects K-weighted loudness), before the pause
@@ -832,12 +900,7 @@ class ConcatUtil:
                     writer.abort()
                     return "Interrupted by user"
 
-                # Flush the previously-held segment using the current segment as the
-                # "next" segment for pseudo-silence compensation.
-                if pending is not None:
-                    flush_pending(curr_sound)
-
-                pending = (curr_sound, phrase, i, path)
+                hold_segment(curr_sound, phrase, i, path)
 
             # Flush the final held segment. No following segment exists, so no
             # pseudo-silence compensation is applied (hardcoded pause is used).
@@ -845,6 +908,10 @@ class ConcatUtil:
             # segments, never trail the output file.
             if pending is not None:
                 flush_pending(None)
+            if Interrupts().did_interrupt:
+                Interrupts().clear()
+                writer.abort()
+                return "Interrupted by user"
 
             if print_progress:
                 printt()
@@ -857,16 +924,37 @@ class ConcatUtil:
 
             # Chapters need the final rendered durations, so they're set last,
             # just before the container is finalized
-            if make_chapters is not None:
-                chapters = make_chapters(durations)
+            if packet_export is not None:
+                for index, adjustment in packet_export.sample_adjustments().items():
+                    durations[index] = (round(durations[index] * APP_SAMPLE_RATE) + adjustment) / APP_SAMPLE_RATE
+            chapters = make_chapters(durations) if make_chapters is not None else ()
+            if packet_export is not None:
+                packet_export.close(chapters)
+            else:
                 if chapters:
                     writer.set_chapters(chapters)
-            writer.close()
+                writer.close()
+        except PacketExportUnavailable as error:
+            writer.abort()
+            if Interrupts().clear():
+                return "Interrupted by user"
+            L.d(f"Re-encoding AAC audiobook continuously: {error}")
+            return ConcatUtil.concatenate_sound_segments(
+                dest_path, phrases_and_paths, use_break_sound_effect, high_shelf, reason_pauses, print_progress,
+                section_start_indices=section_start_indices, start_group_index=start_group_index,
+                aac_bitrate=aac_bitrate, use_upsampler=use_upsampler,
+                limit_silence_gaps=limit_silence_gaps, limit_silence_gaps_duration=limit_silence_gaps_duration,
+                min_sentence_silence=min_sentence_silence, room_tone_db=room_tone_db, room_reverb=room_reverb,
+                room_reverb_stereo=room_reverb_stereo, voice_pans=voice_pans, voice_reverbs=voice_reverbs,
+                voice_volume_dbs=voice_volume_dbs, stereo_required=stereo_required, loudness=loudness,
+                make_chapters=make_chapters, container_metadata=container_metadata, _allow_packet_export=False,
+            )
         except AudioWriteError as e:
-            # The writer has already removed its partial output
             Interrupts().clear()
+            writer.abort()
             return f"Error writing audio file: {e}"
         except BaseException:
+            Interrupts().clear()
             writer.abort()
             raise
 

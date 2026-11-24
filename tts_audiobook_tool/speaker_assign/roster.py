@@ -15,6 +15,7 @@ On disk (the keys the prototype's cache already uses):
                 "gender": "male",
                 "description": "...",
                 "voice_hint": "elderly; deep, gravelly; slow, imperious",
+                "voice_direction": "Slightly deeper tone.",
                 "is_narrator": false,
                 "prominence": "major",
                 "merged_ids": ["OLD_BARON_ID"]    # optional user-confirmed redirects
@@ -22,11 +23,12 @@ On disk (the keys the prototype's cache already uses):
         ]
     }
 
-User-facing fields (`id`, `name`, `voice_hint`, narration `notes` and
-`voice_hint`) are spoiler-free; LLM-facing fields (`aliases`, `description`)
-are complete and may contain spoilers. `voice_hint` (what kind of reference
+Names, IDs, casting hints, voice directions and narration notes are
+spoiler-free. LLM-facing character aliases and descriptions are complete and
+may contain spoilers. `voice_hint` (what kind of reference
 voice suits the character or narration) is shown only to the user, not sent
-with the dialog attribution requests. Instances are immutable; edits make a new instance with
+with the dialog attribution requests. `voice_direction` is a stable performance
+baseline for a character. Instances are immutable; edits make a new instance with
 `dataclasses.replace`.
 
 `RosterFile` is the full-book pass's saved result: the roster plus provenance,
@@ -45,6 +47,34 @@ from tts_audiobook_tool.speaker_assign.speaker_assign_types import RESERVED_SPEA
 # Uppercase letters and digits in underscore-separated words: no spaces, no
 # leading, trailing or repeated underscores.
 ROSTER_ID_PATTERN = re.compile(r"[A-Z0-9]+(?:_[A-Z0-9]+)*")
+NEUTRAL_CHARACTER_VOICE_DIRECTION = "Neutral delivery."
+CHARACTER_VOICE_DIRECTIONS = (
+    NEUTRAL_CHARACTER_VOICE_DIRECTION,
+    "Slightly warmer tone.",
+    "Slightly softer tone.",
+    "Slightly brighter tone.",
+    "Slightly deeper tone.",
+    "Slightly more measured pace.",
+)
+MAX_CHARACTER_VOICE_DIRECTION_CHARS = 120
+_VOICE_DIRECTION_PUNCTUATION = " ,.'’–-"
+
+
+def is_current_character_voice_direction(value: object) -> bool:
+    """Check whether a roster direction belongs to the current subtle casting palette."""
+    return isinstance(value, str) and value in CHARACTER_VOICE_DIRECTIONS
+
+
+def normalize_voice_direction(value: object) -> str:
+    """Clean stored directions, including short plain-language legacy values."""
+    direction = " ".join(value.split()) if isinstance(value, str) else ""
+    if (
+        len(direction) <= MAX_CHARACTER_VOICE_DIRECTION_CHARS
+        and any(char.isalpha() for char in direction)
+        and all(char.isalpha() or char in _VOICE_DIRECTION_PUNCTUATION for char in direction)
+    ):
+        return direction
+    return ""
 
 
 def name_key(text: str) -> str:
@@ -114,6 +144,7 @@ class RosterCharacter:
     prominence: Prominence = Prominence.UNKNOWN
     voice_hint: str = ""
     merged_ids: tuple[str, ...] = ()
+    voice_direction: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not ROSTER_ID_PATTERN.fullmatch(self.id):
@@ -126,6 +157,7 @@ class RosterCharacter:
         object.__setattr__(self, "aliases", tuple(self.aliases))
         if not all(isinstance(alias, str) for alias in self.aliases):
             raise ValueError(f"Roster character {self.id}: aliases must be strings")
+        object.__setattr__(self, "voice_direction", normalize_voice_direction(self.voice_direction))
         object.__setattr__(self, "merged_ids", tuple(self.merged_ids))
         for merged_id in self.merged_ids:
             if (not isinstance(merged_id, str) or not ROSTER_ID_PATTERN.fullmatch(merged_id)
@@ -149,6 +181,8 @@ class RosterCharacter:
         }
         if self.merged_ids:
             value["merged_ids"] = list(self.merged_ids)
+        if self.voice_direction:
+            value["voice_direction"] = self.voice_direction
         return value
 
     @staticmethod
@@ -176,6 +210,7 @@ class RosterCharacter:
             prominence=Prominence.from_value(value.get("prominence")),
             voice_hint=_string(value.get("voice_hint"), ""),
             merged_ids=tuple(merged_ids),
+            voice_direction=_string(value.get("voice_direction"), ""),
         )
 
 

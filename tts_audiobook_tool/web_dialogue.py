@@ -5,7 +5,12 @@ from __future__ import annotations
 from bisect import bisect_left
 from dataclasses import dataclass, replace
 
+from tts_audiobook_tool.app_types.delivery_cue import DeliveryCue
 from tts_audiobook_tool.speaker_assign.assign_plan import AssignPlan
+from tts_audiobook_tool.speaker_assign.roster import (
+    NEUTRAL_CHARACTER_VOICE_DIRECTION,
+    is_current_character_voice_direction,
+)
 from tts_audiobook_tool.speaker_assign.speaker_assign_file_util import SpeakerAssignFileUtil
 from tts_audiobook_tool.speaker_assign.speaker_assign_types import NOT_SPEECH, OTHER, UNKNOWN
 from tts_audiobook_tool.speaker_assign.utterance_util import UtteranceUtil
@@ -26,6 +31,19 @@ class DialogueRow:
     text: str
     speaker: str
     uncertain: bool
+    delivery: DeliveryCue | None = None
+    voice_direction: str = ""
+
+    @property
+    def performance(self) -> str:
+        if not self.delivery:
+            return ""
+        parts = [self.delivery.direction] if self.delivery.direction else []
+        if self.delivery.before:
+            parts.append(f"Before · {self.delivery.before}")
+        if self.delivery.after:
+            parts.append(f"After · {self.delivery.after}")
+        return " / ".join(parts)
 
 
 def dialogue_sections(session: BookSession | None) -> list[tuple[str, int]]:
@@ -52,10 +70,18 @@ def speaker_choices(session: BookSession) -> list[tuple[str, str]]:
     ]
 
 
+def display_voice_direction(direction: str) -> str:
+    if direction != NEUTRAL_CHARACTER_VOICE_DIRECTION and is_current_character_voice_direction(direction):
+        return direction
+    return ""
+
+
 def dialogue_rows(session: BookSession, section: int) -> list[DialogueRow]:
     """Return complete quotation text and current speakers for one section."""
     start, end = _section_range(session, section)
     names = {speaker: name for name, speaker in speaker_choices(session)}
+    characters = session.roster.characters if session.roster else ()
+    directions = {character.id: display_voice_direction(character.voice_direction) for character in characters}
     assignments = session.attributions.by_first_line(session.book)
     return [
         DialogueRow(
@@ -63,6 +89,8 @@ def dialogue_rows(session: BookSession, section: int) -> list[DialogueRow]:
             UtteranceUtil.range_text(session.book, line, utterance.lines[-1] + 1).strip(),
             names.get(canonical_cast_role(utterance.speaker), utterance.speaker),
             utterance.uncertain,
+            utterance.delivery,
+            directions.get(utterance.speaker, ""),
         )
         for line, utterance in sorted(assignments.items())
         if start <= line < end

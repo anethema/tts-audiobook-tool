@@ -29,6 +29,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from tts_audiobook_tool.app_types import Book
+from tts_audiobook_tool.app_types.delivery_cue import DeliveryCue
+from tts_audiobook_tool.speaker_assign.speaker_assign_types import NOT_SPEECH
 from tts_audiobook_tool.speaker_assign.utterance_util import UtteranceUtil
 
 
@@ -39,11 +41,15 @@ UTTERANCE_TEXT_EXCERPT_CHARS = 120
 
 @dataclass(frozen=True)
 class UtteranceAttribution:
-    """The attributed speaker of one utterance (its book-wide lines)."""
+    """The speaker and optional delivery of an utterance on book-wide lines.
+
+    An empty delivery cue records that the quote was assessed without a cue.
+    """
     lines: tuple[int, ...]
     speaker: str
     uncertain: bool = False
     text: str = ""
+    delivery: DeliveryCue | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "lines", tuple(self.lines))
@@ -51,13 +57,18 @@ class UtteranceAttribution:
             raise ValueError(f"Utterance attribution needs non-negative line indices: {self.lines!r}")
         if not isinstance(self.speaker, str) or not self.speaker:
             raise ValueError("Utterance attribution needs a speaker label")
+        if self.speaker == NOT_SPEECH:
+            object.__setattr__(self, "delivery", None)
 
     @property
     def first_line(self) -> int:
         return self.lines[0]
 
     def to_dict(self) -> dict[str, Any]:
-        return {"lines": list(self.lines), "speaker": self.speaker, "uncertain": self.uncertain, "text": self.text}
+        value = {"lines": list(self.lines), "speaker": self.speaker, "uncertain": self.uncertain, "text": self.text}
+        if self.delivery is not None:
+            value["delivery"] = self.delivery.to_dict()
+        return value
 
     @staticmethod
     def from_dict(value: Any) -> UtteranceAttribution:
@@ -69,6 +80,7 @@ class UtteranceAttribution:
             speaker=value.get("speaker"),  # type: ignore[arg-type]  (validated by __post_init__)
             uncertain=value.get("uncertain") is True,
             text=text if isinstance(text, str) else "",
+            delivery=DeliveryCue.from_dict(value.get("delivery")),
         )
 
 

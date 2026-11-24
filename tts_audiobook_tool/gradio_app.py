@@ -33,7 +33,9 @@ from tts_audiobook_tool.web_backend import (
 from tts_audiobook_tool.web_book_output_panel import create_book_output_panel
 from tts_audiobook_tool.web_character_merge import merge_characters, suggest_duplicate_characters
 from tts_audiobook_tool.web_chat_panel import VoiceChatPanel
-from tts_audiobook_tool.web_dialogue import correct_speaker, dialogue_rows, dialogue_sections, speaker_choices
+from tts_audiobook_tool.web_dialogue import (
+    correct_speaker, dialogue_rows, dialogue_sections, display_voice_direction, speaker_choices,
+)
 from tts_audiobook_tool.web_projects import (
     WebProjectError,
     create_project,
@@ -55,7 +57,7 @@ from tts_audiobook_tool.web_models import (
     render_model_book,
     render_model_sample,
 )
-from tts_audiobook_tool.web_render import RenderVoice, WebRenderError
+from tts_audiobook_tool.web_render import RenderVoice, WebRenderError, character_voice_instruction
 from tts_audiobook_tool.web_reader import reader_mount
 from tts_audiobook_tool.web_remote_models import REMOTE_MODEL_ID, WebRemoteTtsError
 from tts_audiobook_tool.web_remote_panel import RemoteModelPanel
@@ -116,7 +118,7 @@ def _review_components(session: BookSession | None, selected_role: str | None = 
     roster = session.roster if session is not None else None
     roster_characters = roster.characters if roster is not None else ()
     rows = [
-        [character.name] for character in roster_characters
+        [character.name, display_voice_direction(character.voice_direction)] for character in roster_characters
         if not character.is_narrator or character.name.strip().casefold() not in {"", "narrator", "the narrator"}
     ]
     choices = []
@@ -230,6 +232,16 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                                 llm_extra_params = gr.Textbox(
                                     label="Extra parameters for book analysis (JSON)", lines=3,
                                 )
+                            character_voices = gr.Checkbox(
+                                label="Use subtle Breeze direction for unassigned characters", value=True,
+                                info="Use the narrator voice as the starting point in local Breeze TTS 2. "
+                                     "Book analysis identifies gender when supported by the text and may suggest a slight "
+                                     "change in tone or pace. Your voice assignments take precedence.",
+                            )
+                            analyze_performance_cues = gr.Checkbox(
+                                label="Ask the LLM for dialogue performance cues", value=True,
+                                info="Propose delivery directions and vocal events for local Breeze TTS 2.",
+                            )
                             with gr.Row():
                                 analyze = gr.Button("Analyze book", interactive=False)
                                 analysis_status = gr.Textbox(
@@ -237,7 +249,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                                 )
                             characters = gr.Dataframe(
                                 label="Identified characters",
-                                headers=["Character"], datatype="str",
+                                headers=["Character", "Voice direction"], datatype="str",
                                 interactive=False,
                                 max_height=340,
                                 visible=False,
@@ -264,7 +276,8 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                             )
                             with gr.Group(visible=False) as cast_editor:
                                 cast_mode = gr.Radio(
-                                    [("Saved voice", "saved"), ("Use narrator voice", "narrator"), ("Custom voice", "custom")],
+                                    [("Saved voice", "saved"), ("Use narrator voice", "narrator"),
+                                     ("Custom voice", "custom"), ("Automatic", "auto")],
                                     value="saved", label="Voice source", interactive=True,
                                 )
                                 cast_library_voice = gr.Dropdown(label="Choose a saved voice", choices=[], interactive=True)
@@ -289,9 +302,9 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                             with gr.Accordion("Review dialogue assignments", open=False, visible=False) as review_panel:
                                 review_section = gr.Dropdown(label="Book section", choices=[], interactive=True)
                                 review_lines = gr.Dataframe(
-                                    headers=["Line", "Dialogue", "Speaker", "Uncertain"],
-                                    datatype=["number", "str", "str", "bool"],
-                                    column_widths=[75, "55%", "23%", 85],
+                                    headers=["Line", "Dialogue", "Speaker", "Uncertain", "Performance cues", "Voice direction"],
+                                    datatype=["number", "str", "str", "bool", "str", "str"],
+                                    column_widths=[75, "30%", "15%", 85, "20%", "20%"],
                                     interactive=False,
                                     max_height=360,
                                     visible=False,
@@ -314,6 +327,10 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                                 choices=model_choices, value=default_model, label="Speech model", interactive=True
                             )
                             with gr.Accordion("Generation settings", open=False):
+                                use_performance_cues = gr.Checkbox(
+                                    label="Use saved Breeze performance cues", value=True,
+                                    info="For local Breeze TTS 2 generation and realtime playback.",
+                                )
                                 validate_audio = gr.Checkbox(value=True, label="Validate audio with Whisper")
                                 with gr.Row():
                                     validation_strictness = gr.Dropdown(
@@ -343,7 +360,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                                 stop_book = gr.Button("Stop generation", variant="stop", interactive=False)
                             book_progress = gr.HTML(visible=False)
                             book_status = gr.Textbox(label="Audiobook status", interactive=False, visible=False)
-                            audiobook = gr.File(label="Download audiobook", interactive=False, visible=False)
+                            audiobook = gr.DownloadButton("Download M4B", visible=False)
                         create_book_output_panel(book, private_event=PRIVATE_EVENT)
                         playback_panel = PlaybackPanel()
 
@@ -434,7 +451,8 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
         playback_panel.bind(
             book, cast, book_model, validate_audio, batch_size, model_settings, validation_strictness, max_retries,
             voice_panel, event_options=PRIVATE_EVENT, runtime_settings=runtime_panel, remote_panel=remote_panel,
-            console_for=activity_panel.console_for,
+            console_for=activity_panel.console_for, performance_cues=use_performance_cues,
+            character_voices=character_voices,
         )
 
         def present_book(session, voices, problem=None):
@@ -472,15 +490,17 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                 close_book_session(previous)
                 source = fields[1] if fields[0] == "epub" else None
                 project_id = active_id if using_template else None
+                delivery_default = True if previous is not None and not using_template else gr.skip()
                 return (
                     *present_book(session, {}),
                     project_id, gr.update(interactive=True), gr.update(interactive=bool(project_id)),
                     gr.update(value=None, visible=False),
                     source, gr.skip() if source else gr.update(value=None),
+                    delivery_default, delivery_default, delivery_default,
                 )
             return (
                 *[gr.skip()] * (len(import_outputs) - 1),
-                gr.update(value=problem, visible=True), gr.skip(), gr.skip(),
+                gr.update(value=problem, visible=True), *[gr.skip()] * 5,
             )
 
         book_outputs = [
@@ -491,7 +511,8 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
         import_outputs = [*book_outputs, *project_actions]
         imported_book = text_import.load.click(
             load_book, [book, active_project, *text_import.inputs],
-            [*import_outputs, imported_epub, text_import.epub], **PRIVATE_EVENT,
+            [*import_outputs, imported_epub, text_import.epub,
+             use_performance_cues, character_voices, analyze_performance_cues], **PRIVATE_EVENT,
         )
 
         def refresh_projects(selected=None):
@@ -551,6 +572,9 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                     loaded.validate_audio, loaded.batch_size, name,
                     loaded.model_options,
                     loaded.strictness, loaded.max_retries, loaded.auto_concat,
+                    getattr(loaded, "performance_cues", False),
+                    getattr(loaded, "character_voices", False),
+                    getattr(loaded, "analyze_performance_cues", False),
                 )
             if loaded is not None:
                 close_book_session(loaded.session)
@@ -580,7 +604,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
 
         def store_project(
             operation, destination, session, voices, model, source, validate, batch, settings,
-            strictness, retries, export, *narrator_fields,
+            strictness, retries, export, performance_cues, character_voices, analyze_performance_cues, *narrator_fields,
         ):
             try:
                 if session is None:
@@ -591,6 +615,8 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                     validate_audio=validate, batch_size=batch or PROJECT_BATCH_SIZE_DEFAULT,
                     model_options=settings,
                     strictness=strictness, max_retries=retries, auto_concat=export,
+                    performance_cues=performance_cues, character_voices=character_voices,
+                    analyze_performance_cues=analyze_performance_cues,
                 )
             except (WebProjectError, WebRenderError) as exc:
                 message = str(exc)
@@ -623,6 +649,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
             text_import.pasted_text, *text_import.settings_outputs, *voice_panel.outputs, *voice_panel.selection_outputs,
             voice_panel.library_status, book_model,
             validate_audio, batch_size, project_name, model_settings, validation_strictness, max_retries, auto_concat,
+            use_performance_cues, character_voices, analyze_performance_cues,
         ]
         opened_project = open_project.click(
             open_project_snapshot, [saved_projects, book], opened_project_outputs, **PRIVATE_EVENT,
@@ -639,6 +666,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                     name or "", template.session, narrator=template.narrator, voices={}, model_id=template.model_id,
                     model_options=template.model_options, batch_size=template.batch_size, strictness=template.strictness,
                     max_retries=template.max_retries, auto_concat=template.auto_concat,
+                    performance_cues=True, character_voices=True, analyze_performance_cues=True,
                 )
             except WebProjectError as exc:
                 updates = [gr.skip()] * len(opened_project_outputs)
@@ -676,13 +704,15 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
         )
         persist_inputs = [
             book, cast, book_model, imported_epub, validate_audio, batch_size, model_settings,
-            validation_strictness, max_retries, auto_concat, *voice_panel.inputs,
+            validation_strictness, max_retries, auto_concat,
+            use_performance_cues, character_voices, analyze_performance_cues, *voice_panel.inputs,
         ]
         persist_outputs = [book, cast, active_project, saved_projects, open_project, save_changes, project_status]
         save_new.click(save_named_project, [project_name, *persist_inputs], persist_outputs, **PRIVATE_EVENT)
         save_changes.click(save_loaded_project, [active_project, *persist_inputs], persist_outputs, **PRIVATE_EVENT)
 
-        def analyze_book(session, key, model, reasoning, endpoint, settings_json, selected_role, request: gr.Request):
+        def analyze_book(session, key, model, reasoning, endpoint, settings_json, selected_role, character_voices,
+                         performance_cues, request: gr.Request):
             console = activity_panel.console_for(request.session_hash)
             secret = (key or "").strip()
 
@@ -703,7 +733,8 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                     raise WebBackendError("Remove the API key from the chat completions URL.")
                 session = analyze_book_dialogue(
                     session, secret, model, effort=reasoning or "", endpoint=endpoint,
-                    settings_json=settings_json or "", on_log=log,
+                    settings_json=settings_json or "", on_log=log, performance_cues=performance_cues,
+                    character_voices=character_voices,
                 )
             except (StoredApiKeyError, WebBackendError) as exc:
                 message = str(exc)
@@ -717,7 +748,10 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
             yield gr.skip(), gr.skip(), gr.skip(), voice_status(redact(message))
 
         analyzed = analyze.click(
-            analyze_book, [book, api_key, llm_model, effort, llm_endpoint, llm_extra_params, cast_role],
+            analyze_book, [
+                book, api_key, llm_model, effort, llm_endpoint, llm_extra_params, cast_role, character_voices,
+                analyze_performance_cues,
+            ],
             [book, characters, cast_role, analysis_status], show_progress="hidden", **PRIVATE_EVENT,
         )
 
@@ -738,7 +772,13 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                 voice, role, voice_status(), voice_status(message),
             )
 
-        def show_cast_voice(role, voices, session, narrator_selected, narrator_name):
+        def unassigned_cast_message(session, role, role_name, use_character_voices):
+            character = session.roster.get(role) if session.roster is not None else None
+            if use_character_voices and character is not None and character_voice_instruction(character):
+                return f"{role_name} uses the narrator voice with subtle character direction in local Breeze TTS 2."
+            return f"{role_name} uses the narrator voice by default."
+
+        def show_cast_voice(role, voices, session, narrator_selected, narrator_name, use_character_voices):
             if role is None or session is None:
                 return gr.update(visible=False), *cast_fields_for(None, RenderVoice(), None)
             if role == _narrator_role(session):
@@ -751,7 +791,9 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                 return gr.update(visible=False), *cast_fields_for(None, RenderVoice(), None)
             voice = voices.get(role)
             if voice is None:
-                fields = cast_fields_for(role, RenderVoice(), f"{role_name} uses the narrator voice by default.")
+                fields = cast_fields_for(
+                    role, RenderVoice(), unassigned_cast_message(session, role, role_name, use_character_voices),
+                )
             elif voice == RenderVoice():
                 fields = cast_fields_for(role, voice, f"{role_name} uses the narrator voice.", mode="narrator")
             else:
@@ -771,8 +813,21 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
             return gr.update(visible=True), *fields
 
         cast_role.change(
-            show_cast_voice, [cast_role, cast, book, voice_panel.selected, voice_panel.name],
+            show_cast_voice, [cast_role, cast, book, voice_panel.selected, voice_panel.name, character_voices],
             [cast_editor, *cast_fields], **PRIVATE_EVENT,
+        )
+
+        def refresh_unassigned_cast_status(session, voices, role, use_character_voices):
+            if session is None or role is None or role in voices or role == _narrator_role(session):
+                return gr.skip()
+            role_name = _cast_role_name(session, role)
+            if role_name is None:
+                return gr.skip()
+            return voice_status(unassigned_cast_message(session, role, role_name, use_character_voices))
+
+        character_voices.input(
+            refresh_unassigned_cast_status, [*cast_inputs, character_voices], cast_status,
+            show_progress="hidden", **PRIVATE_EVENT,
         )
         cast_mode.input(
             lambda mode: (gr.update(visible=mode == "saved"), gr.update(visible=mode == "custom")),
@@ -789,7 +844,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                     if not selected:
                         raise WebVoiceError("Choose a saved voice before saving the assignment.")
                     voice = load_voice(selected).voice
-                elif mode == "narrator":
+                elif mode in {"auto", "narrator"}:
                     voice = RenderVoice()
                 elif mode == "custom":
                     voice = replace(
@@ -813,6 +868,11 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                 role_name = _cast_role_name(session, role)
                 if role_name is None:
                     raise WebVoiceError("Choose a role from the casting list.")
+                if mode == "auto":
+                    updated_voices = dict(voices)
+                    updated_voices.pop(role, None)
+                    fields = cast_fields_for(role, voice, f"Restored automatic casting for {role_name}.", mode=mode)
+                    return updated_voices, *fields, *narrator_unchanged
                 if mode == "narrator":
                     message = f"Saved the narrator voice for {role_name}."
                 else:
@@ -861,7 +921,10 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
             ]
             return (
                 gr.update(
-                    value=[[row.first_line + 1, row.text, row.speaker, row.uncertain] for row in rows],
+                    value=[
+                        [row.first_line + 1, row.text, row.speaker, row.uncertain, row.performance, row.voice_direction]
+                        for row in rows
+                    ],
                     visible=bool(rows),
                 ),
                 gr.update(choices=choices, value=selected_line, visible=bool(rows)),
@@ -938,8 +1001,10 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
             if problem:
                 return None, voice_status(problem), gr.update(interactive=False)
             voice = voices.get(keep)
-            if keep == _narrator_role(session) or voice is None or voice == RenderVoice():
+            if keep == _narrator_role(session) or voice == RenderVoice():
                 voice_label = narrator_name or "the narrator voice"
+            elif voice is None:
+                voice_label = "chosen automatically"
             else:
                 voice_label = voice.name or "the retained character's custom voice"
             summary = (
@@ -1010,11 +1075,14 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
             changed_inputs=[cast], changed_outputs=[*book_outputs, review_panel, review_section],
             event_options=PRIVATE_EVENT, source_epub=imported_epub,
         )
+        review_outputs = [review_lines, review_line, review_speaker, save_speaker, review_status]
         analyzed.then(
             update_review_sections, [book, review_section], [review_panel, review_section],
             show_progress="hidden", **PRIVATE_EVENT,
+        ).then(
+            display_review_section, [book, review_section], review_outputs,
+            show_progress="hidden", **PRIVATE_EVENT,
         )
-        review_outputs = [review_lines, review_line, review_speaker, save_speaker, review_status]
         review_section.change(display_review_section, [book, review_section], review_outputs, **PRIVATE_EVENT)
         save_speaker.click(
             update_dialogue_speaker, [book, review_section, review_line, review_speaker], [book, *review_outputs],
@@ -1023,8 +1091,8 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
 
         def generate_audiobook(
             session, voices, model, validate, batch, settings,
-            strictness, retries, export, first, last, regenerate,
-            force_cpu, whisper_model, whisper_device, save_generation_logs, aac_bitrate,
+            strictness, retries, export, first, last, regenerate, performance_cues, character_voices,
+            force_cpu, whisper_model, whisper_device, save_generation_logs, aac_bitrate, checkpoint_format,
             remote_endpoint, remote_config,
             request: gr.Request, *narrator_fields,
         ):
@@ -1039,7 +1107,9 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                 return
             try:
                 narrator = voice_panel.snapshot(*narrator_fields)
-                runtime = runtime_panel.snapshot(force_cpu, whisper_model, whisper_device, save_generation_logs, aac_bitrate)
+                runtime = runtime_panel.snapshot(
+                    force_cpu, whisper_model, whisper_device, save_generation_logs, aac_bitrate, checkpoint_format,
+                )
                 remote = remote_panel.selection_for(remote_endpoint, remote_config) if model == REMOTE_MODEL_ID else None
             except (WebRenderError, WebRuntimeSettingsError, WebRemoteTtsError) as exc:
                 yield voice_status(str(exc)), gr.skip(), gr.skip()
@@ -1064,6 +1134,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                         model_options=settings.get(model),
                         strictness=strictness or None, max_retries=retries, auto_concat=export,
                         first_line=first, last_line=last, regenerate=regenerate,
+                        performance_cues=performance_cues, character_voices=character_voices,
                         runtime_settings=runtime,
                         **({"remote_selection": remote} if remote is not None else {}),
                     )
@@ -1091,6 +1162,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
             [
                 book, cast, book_model, validate_audio, batch_size, model_settings,
                 validation_strictness, max_retries, auto_concat, first_line, last_line, regenerate_lines,
+                use_performance_cues, character_voices,
                 *runtime_panel.inputs, *remote_panel.selection_inputs, *voice_panel.inputs,
             ],
             [book_status, audiobook, stop_book],
@@ -1100,7 +1172,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
 
         def compare_samples(
             models, text, language, settings, force_cpu, whisper_model, whisper_device, save_generation_logs,
-            aac_bitrate,
+            aac_bitrate, checkpoint_format,
             remote_endpoint, remote_config,
             request: gr.Request, progress=gr.Progress(), *narrator_fields,
         ):
@@ -1114,7 +1186,9 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
 
             try:
                 voice = voice_panel.snapshot(*narrator_fields)
-                runtime = runtime_panel.snapshot(force_cpu, whisper_model, whisper_device, save_generation_logs, aac_bitrate)
+                runtime = runtime_panel.snapshot(
+                    force_cpu, whisper_model, whisper_device, save_generation_logs, aac_bitrate, checkpoint_format,
+                )
             except (WebRenderError, WebRuntimeSettingsError) as exc:
                 yield [voice_status(str(exc)), gr.skip(), *[gr.skip() for _ in sample_players]]
                 return

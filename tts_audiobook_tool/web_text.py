@@ -9,6 +9,7 @@ from itertools import groupby
 from pathlib import Path
 
 from tts_audiobook_tool.app_types import Book, BookSection, BookSegmentationSettings, SegmentationStrategy
+from tts_audiobook_tool.app_types.delivery_cue import DeliveryCue
 from tts_audiobook_tool.app_types.phrase import PhraseGroup, Reason
 from tts_audiobook_tool.constants import MAX_WORDS_PER_SEGMENT_DEFAULT, MAX_WORDS_PER_SEGMENT_MAX, MAX_WORDS_PER_SEGMENT_MIN
 from tts_audiobook_tool.project_support.project_text_io_util import ProjectTextIOUtil
@@ -210,7 +211,12 @@ def _utterance_fragment(book: Book, original: UtteranceAttribution, lines: tuple
     if lines == original.lines:
         return original
     text = "".join(book.phrase_groups[line].text for line in lines).strip()
-    return replace(original, lines=lines, text=text[:UTTERANCE_TEXT_EXCERPT_CHARS])
+    delivery = original.delivery
+    if delivery:
+        delivery = delivery.with_boundaries(
+            before=lines[0] == original.first_line, after=lines[-1] == original.lines[-1],
+        )
+    return replace(original, lines=lines, text=text[:UTTERANCE_TEXT_EXCERPT_CHARS], delivery=delivery)
 
 
 def _preserve_section_attributions(book: Book, previous: AttributionsFile) -> AttributionsFile:
@@ -248,11 +254,17 @@ def _preserve_section_attributions(book: Book, previous: AttributionsFile) -> At
             chunk.start, chunk.end, UtteranceUtil.range_text_hash(book, chunk.start, chunk.end), utterances,
         ))
 
-    # Overlapping historical ranges may contain shadowed utterances. A new
-    # fragment must never resurrect an old speaker or overwrite a correction.
-    before = {line: (item.speaker, item.uncertain) for line, item in original_assignments.items()}
-    after = {line: (item.speaker, item.uncertain) for line, item in _attributions_by_line(book, attributions).items()}
+    # Compare projected line cues because a split changes utterance boundaries.
+    before = {line: _attribution_for_line(item, line) for line, item in original_assignments.items()}
+    after = {line: _attribution_for_line(item, line) for line, item in _attributions_by_line(book, attributions).items()}
     return attributions if before == after and attributions != previous else previous
+
+
+def _attribution_for_line(item: UtteranceAttribution, line: int) -> tuple[str, bool, DeliveryCue | None]:
+    cue = item.delivery
+    if cue:
+        cue = cue.with_boundaries(before=line == item.first_line, after=line == item.lines[-1])
+    return item.speaker, item.uncertain, cue
 
 
 def _attributions_by_line(book: Book, attributions: AttributionsFile) -> dict[int, UtteranceAttribution]:

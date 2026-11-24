@@ -5,6 +5,7 @@ from typing import Any
 
 from tts_audiobook_tool import text_util
 from tts_audiobook_tool.app_types import Strictness
+from tts_audiobook_tool.app_types.delivery_cue import DeliveryCue
 from tts_audiobook_tool.app_types.force_align_util import ForceAlignUtil
 from tts_audiobook_tool.app_types.phrase import PhraseGroup
 from tts_audiobook_tool.project import Project
@@ -18,6 +19,7 @@ from tts_audiobook_tool.app_types.validation_findings import ValidationFindings,
 from tts_audiobook_tool.validator import Validator
 from tts_audiobook_tool.app_types.validation_result import POSSIBLE_TRUNCATION_UI_MESSAGE, TranscriptResult, ValidationResult
 from tts_audiobook_tool.transcriber import Transcriber
+from tts_audiobook_tool.tts_models.breeze_base_model import BreezeBaseModel
 from tts_audiobook_tool.util import *
 
 class SegmentTranscriptUtil:
@@ -34,18 +36,22 @@ class SegmentTranscriptUtil:
     EXCEPTION_WORD_ERROR_SENTINEL = ValidationFindings.LEGACY_INVALID_SCORE
 
     @staticmethod
-    def make_inference_prompt(project: Project, source: str) -> str:
+    def make_inference_prompt(project: Project, source: str, delivery: DeliveryCue | None = None) -> str:
         """
         Returns the final text handed to the active TTS model for `source`:
         project word substitutions, then generic prompt normalization, then
         the model-specific massage (see `TtsBaseModel.prepare_text_for_inference`).
+        Local Breeze then wraps the prepared text with delivery event tags.
 
         The sidecar stores this so a segment records what the model was
         actually asked to say, which may differ from `source` (the project
         text the validator compares against the transcript).
         """
         from tts_audiobook_tool.tts import Tts
-        return Tts.get_model_support(project).prepare_text_for_inference(project, source)
+        prompt = Tts.get_model_support(project).prepare_text_for_inference(project, source)
+        if delivery is not None and project.get_tts_model_type().id == BreezeBaseModel.INFO.id:
+            prompt = BreezeBaseModel.apply_delivery_events(prompt, delivery)
+        return prompt
 
     @staticmethod
     def from_validation_result(
@@ -56,7 +62,7 @@ class SegmentTranscriptUtil:
     ) -> SegmentTranscriptData:
 
         source = phrase_group.spoken_text(project.language_code)
-        prompt = SegmentTranscriptUtil.make_inference_prompt(project, source)
+        prompt = SegmentTranscriptUtil.make_inference_prompt(project, source, phrase_group.delivery)
         transcript = Transcriber.get_flat_text_from_words(validation_result.transcript_words)
         normalized_source, normalized_transcript = TextNormalizer.normalize_source_and_transcript(
             source, transcript, project.language_code

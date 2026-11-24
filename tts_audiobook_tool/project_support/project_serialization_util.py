@@ -430,6 +430,9 @@ class ProjectSerializationUtil:
             )
 
         normalize_by_id('export_type', ExportType.get_by_id, list(ExportType)[0])
+        if d.get('checkpoint_format', 'flac') not in ('flac', 'aac'):
+            add_warning('checkpoint_format', 'flac')
+            d['checkpoint_format'] = 'flac'
         normalize_by_id('normalization_type', NormalizationType.from_id, list(NormalizationType)[0])
 
         reason_pause_type = ReasonPauseTypes.get_by_id(d.get('reason_pauses', ''))
@@ -970,6 +973,7 @@ class ProjectSerializationUtil:
             "markers": sorted(project.markers),
             "subdivide_phrases": project.subdivide_phrases,
             "export_type": project.export_type.id,
+            "checkpoint_format": project.checkpoint_format,
             "use_break_sound_effect": project.use_break_sound_effect,
             "normalization_type": project.normalization_type.value.id,
             "high_shelf": project.high_shelf,

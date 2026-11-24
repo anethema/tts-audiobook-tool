@@ -7,6 +7,7 @@ from typing import cast
 import pytest
 
 from tts_audiobook_tool.app_types import DeviceType
+from tts_audiobook_tool.app_types.delivery_cue import DeliveryCue
 from tts_audiobook_tool.menus.menu_util import get_string_from
 from tts_audiobook_tool.menus.model.model_menu_shared import ModelMenuShared
 from tts_audiobook_tool.project import Project
@@ -169,7 +170,8 @@ def fake_model(monkeypatch):
             lib.generate_state.append(
                 {"bound": lib.bound, "head_dtype": self.depth_decoder.codebooks_head.weight.dtype})
             # One row per request, each with its own (EOS-trimmed) length
-            return [torch.zeros(1, 2400 * (row + 1)) for row in range(kwargs["num_rows"])]
+            return [torch.zeros(1, 2400 * (int(request["id"].removeprefix("seg-")) + 1))
+                    for request in lib.prepare_calls[-1]["requests"]]
 
     monkeypatch.setattr(module, "set_all_seeds", lambda seed: (lib.seeds.append(seed), lib.events.append(("seed", seed))))
     monkeypatch.setattr(module, "BatchDepthDecoder", FakeBatchDepthDecoder)
@@ -228,6 +230,111 @@ def test_breeze_generation_batches_prompts_in_one_call(fake_model, tmp_path):
     assert [r["text"] for r in requests] == ["One.", "Two.", "Three."]
     assert len({r["id"] for r in requests}) == 3
     assert all(r["ref_text"] == "Hi." and r["ref_audio_path"].endswith("voice.flac") for r in requests)
+
+
+@pytest.mark.parametrize("file_name, neutral_template, directed_template", [
+    ("selected.flac", "ref_clone_tata", "ref_edit_tata"),
+    ("", "tts_plain", "tts_instruction"),
+])
+def test_breeze_delivery_batches_compatible_rows_in_input_order(
+        fake_model, tmp_path, monkeypatch, file_name, neutral_template, directed_template,
+):
+    model, lib = fake_model
+    project = make_project(tmp_path, [
+        {"file_name": "other.flac", "transcript": ""},
+        {"file_name": file_name, "transcript": "The selected voice."},
+    ])
+    project.word_substitutions = {"quiet": "still", "sighs": "ignore"}
+    project.set_model_setting(MODEL_ID, "seed", 1234)
+    monkeypatch.setattr(Tts, "_type", TtsModelType.require_by_id(MODEL_ID))
+    monkeypatch.setattr(Tts, "get_instance", lambda: model)
+
+    result = Tts.generate_using_project(
+        project,
+        ["A quiet room!", "The door shut.", "I stayed.", "Just listen."],
+        voice_selection_index=1,
+        delivery_cues=[
+            DeliveryCue(before="sighs", after="coughs"),
+            DeliveryCue(direction="With growing dread"),
+            None,
+            DeliveryCue(direction="A conspiratorial whisper", before="clears throat"),
+        ],
+    )
+
+    assert isinstance(result, list)
+    assert [len(sound.data) for sound in result] == [2400, 4800, 7200, 9600]
+    assert lib.seeds == [1234] * 3
+    assert [call["template"] for call in lib.prepare_calls] == [neutral_template, directed_template]
+    assert [call["guidance_scale"] for call in lib.prepare_calls] == [1.0, 4.0]
+    neutral, directed = (call["requests"] for call in lib.prepare_calls)
+    assert [(row["id"], row["text"]) for row in neutral] == [
+        ("seg-0", "(sighs) A still room! (coughs)"), ("seg-2", "I stayed."),
+    ]
+    assert all("instruction" not in row for row in neutral)
+    assert [(row["id"], row["text"], row["instruction"]) for row in directed] == [
+        ("seg-1", "The door shut.", "With growing dread"),
+        ("seg-3", "(clears throat) Just listen.", "A conspiratorial whisper"),
+    ]
+    assert [row.get("ref_text", "") for row in neutral + directed] == [
+        "The selected voice." if file_name else "",
+    ] * 4
+    if file_name:
+        assert all(row["ref_audio_path"].endswith(file_name) for row in neutral + directed)
+
+
+@pytest.mark.parametrize(("file_name", "template"), [
+    ("voice.flac", "ref_edit_tata"),
+    ("", "tts_instruction"),
+])
+def test_breeze_delivery_combines_voice_and_row_instructions_in_one_batch(
+        fake_model, tmp_path, monkeypatch, file_name, template,
+):
+    model, lib = fake_model
+    baseline = "Read evenly and clearly.\nUse a female voice. Slightly warmer tone."
+    project = make_project(tmp_path, [{
+        "file_name": file_name, "transcript": "A sample." if file_name else "",
+        "instructions": {MODEL_ID: baseline},
+    }])
+    monkeypatch.setattr(Tts, "_type", TtsModelType.require_by_id(MODEL_ID))
+    monkeypatch.setattr(Tts, "get_instance", lambda: model)
+
+    result = Tts.generate_using_project(
+        project, ["One!", "Two!", "Three!"],
+        delivery_cues=[None, DeliveryCue("Subdued", before="sighs"), DeliveryCue("Slowly")],
+    )
+
+    assert isinstance(result, list) and len(result) == 3
+    assert len(lib.prepare_calls) == 1
+    assert lib.prepare_calls[0]["template"] == template
+    rows = lib.prepare_calls[0]["requests"]
+    assert [row["instruction"] for row in rows] == [
+        baseline, f"{baseline}\nSubdued", f"{baseline}\nSlowly",
+    ]
+    assert [row["text"] for row in rows] == ["One!", "(sighs) Two!", "Three!"]
+
+
+@pytest.mark.parametrize("message", ["Malformed instruction", "CUDA out of memory"])
+def test_breeze_delivery_split_preserves_row_errors_or_aborts_on_oom(fake_model, tmp_path, message):
+    model, lib = fake_model
+    project = make_project(tmp_path)
+    generate = model._model.generate
+
+    def fail_directed(**kwargs):
+        if lib.bound:
+            raise RuntimeError(message)
+        return generate(**kwargs)
+
+    model._model.generate = fail_directed
+    result = model.generate_using_project(project, ["One.", "Two.", "Three."],
+                                          delivery_directions=["Urgently", "", "Quietly"])
+
+    if message == "CUDA out of memory":
+        assert result == f"RuntimeError: {message}"
+        assert len(lib.prepare_calls) == 1
+    else:
+        assert isinstance(result, list)
+        assert (result[0], result[2]) == (f"RuntimeError: {message}",) * 2
+        assert len(result[1].data) == 4800
 
 
 def test_breeze_generation_batch_row_mismatch_is_an_error(fake_model, tmp_path):

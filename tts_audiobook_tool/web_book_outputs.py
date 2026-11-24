@@ -28,6 +28,7 @@ from tts_audiobook_tool.project_support.project_load_util import ProjectLoadUtil
 from tts_audiobook_tool.project_support.project_util import ProjectUtil
 from tts_audiobook_tool.project_support.sound_segment_util import UNKNOWN_ERROR_RANK, get_segment_error_rank
 from tts_audiobook_tool.reason_pauses import ReasonPauseTypes
+from tts_audiobook_tool.sound.checkpoint_audio import has_complete_audio
 from tts_audiobook_tool.tts_models.tts_model_type import TtsModelType
 from tts_audiobook_tool.util import make_file_line_ranges
 
@@ -53,6 +54,7 @@ class BookRenderRun:
     generated_lines: int
     total_lines: int
     updated_at: float
+    performance_cues: bool = False
 
 
 @dataclass(frozen=True)
@@ -156,6 +158,7 @@ def list_book_render_runs(session: BookSession) -> tuple[BookRenderRun, ...]:
                     (model.value.ui.get("proper_name") if model.id != "none" else None) or project.tts_model_type,
                     project.sound_segments.num_generated(), len(project.phrase_groups),
                     (directory / PROJECT_SOUND_SEGMENTS_SUBDIR).stat().st_mtime,
+                    performance_cues=any(group.delivery for group in project.phrase_groups),
                 ))
         except (OSError, WebBookOutputError):
             continue
@@ -186,8 +189,6 @@ def review_book_line(session: BookSession, run_id: str, line: int) -> BookLineRe
 
 def get_book_take_path(session: BookSession, run_id: str, line: int, filename: str) -> str:
     """Resolve a selected take only if it belongs to the chosen saved line."""
-    import soundfile
-
     directory = _run_directory(session, run_id)
     with _open_render_project(directory) as project:
         index = _line_index(line, len(project.phrase_groups))
@@ -195,9 +196,9 @@ def get_book_take_path(session: BookSession, run_id: str, line: int, filename: s
             raise WebBookOutputError("Choose an available take for this line.")
         path = directory / PROJECT_SOUND_SEGMENTS_SUBDIR / filename
         try:
-            if soundfile.info(path).frames <= 0:
+            if not has_complete_audio(path):
                 raise ValueError
-        except (OSError, ValueError, soundfile.LibsndfileError) as error:
+        except (OSError, ValueError) as error:
             raise WebBookOutputError("The selected take could not be read.") from error
         return str(path)
 

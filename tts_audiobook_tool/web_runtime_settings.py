@@ -28,6 +28,7 @@ class WebRuntimeSettings:
     whisper_device: str | None = None
     save_generation_logs: bool = False
     aac_bitrate: str = AAC_BITRATE_DEFAULT
+    checkpoint_format: str = "flac"
 
     def __post_init__(self) -> None:
         if type(self.force_cpu) is not bool or type(self.save_generation_logs) is not bool:
@@ -38,6 +39,8 @@ class WebRuntimeSettings:
             raise WebRuntimeSettingsError("Choose a supported Whisper device.")
         if self.aac_bitrate not in AAC_BITRATES:
             raise WebRuntimeSettingsError("Choose a supported AAC bitrate.")
+        if self.checkpoint_format not in ("flac", "aac"):
+            raise WebRuntimeSettingsError("Choose FLAC or AAC for new render checkpoints.")
 
     def generation_prefs(self, project_dir: str, *, validate_audio: bool) -> Prefs:
         from tts_audiobook_tool.prefs import Prefs

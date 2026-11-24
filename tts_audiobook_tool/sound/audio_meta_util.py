@@ -120,8 +120,6 @@ class AudioMetaUtil:
 
         tags = cast(MP4Tags, mp4.tags)
         tags[tag_key] = MP4FreeForm(utf8_bytes, dataformat=AtomDataType.UTF8)
-        mp4.save(file_to_modify)
-
         try:
             mp4.save()
         except Exception as e:
