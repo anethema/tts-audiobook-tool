@@ -92,6 +92,7 @@ class BookSession:
     word_substitutions: dict[str, str] = field(default_factory=dict)
     line_voices: dict[int, RenderVoice] = field(default_factory=dict)
     analysis_recovery_notice: str = ""
+    analysis_scope: str | None = None
 
     @property
     def language_code(self) -> str:
@@ -173,6 +174,7 @@ def new_book_session(
         roster=roster,
         attributions=loaded,
         attribution_dir=workspace,
+        analysis_scope=project_dir,
         project_language=project_language,
         word_substitutions=dict(word_substitutions or {}),
         line_voices=dict(line_voices or {}),
@@ -249,6 +251,60 @@ def book_cast_problem(
     return None
 
 
+def _analysis_origin(
+        session: BookSession, roster: Roster, attributions: AttributionsFile, previous: object, *,
+        model: str, effort: str, endpoint: str, settings_json: str, local_thinking: str | None,
+        performance_cues: bool, character_voices: bool,
+) -> dict[str, str]:
+    book_id = recovery.book_key(session.book, session.analysis_scope)
+    if local_thinking is not None:
+        provider = ("ollama", LOCAL_QWEN_MODEL, local_thinking)
+    else:
+        try:
+            extra_params = json.loads(settings_json.strip() or "{}")
+        except ValueError:
+            extra_params = settings_json
+        provider = ("remote", model.strip(), (endpoint or "").strip(), effort.strip(), extra_params)
+    config = recovery.settings_key(provider, performance_cues, character_voices)
+    # Manual edits discard this marker and become the starting point for their own checkpoint.
+    if (isinstance(previous, dict) and previous.get("book") == book_id and previous.get("config") == config
+            and isinstance(previous.get("baseline"), str) and re.fullmatch(r"[0-9a-f]{64}", previous["baseline"])):
+        baseline = previous["baseline"]
+    else:
+        baseline = recovery.baseline_key(roster, attributions)
+    return {"book": book_id, "config": config, "baseline": baseline}
+
+
+def restore_session_analysis(
+        session: BookSession, *, model: str = DEFAULT_OPENAI_MODEL, effort: str = DEFAULT_REASONING_EFFORT,
+        endpoint: str = DEFAULT_LLM_ENDPOINT, settings_json: str = "", local_thinking: str | None = None,
+        performance_cues: bool = False, character_voices: bool = False, origin: object = None,
+) -> BookSession:
+    """Open the latest matching committed result without starting or resubmitting any work."""
+    if session.attribution_dir is None or not recovery.recovery_root().is_dir():
+        return session
+    expected = _analysis_origin(
+        session, session.roster or Roster(()), session.attributions, origin, model=model, effort=effort,
+        endpoint=endpoint, settings_json=settings_json, local_thinking=local_thinking,
+        performance_cues=performance_cues, character_voices=character_voices,
+    )
+    directory = recovery.checkpoint_dir(expected["book"], expected["baseline"])
+    backup = recovery.existing_checkpoint(directory, expected["config"])
+    if backup is None:
+        return session
+    # The job can continue writing after the browser reconnects. Read one atomic version
+    # and install that same version of both the roster and the quote labels in this workspace.
+    roster, attributions, marker = _read_analysis_checkpoint(session, backup)
+    if marker != expected:
+        raise WebBackendError("The dialogue checkpoint does not match the saved session.")
+    checkpoint = Path(SpeakerAssignFileUtil.attributions_path(session.attribution_dir))
+    _save_analysis_checkpoint(checkpoint, roster, attributions, origin=expected)
+    notice = session.attribution_notice
+    if attributions != session.attributions or roster != session.roster:
+        notice = f"Restored dialogue analysis from {_count_label(len(attributions.ranges), 'saved chunk range')}."
+    return replace(session, roster=roster, attributions=attributions, attribution_notice=notice, analysis_recovery_notice="")
+
+
 def analyze_book_dialogue(
         session: BookSession,
         api_key: str,
@@ -272,26 +328,14 @@ def analyze_book_dialogue(
     durable = nullcontext(None)
     origin = None
     if session.attribution_dir is not None:
-        scope = session.project_dir if session.project_dir != session.attribution_dir else None
-        book_id = recovery.book_key(session.book, scope)
-        if local_tagger is None:
-            try:
-                extra_params = json.loads(settings_json.strip() or "{}")
-            except ValueError:
-                extra_params = settings_json
-            provider = ("remote", model.strip(), (endpoint or "").strip(), effort.strip(), extra_params)
-        else:
-            provider = ("ollama", LOCAL_QWEN_MODEL, local_tagger.thinking)
-        config = recovery.settings_key(provider, performance_cues, character_voices)
-        # Review edits rewrite the local checkpoint without this marker. Their own
-        # roster and labels then become a separate, authoritative starting point.
-        if (isinstance(previous, dict) and previous.get("book") == book_id and previous.get("config") == config
-                and isinstance(previous.get("baseline"), str) and re.fullmatch(r"[0-9a-f]{64}", previous["baseline"])):
-            seed = previous["baseline"]
-        else:
-            seed = recovery.baseline_key(roster, attributions)
-        origin = {"book": book_id, "config": config, "baseline": seed}
-        durable = recovery.locked_checkpoint(recovery.checkpoint_dir(book_id, seed), config)
+        origin = _analysis_origin(
+            session, roster, attributions, previous, model=model, effort=effort, endpoint=endpoint,
+            settings_json=settings_json, local_thinking=local_tagger.thinking if local_tagger is not None else None,
+            performance_cues=performance_cues, character_voices=character_voices,
+        )
+        durable = recovery.locked_checkpoint(
+            recovery.checkpoint_dir(origin["book"], origin["baseline"]), origin["config"],
+        )
 
     try:
         with durable as backup:

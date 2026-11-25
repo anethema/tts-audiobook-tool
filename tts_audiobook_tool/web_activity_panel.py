@@ -5,9 +5,11 @@ from contextlib import suppress
 from dataclasses import dataclass
 from html import escape
 import math
+import re
 from threading import Lock
 from time import monotonic
 from typing import TYPE_CHECKING
+from weakref import WeakValueDictionary
 
 import gradio as gr
 
@@ -190,6 +192,25 @@ class ActivityPanel:
         self._lock = Lock()
         self._terminal_log = terminal_log
         self._sessions: dict[str | None, SessionActivity] = {}
+        self._browser_ids: dict[str, str] = {}
+        # A running job retains its activity even after the last tab disconnects.
+        self._browsers: WeakValueDictionary[str, SessionActivity] = WeakValueDictionary()
+
+    def bind_browser(self, session_id: str | None, token: str) -> None:
+        if session_id is None or not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
+            return
+        with self._lock:
+            activity = self._browsers.get(token)
+            if activity is None and session_id not in self._browser_ids:
+                activity = self._sessions.get(session_id)
+            if activity is None:
+                activity = SessionActivity(terminal_log=self._terminal_log)
+            self._browser_ids[session_id] = token
+            self._sessions[session_id] = self._browsers[token] = activity
+
+    def browser_for(self, session_id: str | None) -> str | None:
+        with self._lock:
+            return self._browser_ids.get(session_id) if session_id is not None else None
 
     def session(self, session_id: str | None) -> SessionActivity:
         with self._lock:
@@ -199,6 +220,11 @@ class ActivityPanel:
 
     def console_for(self, session_id: str | None):
         return self.session(session_id).write
+
+    def disconnect(self, session_id: str | None) -> None:
+        with self._lock:
+            self._sessions.pop(session_id, None)
+            self._browser_ids.pop(session_id, None)
 
     def bind(self, app: gr.Blocks, progress: gr.HTML, analysis_progress: gr.HTML) -> None:
         console = gr.Textbox(
@@ -217,8 +243,7 @@ class ActivityPanel:
             return activity.changes_since(last_seen)
 
         def discard_activity(request: gr.Request):
-            with self._lock:
-                self._sessions.pop(request.session_hash, None)
+            self.disconnect(request.session_hash)
 
         timer.tick(
             refresh_activity, versions, [console, progress, analysis_progress, versions],

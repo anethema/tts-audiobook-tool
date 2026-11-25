@@ -796,7 +796,7 @@ def test_character_merge_confirms_current_pair_and_survives_reopening(tmp_path, 
 
     async def exercise():
         open_project = ui.event("open_project_snapshot")
-        await ui.run(ui.event("list_saved_projects"))
+        await ui.run(ui.event("restore_browser_session"), "0" * 32, None, None)
         await ui.run(open_project, project.project_id, None)
         refresh = ui.event("refresh_character_merge")
         (controls,) = await ui.run(refresh)
@@ -1014,3 +1014,154 @@ def test_compare_resolves_remote_selection_for_the_current_endpoint(tmp_path, mo
     values[endpoint] = "http://127.0.0.1:8000"
     asyncio.run(ui.run(compare, *values))
     assert sent == [(REMOTE_MODEL_ID, selected)]
+
+
+def test_browser_draft_restores_book_and_settings_without_starting_analysis(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("GRADIO_TEMP_DIR", str(tmp_path / "gradio"))
+    monkeypatch.setattr(gradio_app, "installed_model_choices", lambda: [("Breeze TTS 2", "venv-breeze")])
+    monkeypatch.setattr(gradio_app, "analyze_book_dialogue", lambda *a, **kw: pytest.fail("analysis on restore"))
+    monkeypatch.setattr(gradio_app, "render_model_book", lambda *a, **kw: pytest.fail("render on restore"))
+    token = "a" * 32
+
+    async def connect(ui, token):
+        restore = ui.event("restore_browser_session")
+        ui.values[restore.inputs[0]._id] = token
+        await ui.run(restore)
+
+    async def exercise():
+        ui = VoiceApp()
+        await connect(ui, token)
+        load = ui.event("load_book")
+        ui.values[load.inputs[2]._id] = "manual"
+        ui.values[load.inputs[5]._id] = "Ada nodded. “Yes.”"
+        await ui.run(load)
+        analyze = ui.event("analyze_book")
+        model = next(c for c in analyze.inputs if getattr(c, "label", None) == "LLM model")
+        ui.values[model._id] = "saved-model"
+        ui.values[analyze.inputs[1]._id] = "secret-only-in-this-tab"
+        await ui.run(ui.event("autosave_browser_session"))
+        original = ui.state[load.inputs[0]._id]
+        assert original.book.phrase_groups
+        gradio_app.close_book_session(original)
+
+        reopened = VoiceApp()
+        await connect(reopened, token)
+        load = reopened.event("load_book")
+        restored = reopened.state[load.inputs[0]._id]
+        assert [g.text for g in restored.book.phrase_groups] == [g.text for g in original.book.phrase_groups]
+        analyze = reopened.event("analyze_book")
+        model = next(c for c in analyze.inputs if getattr(c, "label", None) == "LLM model")
+        assert reopened.values[model._id] == "saved-model"
+        assert not reopened.values[analyze.inputs[1]._id]
+        summary = next(c for c in load.outputs if getattr(c, "label", None) == "Book summary")
+        assert reopened.values[summary._id] == gradio_app._book_summary(restored)
+        gradio_app.close_book_session(restored)
+
+        separate = VoiceApp()
+        await connect(separate, "b" * 32)
+        assert separate.state[separate.event("load_book").inputs[0]._id] is None
+
+    asyncio.run(exercise())
+
+
+def test_reimport_preserves_edits_and_range_until_source_or_segmentation_changes(tmp_path, monkeypatch):
+    from ebooklib import epub
+
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("GRADIO_TEMP_DIR", str(uploads))
+    monkeypatch.setattr(gradio_app, "installed_model_choices", lambda: [("Breeze TTS 2", "venv-breeze")])
+
+    def make_epub(directory, text):
+        directory.mkdir()
+        path = directory / "book.epub"
+        source = epub.EpubBook()
+        source.set_identifier("example")
+        source.set_title("Two editions")
+        source.set_language("en")
+        chapter = epub.EpubHtml(title="Chapter", file_name="one.xhtml", lang="en")
+        chapter.content = f"<p>{text}</p>"
+        source.add_item(chapter)
+        source.spine = [chapter]
+        source.toc = [epub.Link("one.xhtml", "Chapter", "one")]
+        source.add_item(epub.EpubNav())
+        epub.write_epub(str(path), source)
+        return {"path": str(path), "meta": {"_type": "gradio.FileData"}}
+
+    first = make_epub(uploads / "first", "Rue nodded. “Go ahead.”")
+    second = make_epub(uploads / "second", "Rue nodded. “Stay there.”")
+
+    async def exercise():
+        ui = VoiceApp()
+        restore = ui.event("restore_browser_session")
+        ui.values[restore.inputs[0]._id] = "e" * 32
+        await ui.run(restore)
+        load = ui.event("load_book")
+        book, project_id, _, upload = load.inputs[:4]
+        cast = load.outputs[1]
+        ui.values[upload._id] = first
+        await ui.run(load)
+        named = ui.event("save_named_project")
+        ui.values[named.inputs[0]._id] = "My working copy"
+        await ui.run(named)
+        active_id = ui.state[project_id._id]
+        assert active_id
+        original = ui.state[book._id]
+        # Editing is why comparing only freshly segmented text would lose work here.
+        original.book.title = "My edited title"
+        original.book.phrase_groups[0].phrases[0].text = "A manual correction."
+        attributed = AttributionsFile((RangeAttribution(0, 1, UtteranceUtil.range_text_hash(original.book, 0, 1),
+                                      (UtteranceAttribution((0,), "RUE"),)),))
+        edited = replace(original, attributions=attributed, roster=Roster((RosterCharacter("RUE", "Rue"),)))
+        ui.state[book._id] = edited
+        voices = {"RUE": RenderVoice(name="Chosen voice")}
+        ui.state[cast._id] = voices
+        range_controls = load.outputs[11:14]
+        for component, value in zip(range_controls, (2, 2, True), strict=True):
+            ui.values[component._id] = value
+        ui.values[load.outputs[-1]._id] = False
+        # Same bytes at a second upload path must also compare equal.
+        copy = uploads / "copy.epub"
+        copy.write_bytes(Path(first["path"]).read_bytes())
+        ui.values[upload._id] = {**first, "path": str(copy)}
+        (result,) = await ui.run(load)
+        assert any("already open" in str(item) for item in result)
+        assert ui.state[book._id] is edited and ui.state[cast._id] == voices
+        assert ui.state[project_id._id] == active_id
+        assert [ui.values[c._id] for c in range_controls] == [2, 2, True]
+        assert ui.values[load.outputs[-1]._id] is False
+
+        await ui.run(ui.event("autosave_browser_session"))
+        ui.state[book._id] = None  # Gradio evicted the transient state.
+        (result,) = await ui.run(load)
+        assert any("Reload this page" in str(item) for item in result)
+        assert ui.state[book._id] is None
+        with monkeypatch.context() as restarted:
+            restarted.setattr(gradio_app.ActivityPanel, "browser_for", lambda *_: None)
+            (result,) = await ui.run(load)
+            assert any("Reload this page" in str(item) for item in result)
+            assert ui.state[book._id] is None
+        disk = gradio_app.load_draft("e" * 32)
+        assert disk.active_project_id == active_id and disk.project.session.attributions == attributed
+        gradio_app.close_book_session(disk.project.session)
+        ui.state[book._id] = edited
+
+        # Same EPUB and a different segmentation configuration is an intentional new import.
+        dialogue = next(c for c in load.inputs if getattr(c, "label", None) == "Split dialogue into separate lines")
+        ui.values[dialogue._id] = not ui.values[dialogue._id]
+        await ui.run(load)
+        changed = ui.state[book._id]
+        assert changed.book.segmentation_settings.dialog_segmentation == ui.values[dialogue._id]
+        assert not changed.attributions.ranges and ui.state[project_id._id] is None
+        assert ui.state[cast._id] == {} and ui.values[range_controls[0]._id] == 1
+
+        # A different EPUB with the same filename, title and settings is likewise new.
+        ui.values[upload._id] = second
+        await ui.run(load)
+        current = ui.state[book._id]
+        assert current is not changed and "Stay there" in "".join(group.text for group in current.book.phrase_groups)
+        gradio_app.close_book_session(current)
+
+    asyncio.run(exercise())

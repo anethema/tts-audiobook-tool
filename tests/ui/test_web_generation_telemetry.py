@@ -300,3 +300,24 @@ def test_analysis_eta_finishes_and_starts_fresh_on_resume(monkeypatch):
     _, _, update, _ = activity.changes_since(version)
     assert "3 of 3 chunks complete" in update["value"]
     assert "ETA" not in update["value"]
+
+
+def test_browser_reconnects_to_its_job_activity_after_the_original_tab_disconnects():
+    from tts_audiobook_tool.web_activity_panel import ActivityPanel
+
+    panel = ActivityPanel()
+    browser = "a" * 32
+    panel.bind_browser("first-tab", browser)
+    running = panel.session("first-tab")
+    running.update_analysis(1, 4, "Analyzing")
+    running.write("Chunk 1 saved")
+    panel.disconnect("first-tab")
+
+    panel.bind_browser("new-tab", browser)
+    panel.bind_browser("unrelated-tab", "b" * 32)
+    assert panel.browser_for("first-tab") is None
+    assert panel.session("unrelated-tab") is not running
+    resumed = panel.session("new-tab")
+    assert resumed is running
+    console, _, progress, _ = resumed.changes_since((0, 0, 0))
+    assert console == "Chunk 1 saved" and "1 of 4 chunks" in progress["value"]

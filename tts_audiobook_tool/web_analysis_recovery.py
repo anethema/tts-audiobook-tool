@@ -53,6 +53,13 @@ def _private_directory(path: Path) -> bool:
     )
 
 
+def existing_checkpoint(directory: Path, config: str) -> Path | None:
+    if not (_private_directory(directory.parent) and _private_directory(directory)):
+        return None
+    path = directory / (config + ".json")
+    return path if path.is_file() and not path.is_symlink() else None
+
+
 def available_notice(directory: Path) -> str:
     """Report the largest saved result for this initial state across analysis settings."""
     if not (_private_directory(directory.parent) and _private_directory(directory)):

@@ -1,6 +1,7 @@
 """Private local storage for named browser projects."""
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -216,7 +217,11 @@ def load_project(
 ) -> SavedProject:
     project_dir = _find_project(project_id, root)
     snapshot, metadata = _read_snapshot(project_dir)
-    summary = _summary(project_id, metadata)
+    return _decode_snapshot(project_dir, snapshot, metadata, project_dir / "render")
+
+
+def _decode_snapshot(project_dir: Path, snapshot: dict, metadata: dict, render_dir: Path) -> SavedProject:
+    summary = _summary(project_dir.name, metadata)
     book = book_from_project_text_json_dict(snapshot)
     if isinstance(book, str):
         raise WebProjectError("The saved book text could not be read.")
@@ -270,7 +275,6 @@ def load_project(
     except (AttributeError, KeyError, TypeError, ValueError):
         raise WebProjectError("The saved project settings could not be read.") from None
 
-    render_dir = project_dir / "render"
     try:
         render_dir.mkdir(mode=0o700, exist_ok=True)
         if not _is_directory(render_dir):
@@ -316,6 +320,8 @@ def _save_snapshot(
         performance_cues: bool,
         character_voices: bool,
         analyze_performance_cues: bool,
+        publish_draft: Callable[[Callable[[], dict], dict], None] | None = None,
+        copy_asset: Callable[[Path, str], str] | None = None,
 ) -> ProjectSummary:
     try:
         model_options = _copy_model_options(model_options)
@@ -341,6 +347,7 @@ def _save_snapshot(
     if type(character_voices) is not bool:
         raise WebProjectError("Choose a valid character voice setting.")
 
+    copy_asset = copy_asset or _copy_asset
     updated = datetime.now(timezone.utc).isoformat()
     saved_references: dict[str, str] = {}
 
@@ -348,47 +355,55 @@ def _save_snapshot(
         data = asdict(voice)
         source = data.pop("reference_path")
         if source and source not in saved_references:
-            saved_references[source] = _copy_asset(assets, source)
+            saved_references[source] = copy_asset(assets, source)
         data["reference"] = saved_references.get(source)
         return data
 
-    narrator_data = save_voice(narrator)
-    voices_data = {speaker_id: save_voice(voice) for speaker_id, voice in voices.items()}
-    line_voices_data = {str(slot): save_voice(voice) for slot, voice in session.line_voices.items()}
-    source_name = _copy_asset(assets, source_epub) if source_epub else None
     summary = ProjectSummary(project_dir.name, name, session.book.title, updated)
-    _copy_render_runs(Path(session.project_dir), project_dir / "render")
+    settings = {
+        "version": 1,
+        "name": name,
+        "book_title": summary.book_title,
+        "updated": updated,
+        "source_epub": copy_asset(assets, source_epub) if source_epub else None,
+        "model_id": model_id or "",
+        "validate_audio": validate_audio,
+        "batch_size": batch_size,
+        "strictness": strictness,
+        "max_retries": max_retries,
+        "auto_concat": auto_concat,
+        **({"performance_cues": True} if performance_cues else {}),
+        "character_voices": character_voices,
+        "analyze_performance_cues": analyze_performance_cues,
+        "model_options": model_options,
+        "narrator": save_voice(narrator),
+        "voices": {speaker_id: save_voice(voice) for speaker_id, voice in voices.items()},
+    }
 
-    def payload() -> dict:
+    def book_revision() -> dict:
         return {
             **book_to_project_text_json_dict(session.book),
             "web_project": {
-                "version": 1,
-                "name": name,
-                "book_title": summary.book_title,
-                "updated": updated,
-                "source_epub": source_name,
-                "model_id": model_id or "",
-                "validate_audio": validate_audio,
-                "batch_size": batch_size,
-                "strictness": strictness,
-                "max_retries": max_retries,
-                "auto_concat": auto_concat,
-                **({"performance_cues": True} if performance_cues else {}),
-                "character_voices": character_voices,
-                "analyze_performance_cues": analyze_performance_cues,
-                "model_options": model_options,
                 "project_language": session.project_language,
                 "word_substitutions": session.word_substitutions,
                 "warnings": list(session.warnings),
                 "roster": session.roster.to_dict() if session.roster is not None else None,
                 "attributions": session.attributions.to_dict(),
                 "attribution_notice": session.attribution_notice,
-                "narrator": narrator_data,
-                "voices": voices_data,
-                "line_voices": line_voices_data,
+                "line_voices": {str(slot): save_voice(voice) for slot, voice in session.line_voices.items()},
             },
         }
+
+    if publish_draft is not None:
+        publish_draft(book_revision, settings)
+        return summary
+
+    _copy_render_runs(Path(session.project_dir), project_dir / "render")
+
+    def payload() -> dict:
+        data = book_revision()
+        data["web_project"].update(settings)
+        return data
 
     # The private, immutable assets are ready before publishing the snapshot.
     # The standard project text reader ignores the extra browser metadata.

@@ -114,6 +114,40 @@ def test_reimport_resumes_after_workspace_cleanup_with_matching_book_and_setting
     assert len(calls) == 4 and "Current passage, starting at line 3:" in calls[-1]
 
 
+def test_draft_restore_reads_completed_chunks_without_contacting_provider(tmp_path, monkeypatch):
+    book = Book(sections=[_section("FIRST"), _section("SECOND")])
+    original = web_backend.new_book_session(book)
+    # The persistent draft has its own render directory but uses the original import's analysis identity.
+    original = replace(original, project_dir=str(tmp_path / "draft-render"))
+    anna = {"id": "ANNA", "name": "Anna"}
+    replies = iter([_response(_reply({"1": "ANNA"}, [anna])), requests.Timeout(), _response(_reply({"1": "ANNA"}))])
+    calls = []
+
+    def post(*_, **kwargs):
+        calls.append(kwargs["json"]["messages"][1]["content"])
+        result = next(replies)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(requests.Session, "post", post)
+    partial = web_backend.analyze_book_dialogue(original, "test-key")
+    reopened = web_backend.new_book_session(book)
+    hydrated = web_backend.restore_session_analysis(reopened)
+    assert hydrated.roster == partial.roster and hydrated.attributions == partial.attributions
+    assert "1 saved chunk range" in hydrated.attribution_notice and len(calls) == 2
+    assert not web_backend.restore_session_analysis(reopened, effort="medium").attributions.ranges
+
+    _, _, origin = web_backend._read_analysis_checkpoint(
+        hydrated, Path(hydrated.attribution_dir) / "speaker_assign" / "attributions.json",
+    )
+    complete = web_backend.analyze_book_dialogue(partial, "test-key")
+    snapshot = web_backend.new_book_session(book, roster=partial.roster, attributions=partial.attributions)
+    hydrated = web_backend.restore_session_analysis(snapshot, origin=origin)
+    assert hydrated.roster == complete.roster and hydrated.attributions == complete.attributions
+    assert "2 saved chunk ranges" in hydrated.attribution_notice and len(calls) == 3
+
+
 def test_reopening_named_project_resumes_its_unsaved_dialogue_analysis(tmp_path, monkeypatch):
     from tts_audiobook_tool.web_projects import create_project, load_project
     from tts_audiobook_tool.web_render import RenderVoice

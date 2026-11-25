@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import filecmp
 import logging
+import re
 from collections import Counter
 from contextlib import contextmanager, nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from threading import Event, Lock
 from time import monotonic
 
@@ -19,7 +21,7 @@ from tts_audiobook_tool.constants_config import (
 from tts_audiobook_tool.l import L
 from tts_audiobook_tool.util import progress_eta_description
 from tts_audiobook_tool.web_abr_project import read_abr_project
-from tts_audiobook_tool.web_activity_panel import ACTIVITY_CSS, ActivityPanel
+from tts_audiobook_tool.web_activity_panel import ACTIVITY_CSS, ActivityPanel, SessionActivity
 from tts_audiobook_tool.web_api_keys import StoredApiKeyError, forget_api_key, has_api_key, load_api_key, save_api_key
 from tts_audiobook_tool.web_backend import (
     DEFAULT_LLM_ENDPOINT,
@@ -31,6 +33,7 @@ from tts_audiobook_tool.web_backend import (
     analyze_book_dialogue,
     book_cast_problem,
     close_book_session,
+    restore_session_analysis,
 )
 from tts_audiobook_tool.web_book_output_panel import create_book_output_panel
 from tts_audiobook_tool.web_character_merge import merge_characters, suggest_duplicate_characters
@@ -66,6 +69,7 @@ from tts_audiobook_tool.web_remote_models import REMOTE_MODEL_ID, WebRemoteTtsEr
 from tts_audiobook_tool.web_remote_panel import RemoteModelPanel
 from tts_audiobook_tool.web_runtime_panel import create_runtime_panel
 from tts_audiobook_tool.web_runtime_settings import WebRuntimeSettingsError
+from tts_audiobook_tool.web_session_store import bind_draft_workspace, has_draft, load_draft, save_draft
 from tts_audiobook_tool.web_text_panel import SectionTextPanel, TextImportPanel
 from tts_audiobook_tool.web_tools_panel import build_tools_panel
 from tts_audiobook_tool.web_voice_panel import VoicePanel, bind_transcription, voice_status
@@ -74,6 +78,34 @@ from tts_audiobook_tool.web_voices import WebVoiceError, import_voices, load_voi
 
 TITLE = "TTS Audiobook Tool"
 PRIVATE_EVENT = {"api_visibility": "private", "concurrency_id": "local-work"}
+DRAFT_EVENT = {"api_visibility": "private", "concurrency_id": "browser-session-storage", "show_progress": "hidden"}
+# Read synchronously before Gradio submits its load request, including the first visit.
+BROWSER_SESSION_JS = """(unused, book, cursor) => {
+    const key = "tts-audiobook-tool/browser-session";
+    const makeToken = () => Array.from(crypto.getRandomValues(new Uint8Array(16)),
+        byte => byte.toString(16).padStart(2, "0")).join("");
+    let token;
+    try {
+        token = localStorage.getItem(key);
+        if (!/^[a-f0-9]{32}$/.test(token || "")) {
+            token = makeToken();
+            localStorage.setItem(key, token);
+        }
+    } catch {
+        token = "temporary-" + makeToken();
+    }
+    return [token, book, cursor];
+}"""
+
+
+@dataclass(frozen=True)
+class DraftCursor:
+    token: str
+    revision: str | None = None
+    book_revision: BookSession | None = None
+    settings: dict | None = None
+
+
 REASONING_EFFORTS = [
     ("Model default", ""),
     ("None", "none"),
@@ -152,27 +184,30 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
     model_labels = {model_id: label for label, model_id in model_choices}
     default_model = local_choices[0][1] if local_choices else None
     profile_ids = {profile.model_id for profile in model_profiles()}
-    running_jobs: dict[str | None, Event] = {}
+    running_jobs: dict[SessionActivity, Event] = {}
     running_jobs_lock = Lock()
     activity_panel = ActivityPanel(terminal_log=terminal_log)
 
     @contextmanager
     def running_job(request: gr.Request):
+        activity = activity_panel.session(request.session_hash)
         with running_jobs_lock:
-            cancel = running_jobs[request.session_hash] = Event()
+            cancel = running_jobs[activity] = Event()
         try:
             yield cancel
         finally:
             with running_jobs_lock:
-                running_jobs.pop(request.session_hash, None)
+                running_jobs.pop(activity, None)
 
     def stop_generation(request: gr.Request):
         with running_jobs_lock:
-            if cancel := running_jobs.get(request.session_hash):
+            if cancel := running_jobs.get(activity_panel.session(request.session_hash)):
                 cancel.set()
 
     with gr.Blocks(title=TITLE, analytics_enabled=False, delete_cache=(3600, 86400)) as app:
         book = gr.State(None, delete_callback=close_book_session)
+        browser_token = gr.Textbox(visible=False)
+        draft_cursor = gr.State(None)
         cast = gr.State({})
         active_project = gr.State(None)
         model_settings = gr.State({})
@@ -488,35 +523,71 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                 1, None, False,
             )
 
-        def load_book(previous: BookSession | None, active_id: str | None, *fields):
+        def load_book(previous: BookSession | None, active_id: str | None, request: gr.Request,
+                      source, epub_path, text_path, pasted, language, max_words, strategy, dialogue,
+                      previous_epub, browser_id):
+            def keep_book(message):
+                return (*[gr.skip()] * (len(import_outputs) - 1), voice_status(message), *[gr.skip()] * 5)
+
+            token = activity_panel.browser_for(request.session_hash)
             try:
-                session = text_import.import_book(*fields)
-            except WebBackendError as exc:
+                # After a server restart the old tab still has its token, but its Gradio state is gone.
+                recovery_token = token or browser_id
+                if previous is None and recovery_token and has_draft(recovery_token):
+                    return keep_book("Reload this page to restore your saved session before importing another book.")
+                settings = ((language or "").strip().lower(), max_words, strategy, dialogue)
+                same_settings = (previous is not None and previous.book.text_source_kind == source
+                                 and text_import.restore_settings(previous) == settings)
+                same_message = "This book is already open with these segmentation settings. Your current work is intact."
+                if same_settings and source == "epub" and previous_epub and epub_path:
+                    try:
+                        # Gradio owns immutable upload paths. Restored assets can have a different filename.
+                        if epub_path == previous_epub or filecmp.cmp(epub_path, previous_epub, shallow=False):
+                            return keep_book(same_message)
+                    except OSError:
+                        previous_epub = None
+                session = text_import.import_book(
+                    source, epub_path, text_path, pasted, language, max_words, strategy, dialogue,
+                )
+            except (WebBackendError, WebProjectError) as exc:
                 problem = str(exc)
             except Exception:
                 problem = "Could not import the book text."
             else:
+                if same_settings and (source != "epub" or not previous_epub):
+                    before, after = previous.book, session.book
+                    if (before.title == after.title and before.section_start_indices() == after.section_start_indices()
+                            and [s.title for s in before.sections] == [s.title for s in after.sections]
+                            and len(before.phrase_groups) == len(after.phrase_groups)
+                            and all(a.is_dialog == b.is_dialog and a.phrases == b.phrases
+                                    for a, b in zip(before.phrase_groups, after.phrase_groups, strict=True))):
+                        close_book_session(session)
+                        return keep_book(same_message)
                 using_template = previous is not None and not previous.book.sections
                 if using_template:
                     session = replace(
                         session, project_dir=previous.project_dir if active_id else session.project_dir,
+                        analysis_scope=previous.analysis_scope if active_id else session.analysis_scope,
                         project_language=previous.project_language, word_substitutions=previous.word_substitutions,
                     )
-                close_book_session(previous)
-                source = fields[1] if fields[0] == "epub" else None
                 project_id = active_id if using_template else None
+                if token and project_id is None:
+                    try:
+                        session = bind_draft_workspace(token, session)
+                    except (WebProjectError, OSError) as exc:
+                        close_book_session(session)
+                        return keep_book(f"Could not prepare the session workspace. {exc}")
+                close_book_session(previous)
+                source_epub = epub_path if source == "epub" else None
                 delivery_default = True if previous is not None and not using_template else gr.skip()
                 return (
                     *present_book(session, {}),
                     project_id, gr.update(interactive=True), gr.update(interactive=bool(project_id)),
                     gr.update(value=None, visible=False),
-                    source, gr.skip() if source else gr.update(value=None),
+                    source_epub, gr.skip() if source_epub else gr.update(value=None),
                     delivery_default, delivery_default, delivery_default,
                 )
-            return (
-                *[gr.skip()] * (len(import_outputs) - 1),
-                gr.update(value=problem, visible=True), *[gr.skip()] * 5,
-            )
+            return keep_book(problem)
 
         book_outputs = [
             book, cast, summary, characters, cast_role, cast_editor, analysis_status,
@@ -525,7 +596,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
         project_actions = [active_project, save_new, save_changes, project_status]
         import_outputs = [*book_outputs, *project_actions]
         imported_book = text_import.load.click(
-            load_book, [book, active_project, *text_import.inputs],
+            load_book, [book, active_project, *text_import.inputs, imported_epub, browser_token],
             [*import_outputs, imported_epub, text_import.epub,
              use_performance_cues, character_voices, analyze_performance_cues], **PRIVATE_EVENT,
         )
@@ -549,48 +620,55 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                 choices=choices, value=choices[0][1] if choices else None,
             )
 
-        def open_project_snapshot(project_id, previous, *, from_console=False):
+        def present_project_snapshot(loaded, saved_id, name, message):
+            source = text_import.epub.move_resource_to_block_cache(loaded.source_epub)
+            narrator_fields = voice_panel.show(loaded.narrator)
+            installed = loaded.model_id in model_labels
+            if not installed:
+                message += " Choose an installed speech model to generate audio."
+            source_kind = loaded.session.book.text_source_kind
+            if source_kind not in {"epub", "plain_text", "manual"}:
+                source_kind = "epub" if source else "manual"
+            return (
+                *present_book(loaded.session, loaded.voices),
+                saved_id, gr.update(interactive=True), gr.update(interactive=saved_id is not None),
+                gr.update(value=message, visible=True),
+                source, source_kind,
+                gr.update(value=source, visible=source_kind == "epub"),
+                gr.update(value=None, visible=source_kind == "plain_text"),
+                gr.update(value="", visible=source_kind == "manual"),
+                *text_import.restore_settings(loaded.session),
+                *narrator_fields, *voice_panel.reset_selection(), voice_status(),
+                loaded.model_id if installed else None,
+                loaded.validate_audio, loaded.batch_size, name,
+                loaded.model_options,
+                loaded.strictness, loaded.max_retries, loaded.auto_concat,
+                getattr(loaded, "performance_cues", False),
+                getattr(loaded, "character_voices", False),
+                getattr(loaded, "analyze_performance_cues", False),
+            )
+
+        def open_project_snapshot(project_id, previous, *, from_console=False, token=None):
             loaded = None
             try:
                 if from_console:
                     loaded = load_console_project(project_id or "", model_choices=model_choices)
+                    if token:
+                        loaded = replace(loaded, session=bind_draft_workspace(token, loaded.session))
                     name, saved_id = loaded.name, None
+                    message = f"Copied {name} from the console. Save it as a new browser project."
                 else:
                     loaded = load_project(project_id or "")
                     name, saved_id = loaded.summary.name, loaded.summary.project_id
-                source = text_import.epub.move_resource_to_block_cache(loaded.source_epub)
-                narrator_fields = voice_panel.show(loaded.narrator)
+                    message = f"Opened {name}."
+                updates = present_project_snapshot(loaded, saved_id, name, message)
             except (WebProjectError, WebLegacyProjectError) as exc:
                 message = str(exc)
             except Exception:
                 message = "Could not open the project."
             else:
                 close_book_session(previous)
-                installed = loaded.model_id in model_labels
-                message = f"Copied {name} from the console. Save it as a new browser project." if from_console else f"Opened {name}."
-                if not installed:
-                    message += " Choose an installed speech model to generate audio."
-                source_kind = loaded.session.book.text_source_kind
-                if source_kind not in {"epub", "plain_text", "manual"}:
-                    source_kind = "epub" if source else "manual"
-                return (
-                    *present_book(loaded.session, loaded.voices),
-                    saved_id, gr.update(interactive=True), gr.update(interactive=saved_id is not None),
-                    gr.update(value=message, visible=True),
-                    source, source_kind,
-                    gr.update(value=source, visible=source_kind == "epub"),
-                    gr.update(value=None, visible=source_kind == "plain_text"),
-                    gr.update(value="", visible=source_kind == "manual"),
-                    *text_import.restore_settings(loaded.session),
-                    *narrator_fields, *voice_panel.reset_selection(), voice_status(),
-                    loaded.model_id if installed else None,
-                    loaded.validate_audio, loaded.batch_size, name,
-                    loaded.model_options,
-                    loaded.strictness, loaded.max_retries, loaded.auto_concat,
-                    getattr(loaded, "performance_cues", False),
-                    getattr(loaded, "character_voices", False),
-                    getattr(loaded, "analyze_performance_cues", False),
-                )
+                return updates
             if loaded is not None:
                 close_book_session(loaded.session)
             return (
@@ -599,8 +677,10 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                 *[gr.skip()] * (len(opened_project_outputs) - len(import_outputs)),
             )
 
-        def open_console_snapshot(project_id, previous):
-            return open_project_snapshot(project_id, previous, from_console=True)
+        def open_console_snapshot(project_id, previous, request: gr.Request):
+            return open_project_snapshot(
+                project_id, previous, from_console=True, token=activity_panel.browser_for(request.session_hash),
+            )
 
         def import_console_library(project_id, selected, cast_selected):
             loaded = None
@@ -657,7 +737,6 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
         def save_loaded_project(destination, *values):
             return store_project(save_project, destination, *values)
 
-        app.load(list_saved_projects, outputs=[saved_projects, open_project, project_status], **PRIVATE_EVENT)
         app.load(discover_console_projects, outputs=[console_projects_row, console_projects], **PRIVATE_EVENT)
         opened_project_outputs = [
             *import_outputs, imported_epub, text_import.source, text_import.epub, text_import.text_file,
@@ -726,6 +805,144 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
         save_new.click(save_named_project, [project_name, *persist_inputs], persist_outputs, **PRIVATE_EVENT)
         save_changes.click(save_loaded_project, [active_project, *persist_inputs], persist_outputs, **PRIVATE_EVENT)
 
+        draft_controls = {
+            "llm_model": llm_model, "reasoning_effort": effort, "llm_endpoint": llm_endpoint,
+            "llm_extra_params": llm_extra_params, "use_local_qwen": use_local_qwen,
+            "local_thinking": local_thinking, "first_line": first_line, "last_line": last_line,
+            "regenerate_lines": regenerate_lines,
+        }
+        draft_inputs = [active_project, project_name, *persist_inputs, *draft_controls.values()]
+        restore_outputs = list(dict.fromkeys([
+            *opened_project_outputs, saved_projects, open_project, *draft_controls.values(),
+            *section_text.refresh_outputs, review_panel, review_section, browser_token, draft_cursor,
+        ]))
+
+        def draft_values(active_id, name, session, voices, model, source, validate, batch, settings,
+                         strictness, retries, export, performance_cues, character_directions, analysis_cues, *fields):
+            n = len(voice_panel.inputs)
+            narrator = voice_panel.snapshot(*fields[:n])
+            controls = dict(zip(draft_controls, fields[n:], strict=True))
+            return session, dict(
+                active_project_id=active_id, project_name=name or "", voices=voices, model_id=model or "",
+                source_epub=source, validate_audio=validate, batch_size=batch or PROJECT_BATCH_SIZE_DEFAULT,
+                model_options=settings, strictness=strictness, max_retries=retries, auto_concat=export,
+                performance_cues=performance_cues, character_voices=character_directions,
+                analyze_performance_cues=analysis_cues, narrator=narrator, controls=controls,
+            )
+
+        def restore_browser_session(token, current, cursor, request: gr.Request):
+            updates = {}
+            draft = None
+            if cursor is not None:
+                return tuple(gr.skip() for _ in restore_outputs)
+            try:
+                if isinstance(token, str) and token.startswith("temporary-"):
+                    token = token.removeprefix("temporary-")
+                    gr.Warning("Browser storage is unavailable. Use Save new project before closing or reloading this tab.")
+                if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
+                    raise WebProjectError("Refresh this page to initialize browser session recovery.")
+                activity_panel.bind_browser(request.session_hash, token)
+                draft = load_draft(token)
+                if current is not None and draft is not None:
+                    raise WebProjectError("A book is already open. Reload this page to open your saved session.")
+                updates[browser_token] = token
+                if draft is None:
+                    updates[draft_cursor] = DraftCursor(token)
+                    if current is not None and current.analysis_scope is None:
+                        updates[book] = bind_draft_workspace(token, current)
+                    if current is None:
+                        updates[saved_projects], updates[open_project], updates[project_status] = list_saved_projects()
+                        updates[batch_size] = model_panel.recommended_batch(
+                            default_model, validate_audio.value, {}, runtime_panel.inputs[0].value,
+                        )
+                else:
+                    project = draft.project
+                    controls = {key: draft.controls.get(key, component.value) for key, component in draft_controls.items()}
+                    name = project.summary.name
+                    title = name or project.session.book.title
+                    message = f"Restored your last session — {title}." if title else "Restored your last session."
+                    try:
+                        session = restore_session_analysis(
+                            project.session, model=controls["llm_model"], effort=controls["reasoning_effort"] or "",
+                            endpoint=controls["llm_endpoint"], settings_json=controls["llm_extra_params"] or "",
+                            local_thinking=controls["local_thinking"] if controls["use_local_qwen"] else None,
+                            performance_cues=project.analyze_performance_cues, character_voices=project.character_voices,
+                            origin=draft.analysis_origin,
+                        )
+                        project = replace(project, session=session)
+                    except WebBackendError as exc:
+                        message += f" {exc}"
+                    if draft.omitted_request_settings:
+                        message += (" Re-enter your custom LLM endpoint or extra request parameters "
+                                    "before resuming analysis with those settings.")
+                    presented = present_project_snapshot(project, draft.active_project_id, name, message)
+                    updates.update(zip(opened_project_outputs, presented, strict=True))
+                    updates.update(zip(section_text.refresh_outputs, section_text.refresh(project.session), strict=True))
+                    updates[review_panel], updates[review_section] = update_review_sections(project.session)
+                    updates.update((component, controls[key]) for key, component in draft_controls.items())
+                    updates[saved_projects], updates[open_project] = refresh_projects(draft.active_project_id)
+
+                    def restored_value(component):
+                        value = updates[component]
+                        if isinstance(value, dict) and value.get("__type__") == "update":
+                            return value.get("value", component.value)
+                        return value
+
+                    session, settings = draft_values(*(restored_value(component) for component in draft_inputs))
+                    updates[draft_cursor] = DraftCursor(token, draft.revision, session, settings)
+            except (WebProjectError, WebRenderError, OSError) as exc:
+                if draft is not None:
+                    close_book_session(draft.project.session)
+                choices, opener, _ = list_saved_projects()
+                updates = {
+                    saved_projects: choices, open_project: opener,
+                    project_status: voice_status(f"Could not restore the browser session. {exc}"),
+                }
+            return tuple(updates.get(component, gr.skip()) for component in restore_outputs)
+
+        def save_browser_changes(cursor, values):
+            session, settings = draft_values(*values)
+            if cursor.book_revision is session and cursor.settings == settings:
+                return gr.skip()
+            revision = save_draft(cursor.token, cursor.revision, session, **settings)
+            return DraftCursor(cursor.token, revision, session, settings)
+
+        def autosave_browser_session(cursor, *values):
+            if cursor is None or values[2] is None:
+                return gr.skip(), gr.skip()
+            try:
+                return save_browser_changes(cursor, values), gr.skip()
+            except (WebProjectError, WebRenderError, OSError) as exc:
+                return gr.skip(), voice_status(f"Could not autosave this session. {exc}")
+
+        def save_before_job(cursor, *values):
+            if cursor is None:
+                raise gr.Error("Refresh this page to restore your browser session before starting the job.")
+            if values[2] is None:
+                raise gr.Error("Reload this page to restore your last session, or import your book.")
+            try:
+                active_id, name, session, *rest = values
+                bound = bind_draft_workspace(cursor.token, session) if active_id is None else session
+                saved = save_browser_changes(cursor, (active_id, name, bound, *rest))
+                return saved, gr.skip(), bound if bound is not session else gr.skip()
+            except (WebProjectError, WebRenderError, OSError) as exc:
+                raise gr.Error(f"Could not save the session before starting. {exc}") from exc
+
+        app.load(
+            restore_browser_session, [browser_token, book, draft_cursor], restore_outputs,
+            js=BROWSER_SESSION_JS, **DRAFT_EVENT,
+        )
+        gr.on(
+            [component.change for component in dict.fromkeys(draft_inputs)],
+            autosave_browser_session, [draft_cursor, *draft_inputs], [draft_cursor, project_status],
+            trigger_mode="always_last", **DRAFT_EVENT,
+        )
+
+        def save_then_start(button):
+            return button.click(
+                save_before_job, [draft_cursor, *draft_inputs], [draft_cursor, project_status, book], **DRAFT_EVENT,
+            )
+
         def show_thinking_control(use_qwen):
             return gr.update(visible=use_qwen), gr.update(visible=not use_qwen)
 
@@ -738,7 +955,8 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
             activity = activity_panel.session(request.session_hash)
             if session is None:
                 message = (
-                    "This tab has no active book. Open your saved project, or import the same book with its "
+                    "This tab has no active book. Reload this page to restore your last session. You can also "
+                    "open your saved project, or import the same book with its "
                     "original segmentation settings. If a recovery checkpoint is available, use the matching "
                     "analysis settings and select Analyze book to resume."
                 )
@@ -808,7 +1026,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
             log(message)
             yield gr.skip(), gr.skip(), gr.skip(), voice_status(redact(message))
 
-        analyzed = analyze.click(
+        analyzed = save_then_start(analyze).success(
             analyze_book, [
                 book, api_key, llm_model, effort, llm_endpoint, llm_extra_params, cast_role, use_local_qwen,
                 local_thinking, character_voices, analyze_performance_cues,
@@ -1218,7 +1436,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
             activity.write(message + "\n")
             yield gr.update(value=message, visible=True), gr.skip(), gr.update(interactive=False)
 
-        generate_book.click(
+        save_then_start(generate_book).success(
             generate_audiobook,
             [
                 book, cast, book_model, validate_audio, batch_size, model_settings,
@@ -1333,7 +1551,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
         )
         force_cpu_option = runtime_panel.inputs[0]
         batch_inputs = [book_model, validate_audio, model_settings, force_cpu_option]
-        for event in (app.load, book_model.input, use_recommended_batch.click):
+        for event in (book_model.input, use_recommended_batch.click):
             event(model_panel.recommended_batch, batch_inputs, batch_size, show_progress="hidden", **PRIVATE_EVENT)
 
         def install_selected_model(model_id, sample_selection, session, validate, settings, force_cpu,
