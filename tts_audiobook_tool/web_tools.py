@@ -6,11 +6,13 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
+from time import monotonic
 from types import SimpleNamespace
 
 from natsort import natsorted, ns
 
 from tts_audiobook_tool.constants import AAC_BITRATE_DEFAULT, ABR_VERSION, APP_META_FLAC_FIELD, APP_META_MP4_MEAN, APP_META_MP4_TAG
+from tts_audiobook_tool.util import progress_eta_description
 
 
 AUDIO_SUFFIXES = (".mp3", ".m4a", ".m4b", ".flac", ".wav", ".ogg", ".opus", ".aac", ".aiff", ".aif", ".webm", ".mp4")
@@ -92,9 +94,21 @@ def epub_to_text(path: str, output_dir: Path, *, upload_root: str | Path) -> Too
     return ToolResult(result, "\n".join(["Text file ready.", *extracted.significant_warnings]))
 
 
+def _report_work(
+    description: str, completed: float, total: float, started: float,
+    on_progress: Callable[[str], None] | None, on_counted_progress: Callable[[str, float], None] | None,
+) -> None:
+    description = progress_eta_description(description, completed, total, monotonic() - started)
+    if on_counted_progress is not None:
+        on_counted_progress(description, min(1.0, completed / total))
+    elif on_progress is not None:
+        on_progress(description)
+
+
 def concatenate_audio(
         paths: Sequence[str] | None, output_format: str, output_dir: Path, *, upload_root: str | Path,
         cancel_event: Event | None = None, on_progress: Callable[[str], None] | None = None,
+        on_counted_progress: Callable[[str, float], None] | None = None,
 ) -> ToolResult:
     from tts_audiobook_tool.sound.audio_convert import AudioConvertCancelled, convert_audio_files
 
@@ -106,9 +120,13 @@ def concatenate_audio(
     sources = natsorted(sources, key=lambda path: path.name, alg=ns.IGNORECASE)
     result = output_dir / f"concatenated.{output_format}"
 
+    started = monotonic()
+
     def report(index: int, path: str) -> None:
-        if on_progress is not None:
-            on_progress(f"Combining {index + 1} of {len(sources)}: {Path(path).name}")
+        _report_work(
+            f"Combining {index + 1} of {len(sources)}: {Path(path).name}", index, len(sources), started,
+            on_progress, on_counted_progress,
+        )
 
     _check_cancelled(cancel_event)
     try:
@@ -176,6 +194,7 @@ def change_reference_speed(path: str, percent: int, output_dir: Path, *, upload_
 def enhance_audiobook(
         path: str, source_text: str, language: str, output_dir: Path, *, upload_root: str | Path,
         cancel_event: Event | None = None, on_progress: Callable[[str], None] | None = None,
+        on_counted_progress: Callable[[str, float], None] | None = None,
 ) -> ToolResult:
     from tts_audiobook_tool.app_types.app_metadata import AppMetadata
     from tts_audiobook_tool.enhance import enhance_text
@@ -190,7 +209,7 @@ def enhance_audiobook(
     if on_progress is not None:
         on_progress("Reading the source text")
     book = _read_enhance_book(text, code)
-    words = _transcribe_cached(audio, code, cancel_event, on_progress)
+    words = _transcribe_cached(audio, code, cancel_event, on_progress, on_counted_progress)
     if not words:
         raise WebToolsError("Whisper found no speech in the audiobook.")
     _check_cancelled(cancel_event)
@@ -260,7 +279,7 @@ def _read_enhance_book(path: Path, language: str):
     return book
 
 
-def _transcribe_cached(audio: Path, language: str, cancel_event: Event | None, on_progress):
+def _transcribe_cached(audio: Path, language: str, cancel_event: Event | None, on_progress, on_counted_progress):
     from faster_whisper.utils import download_model
 
     from tts_audiobook_tool.app_types import ConcreteWord, SttConfig, SttVariant
@@ -287,19 +306,30 @@ def _transcribe_cached(audio: Path, language: str, cancel_event: Event | None, o
         whisper = FasterWhisperAdapter(
             str(snapshot), device=config.device, compute_type=config.compute_type, cpu_threads=4,
         )
+        audio_duration: float | None = None
+
+        def set_duration(duration: float | None) -> None:
+            nonlocal audio_duration
+            audio_duration = duration
+
         windows = alignment._stream_audio_with_overlap(
             str(audio), chunk, overlap, cancel_check=cancel_event.is_set if cancel_event is not None else None,
+            on_duration=set_duration if on_progress or on_counted_progress else None,
         )
+        started = monotonic()
         with closing(windows):
             for index, window in enumerate(windows):
                 _check_cancelled(cancel_event)
-                if on_progress is not None:
-                    on_progress(f"Transcribing audio at {index * stride:,} seconds")
+                offset = index * stride
+                description = f"Transcribing audio at {offset:,} seconds"
+                if audio_duration and audio_duration > offset:
+                    _report_work(description, offset, audio_duration, started, on_progress, on_counted_progress)
+                elif on_progress is not None:
+                    on_progress(description)
                 segments, _ = whisper.transcribe(
                     window, language=language if language in whisper.supported_languages else None,
                     word_timestamps=True,
                 )
-                offset = index * stride
                 transcript.append([
                     ConcreteWord(word.start + offset, word.end + offset, word.word, word.probability)
                     for word in Transcriber.get_words_from_segments(segments)

@@ -62,7 +62,15 @@ class TestWebTools(unittest.TestCase):
     def test_concatenates_in_natural_file_order_and_can_cancel(self):
         later = self._write_audio("Chapter 10.wav", np.full(1600, -0.5))
         earlier = self._write_audio("chapter 2.flac", np.full(1600, 0.5))
-        result = web_tools.concatenate_audio([str(later), str(earlier)], "flac", self.output, upload_root=self.uploads)
+        progress = []
+        with patch.object(web_tools, "monotonic", side_effect=[100, 100, 110]):
+            result = web_tools.concatenate_audio(
+                [str(later), str(earlier)], "flac", self.output, upload_root=self.uploads,
+                on_counted_progress=lambda label, fraction: progress.append((label, fraction)),
+            )
+        self.assertEqual([fraction for _, fraction in progress], [0.0, 0.5])
+        self.assertIn("ETA measuring", progress[0][0])
+        self.assertIn("ETA 10s", progress[1][0])
         signal, rate = soundfile.read(result.path)
         self.assertEqual(rate, 16000)
         self.assertEqual(signal.size, 3200)
@@ -118,7 +126,14 @@ class TestWebTools(unittest.TestCase):
             with patch("tts_audiobook_tool.stt.FasterWhisperAdapter") as whisper:
                 whisper.return_value.supported_languages = ["en"]
                 whisper.return_value.transcribe.return_value = ([ConcreteSegment(0, 0.5, "", words)], None)
-                result = web_tools.enhance_audiobook(str(audio), str(text), "en", self.output, upload_root=self.uploads)
+                progress = []
+                result = web_tools.enhance_audiobook(
+                    str(audio), str(text), "en", self.output, upload_root=self.uploads,
+                    on_counted_progress=lambda label, fraction: progress.append((label, fraction)),
+                )
+        self.assertEqual(len(progress), 1)
+        self.assertIn("ETA measuring", progress[0][0])
+        self.assertEqual(progress[0][1], 0.0)
         self.assertTrue(local_model.call_args.kwargs["local_files_only"])
         self.assertEqual(whisper.call_args.kwargs["device"], "cpu")
         self.assertEqual(result.path.name, "Narration.abr.m4a")

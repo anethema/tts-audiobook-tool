@@ -32,6 +32,9 @@ def build_tools_panel(*, event_options):
             session = request.session_hash
             with lock:
                 active[session] = cancel
+            def report(description: str, fraction: float = 0) -> None:
+                progress(fraction, desc=description)
+
             try:
                 yield (
                     gr.update(value=None, visible=False), gr.update(value="Working…", visible=True),
@@ -39,9 +42,7 @@ def build_tools_panel(*, event_options):
                 )
                 try:
                     with TemporaryDirectory(prefix="tts-audiobook-tool-export-") as directory:
-                        result = operation(
-                            values, Path(directory), cancel, lambda description: progress(0, desc=description),
-                        )
+                        result = operation(values, Path(directory), cancel, report)
                         if cancel.is_set():
                             raise web_tools.WebToolsError("Stopped.")
                         path = output.move_resource_to_block_cache(str(result.path))
@@ -76,7 +77,7 @@ def build_tools_panel(*, event_options):
         format_choice = gr.Radio(choices=[("FLAC", "flac"), ("M4A", "m4a")], value="flac", label="Output format")
         bind(
             lambda values, dest, cancel, progress: web_tools.concatenate_audio(
-                *values, dest, upload_root=sources.GRADIO_CACHE, cancel_event=cancel, on_progress=progress,
+                *values, dest, upload_root=sources.GRADIO_CACHE, cancel_event=cancel, on_counted_progress=progress,
             ),
             [sources, format_choice], "Combine audio", "Combined audio file", stoppable=True,
         )
@@ -107,7 +108,8 @@ def build_tools_panel(*, event_options):
         language = gr.Textbox(value="en", label="Language code")
         bind(
             lambda values, dest, cancel, progress: web_tools.enhance_audiobook(
-                *values, dest, upload_root=audiobook.GRADIO_CACHE, cancel_event=cancel, on_progress=progress,
+                *values, dest, upload_root=audiobook.GRADIO_CACHE, cancel_event=cancel,
+                on_progress=progress, on_counted_progress=progress,
             ),
             [audiobook, source_text, language], "Synchronize audiobook", "Enhanced audiobook", stoppable=True,
         )

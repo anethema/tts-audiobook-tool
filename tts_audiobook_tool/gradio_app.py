@@ -17,6 +17,7 @@ from tts_audiobook_tool.constants_config import (
     PROJECT_MAX_RETRIES_DEFAULT, PROJECT_MAX_RETRIES_MAX, PROJECT_MAX_RETRIES_MIN,
 )
 from tts_audiobook_tool.l import L
+from tts_audiobook_tool.util import progress_eta_description
 from tts_audiobook_tool.web_abr_project import read_abr_project
 from tts_audiobook_tool.web_activity_panel import ACTIVITY_CSS, ActivityPanel
 from tts_audiobook_tool.web_api_keys import StoredApiKeyError, forget_api_key, has_api_key, load_api_key, save_api_key
@@ -736,6 +737,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                          character_voices, performance_cues, request: gr.Request):
             activity = activity_panel.session(request.session_hash)
             chunk = (0, 0, "Preparing book analysis")
+            work = None
             last_console_phase = ""
             last_console_update = 0.0
             secret = "" if use_qwen else (key or "").strip()
@@ -746,14 +748,18 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
             def log(message: str) -> None:
                 activity.write(redact(message).rstrip() + "\n")
 
+            def report_work(done: int, total: int) -> None:
+                nonlocal work
+                work = (done, total)
+
             def report_chunk(done: int, total: int, phase: str) -> None:
                 nonlocal chunk
                 chunk = (done, total, phase)
-                activity.update_analysis(*chunk)
+                activity.update_analysis(*chunk, work=work)
 
             def report_qwen(detail: str) -> None:
                 nonlocal last_console_phase, last_console_update
-                activity.update_analysis(*chunk, detail)
+                activity.update_analysis(*chunk, detail, work=work)
                 phase = detail.partition(" · ")[0]
                 now = monotonic()
                 if phase != last_console_phase or now - last_console_update >= 5:
@@ -776,6 +782,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                         session, secret, model, effort=reasoning or "", endpoint=endpoint,
                         settings_json=settings_json or "", on_log=log, performance_cues=performance_cues,
                         character_voices=character_voices, local_tagger=tagger, on_progress=report_chunk,
+                        on_work_progress=report_work,
                     )
             except (StoredApiKeyError, WebBackendError) as exc:
                 message = str(exc)
@@ -1249,12 +1256,16 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                     *[gr.update(**props) for props in player_props],
                 ]
                 statuses = []
+                started = monotonic()
                 for index, model in enumerate(selected):
                     if cancel.is_set():
                         break
                     label = model_labels[model]
                     console(f"\nGenerating text sample with {label}\n")
-                    progress((index, len(selected)), desc=f"Generating with {label}")
+                    description = progress_eta_description(
+                        f"Generating with {label}", index, len(selected), monotonic() - started,
+                    )
+                    progress((index, len(selected)), desc=description)
                     updates = [gr.skip() for _ in sample_players]
                     try:
                         remote = remote_panel.selection_for(

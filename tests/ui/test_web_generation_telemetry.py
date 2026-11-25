@@ -234,3 +234,69 @@ def test_activity_panel_switches_to_assembly_only_when_reported():
     assert "Assembling M4B" in update["value"]
     assert 'aria-label="Synthesis speed"' in update["value"]
     assert "ETA" not in update["value"]
+
+
+def test_analysis_eta_tracks_new_work_and_counts_down_between_checkpoints(monkeypatch):
+    from tts_audiobook_tool import web_activity_panel
+
+    now = 100
+    monkeypatch.setattr(web_activity_panel, "monotonic", lambda: now)
+    activity = web_activity_panel.SessionActivity()
+    activity.update_analysis(0, 0, "Preparing book analysis")
+
+    now = 150
+    activity.update_analysis(3, 8, "Reusing 3 saved chunks", work=(0, 800))
+    _, _, update, version = activity.changes_since((0, 0, 0))
+    assert "ETA measuring…" in update["value"]
+
+    now = 170
+    activity.update_analysis(4, 8, "Chunk 4 complete", work=(200, 800))
+    _, _, update, version = activity.changes_since(version)
+    assert "ETA 1m 00s" in update["value"]
+
+    now = 180
+    activity.update_analysis(4, 8, "Chunk 5", "Qwen is reasoning", work=(200, 800))
+    _, _, update, version = activity.changes_since(version)
+    assert "ETA 50s" in update["value"]
+
+    now = 185
+    _, _, update, _ = activity.changes_since(version)
+    assert "ETA 45s" in update["value"]
+
+    now = 204
+    activity.update_analysis(5, 8, "Chunk 5 complete", work=(600, 800))
+    _, _, update, version = activity.changes_since(version)
+    assert "ETA 18s" in update["value"]
+
+    now = 230
+    _, _, update, _ = activity.changes_since(version)
+    assert "ETA 0s" not in update["value"]
+    assert "ETA -" not in update["value"]
+
+
+def test_analysis_eta_finishes_and_starts_fresh_on_resume(monkeypatch):
+    from tts_audiobook_tool import web_activity_panel
+
+    now = 10
+    monkeypatch.setattr(web_activity_panel, "monotonic", lambda: now)
+    activity = web_activity_panel.SessionActivity()
+    activity.update_analysis(0, 3, "Starting", work=(0, 300))
+    now = 20
+    activity.update_analysis(1, 3, "Chunk 1 complete", work=(100, 300))
+    _, _, update, version = activity.changes_since((0, 0, 0))
+    assert "ETA 20s" in update["value"]
+
+    activity.finish_analysis()
+    _, _, update, version = activity.changes_since(version)
+    assert update["visible"] is False
+
+    now = 100
+    activity.update_analysis(1, 3, "Resuming", work=(0, 200))
+    _, _, update, version = activity.changes_since(version)
+    assert "ETA measuring…" in update["value"]
+
+    activity.finish_analysis()
+    activity.update_analysis(3, 3, "Using saved analysis", work=(0, 0))
+    _, _, update, _ = activity.changes_since(version)
+    assert "3 of 3 chunks complete" in update["value"]
+    assert "ETA" not in update["value"]

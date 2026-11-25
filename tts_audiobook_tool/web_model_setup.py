@@ -14,12 +14,14 @@ import subprocess
 import sys
 from tempfile import mkdtemp
 from threading import Event
+from time import monotonic
 
 from filelock import FileLock, Timeout
 
 from tts_audiobook_tool.app_support.app_memory import get_nv_vram
 from tts_audiobook_tool.constants_config import PROJECT_BATCH_SIZE_DEFAULT
 from tts_audiobook_tool.tts_models.tts_model_type import TtsModelType
+from tts_audiobook_tool.util import progress_eta_description
 from tts_audiobook_tool.web_remote_models import remote_client_python
 
 
@@ -48,10 +50,14 @@ class ModelSetupProgress:
     completed: int
     total: int
     stage: str
+    elapsed: float | None = None
 
     @property
     def description(self) -> str:
-        return f"{self.stage} ({self.completed}/{self.total} steps complete)"
+        label = f"{self.stage} ({self.completed}/{self.total} steps complete)"
+        if self.elapsed is None:
+            return label
+        return progress_eta_description(label, self.completed, self.total, self.elapsed)
 
 
 @dataclass(frozen=True)
@@ -231,11 +237,12 @@ def _install_profile(
     # dependencies, verify the environment, and publish the verified link.
     total = 5 + int(profile.catalog_id is not None) + int(profile.gated_repo is not None) + len(profile.checkpoints)
     completed = 0
+    started = monotonic()
 
     def start_step(description: str) -> None:
         nonlocal completed
         if on_progress is not None:
-            on_progress(ModelSetupProgress(completed, total, description))
+            on_progress(ModelSetupProgress(completed, total, description, monotonic() - started))
         # The next step starts only after this one succeeds.
         completed += 1
 

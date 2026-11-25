@@ -518,6 +518,7 @@ def _stream_audio_with_overlap(
     overlap_duration: int = 5,
     sample_rate: int = 16000,
     cancel_check: Callable[[], bool] | None = None,
+    on_duration: Callable[[float | None], None] | None = None,
 ) -> Generator[np.ndarray, None, None]:
     """
     Yields mono float32 windows of `chunk_duration` seconds, each starting
@@ -548,6 +549,8 @@ def _stream_audio_with_overlap(
         return window
 
     with AudioDecoder(file_path, sample_rate=sample_rate, channels=1) as decoder:
+        if on_duration is not None:
+            on_duration(decoder.duration)
         for block in decoder.chunks(cancel_check=cancel_check):
             pending.append(block)
             pending_count += len(block)

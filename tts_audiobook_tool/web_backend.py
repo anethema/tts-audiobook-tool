@@ -253,8 +253,9 @@ def analyze_book_dialogue(
         character_voices: bool = False,
         on_log: Callable[[str], None] | None = None,
         on_progress: Callable[[int, int, str], None] | None = None,
+        on_work_progress: Callable[[int, int], None] | None = None,
 ) -> BookSession:
-    """Analyze each chunk, reporting the count with all requested results saved."""
+    """Report overall chunk progress and the requested work completed during this run."""
     log = on_log if on_log is not None else lambda _message: None
     directory = session.attribution_dir or session.project_dir
     checkpoint = Path(SpeakerAssignFileUtil.attributions_path(directory))
@@ -290,12 +291,17 @@ def analyze_book_dialogue(
             for number, utterances in utterances_by_chunk.items()
         }
     voices_by_chunk = _character_voice_requests(roster, utterances_by_chunk, effective_by_line) if character_voices else {}
-    complete = sum(
-        not speakers and not cues_by_chunk.get(number) and not voices_by_chunk.get(number)
+    work_by_chunk = {
+        number: len(speakers | cues_by_chunk.get(number, set())) + len(voices_by_chunk.get(number, ()))
         for number, speakers in speakers_by_chunk.items()
-    )
+    }
+    complete = sum(units == 0 for units in work_by_chunk.values())
+    completed_work = 0
+    total_work = sum(work_by_chunk.values())
 
     def progress(detail: str) -> None:
+        if on_work_progress is not None:
+            on_work_progress(completed_work, total_work)
         if on_progress is not None:
             on_progress(complete, total, detail)
 
@@ -410,6 +416,7 @@ def analyze_book_dialogue(
             progress(f"{location} · missing {_count_label(missing_voices, 'character voice direction')}")
         else:
             complete += 1
+            completed_work += work_by_chunk[chunk.number]
             progress(f"{location} · complete")
         usage = ""
         if reply.input_tokens is not None and reply.output_tokens is not None:

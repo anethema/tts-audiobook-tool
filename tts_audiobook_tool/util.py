@@ -330,6 +330,20 @@ def duration_string(seconds: float, include_tenth: bool=False, pad_seconds: bool
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h{minutes}m{secs}s"
 
+def format_eta_duration(seconds: float | None) -> str:
+    if seconds is None or not math.isfinite(seconds) or seconds <= 0:
+        return "measuring…"
+    return duration_string(math.ceil(seconds), pad_seconds=True).replace("h", "h ").replace("m", "m ")
+
+
+def progress_eta_description(label: str, done: float, total: float, elapsed: float) -> str:
+    """Append a remaining-time estimate from completed units of the current operation."""
+    if total <= 0 or done >= total:
+        return label
+    remaining = elapsed * (total - done) / done if done > 0 else None
+    return f"{label} · ETA {format_eta_duration(remaining)}"
+
+
 def time_stamp(seconds: float, with_tenth: bool=True) -> str:
     """ Eg: 05:00:00 """
 

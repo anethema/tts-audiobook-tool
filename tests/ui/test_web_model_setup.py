@@ -121,6 +121,9 @@ class TestModelInstallation(unittest.TestCase):
         self.assertEqual(self.steps[-1][-2], "BreezeBlue/Breeze-TTS-2")
         total = len(self.steps) + 1
         self.assertEqual([(item.completed, item.total) for item in progress], [(i, total) for i in range(total + 1)])
+        self.assertIn("ETA measuring", progress[0].description)
+        self.assertRegex(progress[1].description, r"ETA \d")
+        self.assertNotIn("ETA", progress[-1].description)
         self.assertIn("Download", progress[-3].stage)
         self.assertIn("Publish", progress[-2].stage)
         self.assertEqual(qualified.call_args.args[0], self.stage)

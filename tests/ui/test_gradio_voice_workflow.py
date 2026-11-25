@@ -230,6 +230,10 @@ def test_live_console_and_overall_audio_speed_update_before_render_finishes(tmp_
 
 @pytest.mark.parametrize("fail", [False, True], ids=["success", "failure"])
 def test_local_qwen_activity_is_visible_during_analysis_and_hidden_afterward(tmp_path, monkeypatch, fail):
+    from tts_audiobook_tool import web_activity_panel
+
+    now = 100
+    monkeypatch.setattr(web_activity_panel, "monotonic", lambda: now)
     monkeypatch.setattr(gradio_app, "installed_model_choices", lambda: [("Breeze TTS 2", "venv-breeze")])
     streaming = Event()
     finish = Event()
@@ -241,7 +245,12 @@ def test_local_qwen_activity_is_visible_during_analysis_and_hidden_afterward(tmp
         assert thinking == ("off" if fail else "medium")
         return nullcontext(on_activity)
 
-    def analyze_dialogue(session, _key, _model, *, on_progress, local_tagger, **_kwargs):
+    def analyze_dialogue(session, _key, _model, *, on_progress, on_work_progress, local_tagger, **_kwargs):
+        nonlocal now
+        on_work_progress(0, 80)
+        on_progress(0, 3, "Starting dialogue analysis")
+        now += 10
+        on_work_progress(20, 80)
         on_progress(1, 3, "Chunk 2/3 (lines 7–12) · analyzing")
         local_tagger("Qwen is preparing the prompt…")
         local_tagger(reading)
@@ -284,6 +293,7 @@ def test_local_qwen_activity_is_visible_during_analysis_and_hidden_afterward(tmp
             assert panel["visible"] is True
             assert "Chunk 2/3 (lines 7–12)" in panel["value"]
             assert writing in panel["value"]
+            assert "ETA 30s" in panel["value"]
             assert "1 of 3 chunks complete" in panel["value"]
             assert 'max="3" value="1"' in panel["value"]
 
@@ -838,6 +848,9 @@ def test_model_install_settings_and_batch_reach_render_callbacks(tmp_path, monke
         ((3, 5), "Verify the environment (3/5 steps complete)"),
         ((5, 5), "Setup complete (5/5 steps complete)"),
     ]
+    assert [units for units, _ in setup_progress[-2:]] == [(0, 2), (1, 2)]
+    assert "ETA measuring" in setup_progress[-2][1]
+    assert setup_progress[-1][1].endswith("s") and "ETA " in setup_progress[-1][1]
     assert rendered == [
         ("venv-qwen3tts", {"temperature": 0.7}, 5),
         ("venv-breeze", None),

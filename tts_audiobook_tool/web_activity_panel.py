@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 import gradio as gr
 
-from tts_audiobook_tool.util import duration_string
+from tts_audiobook_tool.util import duration_string, format_eta_duration
 
 if TYPE_CHECKING:
     from tts_audiobook_tool.generation_events import BookRenderTelemetry
@@ -49,9 +49,7 @@ class BookActivity:
             or (not progress.assembling and (progress.total <= 0 or progress.processed < progress.total))
         ):
             eta = progress.eta_seconds if progress is not None else None
-            duration = "measuring…"
-            if eta is not None and math.isfinite(eta) and eta > 0:
-                duration = duration_string(math.ceil(eta), pad_seconds=True).replace("h", "h ").replace("m", "m ")
+            duration = format_eta_duration(eta)
             estimate = f'<span title="Estimated time to finish generating audio">ETA {duration}</span>'
             details = f"{details} · {estimate}" if details else estimate
         rate = progress.speed_multiplier if progress is not None else None
@@ -70,21 +68,42 @@ class BookActivity:
 
 
 @dataclass(frozen=True)
+class _AnalysisPace:
+    completed: int
+    total: int
+    started: float
+    sampled: float
+
+    def eta(self, now: float) -> str:
+        if not self.completed or self.sampled <= self.started:
+            return "measuring…"
+        seconds_per_unit = (self.sampled - self.started) / self.completed
+        remaining = seconds_per_unit * (self.total - self.completed) - (now - self.sampled)
+        return format_eta_duration(remaining) if remaining > 0 else "recalculating…"
+
+
+@dataclass(frozen=True)
 class AnalysisActivity:
     completed: int
     total: int
     phase: str
     detail: str
     started: float
+    pace: _AnalysisPace | None = None
 
     def html(self) -> str:
-        elapsed = duration_string(int(monotonic() - self.started))
+        now = monotonic()
+        elapsed = duration_string(int(now - self.started))
+        estimate = ""
+        if not self.total or self.completed < self.total:
+            duration = self.pace.eta(now) if self.pace else "measuring…"
+            estimate = f' · <span title="Estimated time remaining for book analysis">ETA {duration}</span>'
         counts = f"{self.completed:,} of {self.total:,} chunks complete · " if self.total else ""
         values = f'max="{self.total}" value="{self.completed}"' if self.total else ""
         detail = f"<div>{escape(self.detail)}</div>" if self.detail else ""
         return (
             '<div class="book-progress-details">'
-            f'<span>{escape(self.phase)}</span><span>{counts}Elapsed {elapsed}</span></div>'
+            f'<span>{escape(self.phase)}</span><span>{counts}Elapsed {elapsed}{estimate}</span></div>'
             f'{detail}<div class="book-progress-track">'
             f'<progress aria-label="Overall book analysis progress" {values}></progress></div>'
         )
@@ -132,10 +151,16 @@ class SessionActivity:
             self._book = BookActivity(label, telemetry, ended=True)
             self._book_version += 1
 
-    def update_analysis(self, completed: int, total: int, phase: str, detail: str = "") -> None:
+    def update_analysis(
+        self, completed: int, total: int, phase: str, detail: str = "", *, work: tuple[int, int] | None = None,
+    ) -> None:
         with self._lock:
-            started = self._analysis.started if self._analysis else monotonic()
-            self._analysis = AnalysisActivity(completed, total, phase, detail, started)
+            now = monotonic()
+            started = self._analysis.started if self._analysis else now
+            pace = self._analysis.pace if self._analysis else None
+            if work is not None and (pace is None or work != (pace.completed, pace.total)):
+                pace = _AnalysisPace(*work, started=pace.started if pace else now, sampled=now)
+            self._analysis = AnalysisActivity(completed, total, phase, detail, started, pace)
             self._analysis_version += 1
 
     def finish_analysis(self) -> None:

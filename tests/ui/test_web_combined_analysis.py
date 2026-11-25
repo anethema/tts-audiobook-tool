@@ -340,7 +340,11 @@ def test_combined_analysis_adds_delivery_without_replacing_saved_speakers(tmp_pa
         }})
 
     monkeypatch.setattr(requests.Session, "post", post)
-    result = web_backend.analyze_book_dialogue(session, "test-key", performance_cues=True)
+    work = []
+    result = web_backend.analyze_book_dialogue(
+        session, "test-key", performance_cues=True, on_work_progress=lambda done, total: work.append((done, total)),
+    )
+    assert set(work) == {(0, 2), (2, 2)}
     assert len(prompts) == 1
     instructions = prompts[0][0]["content"]
     assert "nearly every spoken quote" in instructions
@@ -387,7 +391,13 @@ def test_delivery_enrichment_checkpoints_empty_results_and_resumes(tmp_path, mon
         return next(responses)
 
     monkeypatch.setattr(requests.Session, "post", post)
-    partial = web_backend.analyze_book_dialogue(session, "test-key", performance_cues=True)
+    work = []
+
+    def track_work(done, total):
+        work.append((done, total))
+
+    partial = web_backend.analyze_book_dialogue(session, "test-key", performance_cues=True, on_work_progress=track_work)
+    assert set(work) == {(0, 2), (1, 2)}
     assert "1 of 2" in partial.attribution_notice
     assert "Skipped chunk 2 (lines 3–4)" in partial.attribution_notice
     assert "Following context (evidence only):\nSECOND-SECTION" in prompts[0]
@@ -395,7 +405,9 @@ def test_delivery_enrichment_checkpoints_empty_results_and_resumes(tmp_path, mon
     assert partial.attributions.by_first_line(book)[3].delivery is None
     assert partial.attributions.to_dict()["ranges"][0]["utterances"][0]["delivery"] == {}
 
-    complete = web_backend.analyze_book_dialogue(session, "test-key", performance_cues=True)
+    work.clear()
+    complete = web_backend.analyze_book_dialogue(session, "test-key", performance_cues=True, on_work_progress=track_work)
+    assert work[0] == (0, 1) and work[-1] == (1, 1)
     assert len(prompts) == 5
     assert len(set(prompts[1:])) == 1
     assert "2 of 2" in complete.attribution_notice
