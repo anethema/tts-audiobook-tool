@@ -2,11 +2,12 @@ import json
 
 import pytest
 import requests
+from urllib3.exceptions import ReadTimeoutError
 
 from tts_audiobook_tool import web_local_tagger as tagger
 
 
-def _mock_ollama(monkeypatch, chat_lines):
+def _mock_ollama(monkeypatch, chat_lines, *, on_chat=None):
     calls = []
 
     def post(session, url, **kwargs):
@@ -18,11 +19,56 @@ def _mock_ollama(monkeypatch, chat_lines):
         if route == "chat":
             assert kwargs["stream"] is True and kwargs["json"]["stream"] is True
             assert kwargs["json"]["think"] is False
+            if on_chat is not None:
+                on_chat(kwargs)
             response.iter_lines = chat_lines
         return response
 
     monkeypatch.setattr(requests.Session, "post", post)
     return calls
+
+
+def test_local_chat_allows_slow_prefill_and_a_long_active_stream(monkeypatch):
+    now = 0
+    monkeypatch.setattr(tagger, "monotonic", lambda: now)
+
+    def prefill(kwargs):
+        nonlocal now
+        connect, idle = kwargs["timeout"]
+        assert 0 < connect <= 60
+        assert idle == 60 * 60
+        now += 1801
+
+    def chat_lines():
+        nonlocal now
+        yield b'{"message":{"content":"first"},"done":false}'
+        now += 1801
+        yield b'{"message":{"content":" last"},"done":true}'
+
+    _mock_ollama(monkeypatch, chat_lines, on_chat=prefill)
+    with tagger.local_qwen(lambda _line: None) as model:
+        result = model.send("system", "prompt")
+    assert result.reply == "first last"
+    assert result.elapsed == 3602
+
+
+@pytest.mark.parametrize("error, message", [
+    (requests.ReadTimeout("private details"), "Ollama sent no data for 60 minutes"),
+    (requests.ConnectTimeout("private details"), "Cannot reach Ollama"),
+])
+def test_timeout_before_chat_headers_explains_the_problem(monkeypatch, error, message):
+    def fail(_kwargs):
+        raise error
+
+    calls = _mock_ollama(monkeypatch, None, on_chat=fail)
+    with pytest.raises(tagger.LocalTaggerError) as caught:
+        with tagger.local_qwen(lambda _line: None) as model:
+            model.send("system", "prompt")
+
+    assert message in str(caught.value)
+    assert "retry" in str(caught.value).lower()
+    assert "private details" not in str(caught.value)
+    assert calls == ["show", "chat", "generate"]
 
 
 def test_local_progress_arrives_before_completion_and_keeps_exact_reply(monkeypatch):
@@ -63,6 +109,9 @@ def test_local_progress_arrives_before_completion_and_keeps_exact_reply(monkeypa
     (b'{"done":true,"message":{"content":17}}', "incomplete chat response"),
     (b'{"error":"private failure details"}', "failed during streaming"),
     (requests.ConnectionError("connection closed"), "response was interrupted"),
+    (requests.ReadTimeout("private timeout"), "Ollama sent no data for 60 minutes"),
+    # Requests wraps urllib3 read timeouts as ConnectionError during body iteration.
+    (requests.ConnectionError(ReadTimeoutError(None, None, "private timeout")), "Ollama sent no data for 60 minutes"),
 ])
 def test_local_stream_failure_discards_partial_reply_and_unloads(monkeypatch, end, expected):
     def chat_lines():
@@ -77,6 +126,8 @@ def test_local_stream_failure_discards_partial_reply_and_unloads(monkeypatch, en
         with tagger.local_qwen(lambda _line: None) as model:
             model.send("system", "prompt")
 
+    if isinstance(end, requests.RequestException):
+        assert "retry" in str(caught.value).lower()
     assert "partial" not in str(caught.value) and "private" not in str(caught.value)
     assert calls == ["show", "chat", "generate"]
 

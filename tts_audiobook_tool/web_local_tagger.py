@@ -8,6 +8,7 @@ from time import monotonic
 
 from pydantic_core import from_json
 import requests
+from urllib3.exceptions import ReadTimeoutError
 
 from tts_audiobook_tool.app_types.delivery_cue import DeliveryCue
 from tts_audiobook_tool.speaker_assign.llm_request_util import LlmRequestResult, SPEAKER_ASSIGN_LLM_TIMEOUT
@@ -16,6 +17,10 @@ from tts_audiobook_tool.speaker_assign.llm_request_util import LlmRequestResult,
 LOCAL_QWEN_MODEL = "hf.co/unsloth/Qwen3.8-27B-GGUF:UD-Q5_K_M"
 CONTEXT_LENGTH = 40960
 _OLLAMA = "http://127.0.0.1:11434"
+# Ollama can spend tens of minutes processing a chapter before it sends its first byte.
+_CHAT_IDLE_MINUTES = 60
+_CHAT_TIMEOUT = (SPEAKER_ASSIGN_LLM_TIMEOUT[0], _CHAT_IDLE_MINUTES * 60)
+_CHAT_IDLE_MESSAGE = f"Ollama sent no data for {_CHAT_IDLE_MINUTES} minutes. Retry the analysis."
 
 
 class LocalTaggerError(RuntimeError):
@@ -56,13 +61,16 @@ class LocalQwen:
         self.used = False
 
     def _post(self, route: str, **kwargs):
+        timeout = _CHAT_TIMEOUT if route == "/api/chat" else SPEAKER_ASSIGN_LLM_TIMEOUT
         try:
             return self.http.post(
-                _OLLAMA + route, allow_redirects=False, timeout=SPEAKER_ASSIGN_LLM_TIMEOUT, **kwargs,
+                _OLLAMA + route, allow_redirects=False, timeout=timeout, **kwargs,
             )
         except requests.ConnectionError as exc:
             raise LocalTaggerError("Cannot reach Ollama at 127.0.0.1:11434. Start Ollama and retry.") from exc
         except requests.Timeout as exc:
+            if route == "/api/chat":
+                raise LocalTaggerError(_CHAT_IDLE_MESSAGE) from exc
             raise LocalTaggerError(f"Ollama timed out during {route}.") from exc
 
     def prepare(self) -> None:
@@ -152,6 +160,9 @@ class LocalQwen:
         except (KeyError, TypeError, ValueError) as exc:
             raise LocalTaggerError("Ollama returned an incomplete chat response.") from exc
         except requests.RequestException as exc:
+            # Requests wraps urllib3's socket read timeout in ConnectionError during iteration.
+            if isinstance(exc, requests.ReadTimeout) or (exc.args and isinstance(exc.args[0], ReadTimeoutError)):
+                raise LocalTaggerError(_CHAT_IDLE_MESSAGE) from exc
             raise LocalTaggerError("The Ollama response was interrupted. Retry the analysis.") from exc
         raise LocalTaggerError("Ollama ended the chat before reporting completion.")
 
