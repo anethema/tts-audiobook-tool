@@ -18,7 +18,6 @@ def _mock_ollama(monkeypatch, chat_lines, *, on_chat=None):
         response._content_consumed = True
         if route == "chat":
             assert kwargs["stream"] is True and kwargs["json"]["stream"] is True
-            assert kwargs["json"]["think"] is False
             if on_chat is not None:
                 on_chat(kwargs)
             response.iter_lines = chat_lines
@@ -71,6 +70,21 @@ def test_timeout_before_chat_headers_explains_the_problem(monkeypatch, error, me
     assert calls == ["show", "chat", "generate"]
 
 
+@pytest.mark.parametrize("options, expected", [({}, "medium"), ({"thinking": "off"}, False)])
+def test_local_qwen_sends_selected_thinking_mode(monkeypatch, options, expected):
+    def chat_lines():
+        yield b'{"message":{"content":"answer"},"done":true}'
+
+    def check_thinking(kwargs):
+        actual = kwargs["json"]["think"]
+        assert actual == expected
+        assert type(actual) is type(expected)
+
+    _mock_ollama(monkeypatch, chat_lines, on_chat=check_thinking)
+    with tagger.local_qwen(lambda _line: None, **options) as model:
+        assert model.send("system", "prompt").reply == "answer"
+
+
 def test_local_progress_arrives_before_completion_and_keeps_exact_reply(monkeypatch):
     now = 100.0
     monkeypatch.setattr(tagger, "monotonic", lambda: now)
@@ -80,7 +94,8 @@ def test_local_progress_arrives_before_completion_and_keeps_exact_reply(monkeypa
         nonlocal now
         yield b""
         yield b'{"message":{"content":"","thinking":"private reasoning"},"done":false}'
-        assert activity[-1] == "Qwen is preparing the prompt…"
+        assert "reasoning" in activity[-1].lower()
+        assert "private" not in activity[-1]
         yield b'{"message":{"content":"first "},"done":false}'
         first_update = activity[-1]
         assert first_update == "Qwen is writing tags · 6 reply characters · 0s"

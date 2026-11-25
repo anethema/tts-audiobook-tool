@@ -236,7 +236,8 @@ def test_local_qwen_activity_is_visible_during_analysis_and_hidden_afterward(tmp
     writing = "Qwen is writing tags · 18 speaker labels drafted · 982 characters · 3s"
     notice = "The model disconnected." if fail else "3 of 3 dialogue chunks complete."
 
-    def local_qwen(_log, *, on_activity):
+    def local_qwen(_log, *, thinking, on_activity):
+        assert thinking == ("off" if fail else "medium")
         return nullcontext(on_activity)
 
     def analyze_dialogue(session, _key, _model, *, on_progress, local_tagger, **_kwargs):
@@ -261,8 +262,14 @@ def test_local_qwen_activity_is_visible_during_analysis_and_hidden_afterward(tmp
         if isinstance(component, gr.Checkbox) and component.label.startswith("Use local Qwen")
     )
     ui.values[qwen._id] = True
+    thinking = next(component for component in analyze.inputs if getattr(component, "label", None) == "Local Qwen thinking")
+    assert ui.values[thinking._id] == "medium"
+    if fail:
+        ui.values[thinking._id] = "off"
 
     async def exercise():
+        (controls,) = await ui.run(ui.event("show_thinking_control"), True)
+        assert [control["visible"] for control in controls] == [True, False]
         job = asyncio.create_task(ui.run(analyze))
         try:
             assert await asyncio.to_thread(streaming.wait, 10)

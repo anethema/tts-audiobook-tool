@@ -16,6 +16,7 @@ from tts_audiobook_tool.speaker_assign.llm_request_util import LlmRequestResult,
 
 LOCAL_QWEN_MODEL = "hf.co/unsloth/Qwen3.8-27B-GGUF:UD-Q5_K_M"
 CONTEXT_LENGTH = 40960
+DEFAULT_LOCAL_THINKING = "medium"
 _OLLAMA = "http://127.0.0.1:11434"
 # Ollama can spend tens of minutes processing a chapter before it sends its first byte.
 _CHAT_IDLE_MINUTES = 60
@@ -53,8 +54,11 @@ def _writing_activity(fragments: list[str], characters: int, elapsed: float) -> 
 class LocalQwen:
     def __init__(
         self, http: requests.Session, log: Callable[[str], None],
-        *, on_activity: Callable[[str], None] | None = None,
+        *, thinking: str = DEFAULT_LOCAL_THINKING, on_activity: Callable[[str], None] | None = None,
     ):
+        if thinking not in ("medium", "off"):
+            raise LocalTaggerError("Choose Medium or Off for local Qwen thinking.")
+        self.thinking = thinking
         self.http = http
         self.log = log
         self.on_activity = on_activity
@@ -115,12 +119,16 @@ class LocalQwen:
         if not self.used:
             self.prepare()
             self.used = True
-            self.log(f"Tagging locally with {LOCAL_QWEN_MODEL} and a {CONTEXT_LENGTH:,}-token context.\n")
+            self.log(
+                f"Tagging locally with {LOCAL_QWEN_MODEL}, thinking {self.thinking}, "
+                f"and a {CONTEXT_LENGTH:,}-token context.\n"
+            )
         started = monotonic()
         if self.on_activity:
             self.on_activity("Qwen is preparing the prompt…")
         with self._post("/api/chat", stream=True, json={
-            "model": LOCAL_QWEN_MODEL, "stream": True, "format": "json", "think": False, "truncate": False,
+            "model": LOCAL_QWEN_MODEL, "stream": True, "format": "json", "truncate": False,
+            "think": False if self.thinking == "off" else self.thinking,
             "options": {"num_ctx": CONTEXT_LENGTH, "temperature": 0.2},
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
         }) as response:
@@ -132,6 +140,7 @@ class LocalQwen:
         fragments: list[str] = []
         characters = 0
         last_report = None
+        last_reasoning_report = None
         try:
             for line in response.iter_lines():
                 if not line:
@@ -141,7 +150,11 @@ class LocalQwen:
                     raise ValueError
                 if "error" in update:
                     raise LocalTaggerError("Local Qwen tagging failed during streaming. Check the Ollama log.")
-                fragment = update["message"]["content"]
+                message = update["message"]
+                if not isinstance(message, dict):
+                    raise ValueError
+                reasoning = bool(message.get("thinking"))
+                fragment = message.get("content", "") if reasoning else message["content"]
                 if not isinstance(fragment, str) or not isinstance(update.get("done"), bool):
                     raise ValueError
                 if fragment:
@@ -152,6 +165,11 @@ class LocalQwen:
                         if last_report is None or now - last_report >= 1:
                             self.on_activity(_writing_activity(fragments, characters, now - started))
                             last_report = now
+                elif reasoning and self.on_activity and not fragments:
+                    now = monotonic()
+                    if last_reasoning_report is None or now - last_reasoning_report >= 1:
+                        self.on_activity(f"Qwen is reasoning · {now - started:.0f}s")
+                        last_reasoning_report = now
                 if update["done"]:
                     return LlmRequestResult(
                         "".join(fragments), "", monotonic() - started, finish_reason=update.get("done_reason"),
@@ -177,10 +195,13 @@ class LocalQwen:
 
 
 @contextmanager
-def local_qwen(log: Callable[[str], None], *, on_activity: Callable[[str], None] | None = None):
+def local_qwen(
+    log: Callable[[str], None], *, thinking: str = DEFAULT_LOCAL_THINKING,
+    on_activity: Callable[[str], None] | None = None,
+):
     with requests.Session() as http:
         http.trust_env = False
-        tagger = LocalQwen(http, log, on_activity=on_activity)
+        tagger = LocalQwen(http, log, thinking=thinking, on_activity=on_activity)
         try:
             yield tagger
         finally:

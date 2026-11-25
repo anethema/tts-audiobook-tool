@@ -49,7 +49,7 @@ from tts_audiobook_tool.web_legacy_project import (
     WebLegacyProjectError, list_console_projects, load_console_project,
 )
 from tts_audiobook_tool.web_line_voice_panel import LineVoicePanel
-from tts_audiobook_tool.web_local_tagger import local_qwen
+from tts_audiobook_tool.web_local_tagger import DEFAULT_LOCAL_THINKING, local_qwen
 from tts_audiobook_tool.web_model_panel import ModelPanel
 from tts_audiobook_tool.web_model_setup import ModelSetupProgress, WebModelSetupError, install_model, model_profiles
 from tts_audiobook_tool.web_playback_panel import PlaybackPanel
@@ -217,6 +217,10 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                                 info="Downloads the Hugging Face UD-Q5_K_M model through local Ollama on first use "
                                      "(about 21 GB). Tags characters and delivery with a 40,960-token context. "
                                      "Leave unchecked to use the configured LLM.",
+                            )
+                            local_thinking = gr.Dropdown(
+                                [("Medium", "medium"), ("Off", "off")], value=DEFAULT_LOCAL_THINKING,
+                                label="Local Qwen thinking", interactive=True, visible=False,
                             )
                             with gr.Row():
                                 api_key = gr.Textbox(
@@ -718,8 +722,15 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
         save_new.click(save_named_project, [project_name, *persist_inputs], persist_outputs, **PRIVATE_EVENT)
         save_changes.click(save_loaded_project, [active_project, *persist_inputs], persist_outputs, **PRIVATE_EVENT)
 
-        def analyze_book(session, key, model, reasoning, endpoint, settings_json, selected_role, use_qwen, character_voices,
-                         performance_cues, request: gr.Request):
+        def show_thinking_control(use_qwen):
+            return gr.update(visible=use_qwen), gr.update(visible=not use_qwen)
+
+        use_local_qwen.change(
+            show_thinking_control, use_local_qwen, [local_thinking, effort], queue=False, **PRIVATE_EVENT,
+        )
+
+        def analyze_book(session, key, model, reasoning, endpoint, settings_json, selected_role, use_qwen, thinking,
+                         character_voices, performance_cues, request: gr.Request):
             activity = activity_panel.session(request.session_hash)
             chunk = (0, 0, "Preparing book analysis")
             last_console_update = None
@@ -755,7 +766,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                     secret = load_api_key(endpoint or "")
                 if secret and secret in (endpoint or ""):
                     raise WebBackendError("Remove the API key from the chat completions URL.")
-                with local_qwen(log, on_activity=report_qwen) if use_qwen else nullcontext() as tagger:
+                with local_qwen(log, thinking=thinking, on_activity=report_qwen) if use_qwen else nullcontext() as tagger:
                     session = analyze_book_dialogue(
                         session, secret, model, effort=reasoning or "", endpoint=endpoint,
                         settings_json=settings_json or "", on_log=log, performance_cues=performance_cues,
@@ -780,7 +791,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
         analyzed = analyze.click(
             analyze_book, [
                 book, api_key, llm_model, effort, llm_endpoint, llm_extra_params, cast_role, use_local_qwen,
-                character_voices, analyze_performance_cues,
+                local_thinking, character_voices, analyze_performance_cues,
             ],
             [book, characters, cast_role, analysis_status], show_progress="hidden", **PRIVATE_EVENT,
         )

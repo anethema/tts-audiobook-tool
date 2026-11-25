@@ -343,6 +343,7 @@ def test_combined_analysis_adds_delivery_without_replacing_saved_speakers(tmp_pa
     result = web_backend.analyze_book_dialogue(session, "test-key", performance_cues=True)
     assert len(prompts) == 1
     assert "Do not invent spoken words" in prompts[0][0]["content"]
+    assert "Add a sparse top-level" in prompts[0][0]["content"]
     passage = prompts[0][1]["content"]
     assert "Anna managed a hollow laugh." in passage
     assert '<q id="1" speaker="ANNA" cue="true">“All right.”</q>' in passage
@@ -641,6 +642,10 @@ def test_local_qwen_downloads_tags_and_unloads_then_reuses_saved_analysis(tmp_pa
         elif route == "pull":
             response._content = b'{"status":"success"}\n'
         elif route == "chat":
+            instructions = payload["messages"][0]["content"]
+            assert "nearly every spoken quote" in instructions
+            assert 'Usually omit "before" and "after"' in instructions
+            assert "Add a sparse top-level" not in instructions
             assert payload["options"]["num_ctx"] == CONTEXT_LENGTH
             assert payload["truncate"] is False and payload["format"] == "json"
             response._content = json.dumps({
