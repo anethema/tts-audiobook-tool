@@ -32,7 +32,7 @@ from tts_audiobook_tool.speaker_assign.attribution_prompt_util import ATTRIBUTIO
 from tts_audiobook_tool.speaker_assign.attribution_reply_util import AttributionReplyUtil
 from tts_audiobook_tool.speaker_assign.combined_analysis import SYSTEM_PROMPT as COMBINED_ANALYSIS_SYSTEM_PROMPT
 from tts_audiobook_tool.speaker_assign.combined_analysis import (
-    CHARACTER_VOICE_SYSTEM_INSTRUCTIONS, LOCAL_PERFORMANCE_CUE_SYSTEM_PROMPT, PERFORMANCE_CUE_SYSTEM_PROMPT,
+    CHARACTER_VOICE_SYSTEM_INSTRUCTIONS, PERFORMANCE_CUE_SYSTEM_PROMPT,
     InvalidChunkReplyError, build_prompt, parse_chunk_reply,
 )
 from tts_audiobook_tool.speaker_assign.attribution_runner import AttributionRunner, AttributionRunListener
@@ -305,7 +305,6 @@ def analyze_book_dialogue(
         progress("Starting dialogue analysis.")
     prefs = None
     analysis_model = LOCAL_QWEN_MODEL if local_tagger is not None else model.strip()
-    cue_prompt = LOCAL_PERFORMANCE_CUE_SYSTEM_PROMPT if local_tagger is not None else PERFORMANCE_CUE_SYSTEM_PROMPT
     issue = ""
     skipped_chunks: list[PlannedChunk] = []
     log(f"Analyzing {total:,} dialogue chunks.\n")
@@ -344,7 +343,7 @@ def analyze_book_dialogue(
             request_description = " and ".join(request_parts)
             progress(f"{location} · requesting {request_description}")
             log(f"{label} requesting {request_description} ({line_range}).\n")
-            system_prompt = cue_prompt if cue_requests else COMBINED_ANALYSIS_SYSTEM_PROMPT
+            system_prompt = PERFORMANCE_CUE_SYSTEM_PROMPT if cue_requests else COMBINED_ANALYSIS_SYSTEM_PROMPT
             if character_voices:
                 system_prompt += CHARACTER_VOICE_SYSTEM_INSTRUCTIONS
             attempt_system_prompt = system_prompt

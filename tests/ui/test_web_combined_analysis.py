@@ -11,7 +11,7 @@ from tts_audiobook_tool.app_types.delivery_cue import DeliveryCue
 from tts_audiobook_tool.app_types.phrase import Phrase, PhraseGroup, Reason
 from tts_audiobook_tool.l import L
 from tts_audiobook_tool.speaker_assign.attribution import AttributionsFile, RangeAttribution, UtteranceAttribution
-from tts_audiobook_tool.speaker_assign.combined_analysis import parse_chunk_reply
+from tts_audiobook_tool.speaker_assign.combined_analysis import PERFORMANCE_CUE_SYSTEM_PROMPT, parse_chunk_reply
 from tts_audiobook_tool.speaker_assign.roster import (
     CHARACTER_VOICE_DIRECTIONS, NEUTRAL_CHARACTER_VOICE_DIRECTION, Roster, RosterCharacter,
 )
@@ -342,8 +342,10 @@ def test_combined_analysis_adds_delivery_without_replacing_saved_speakers(tmp_pa
     monkeypatch.setattr(requests.Session, "post", post)
     result = web_backend.analyze_book_dialogue(session, "test-key", performance_cues=True)
     assert len(prompts) == 1
-    assert "Do not invent spoken words" in prompts[0][0]["content"]
-    assert "Add a sparse top-level" in prompts[0][0]["content"]
+    instructions = prompts[0][0]["content"]
+    assert "nearly every spoken quote" in instructions
+    assert 'Usually omit "before" and "after"' in instructions
+    assert "Keep the quoted words intact" in instructions
     passage = prompts[0][1]["content"]
     assert "Anna managed a hollow laugh." in passage
     assert '<q id="1" speaker="ANNA" cue="true">“All right.”</q>' in passage
@@ -642,10 +644,7 @@ def test_local_qwen_downloads_tags_and_unloads_then_reuses_saved_analysis(tmp_pa
         elif route == "pull":
             response._content = b'{"status":"success"}\n'
         elif route == "chat":
-            instructions = payload["messages"][0]["content"]
-            assert "nearly every spoken quote" in instructions
-            assert 'Usually omit "before" and "after"' in instructions
-            assert "Add a sparse top-level" not in instructions
+            assert payload["messages"][0]["content"] == PERFORMANCE_CUE_SYSTEM_PROMPT
             assert payload["options"]["num_ctx"] == CONTEXT_LENGTH
             assert payload["truncate"] is False and payload["format"] == "json"
             response._content = json.dumps({

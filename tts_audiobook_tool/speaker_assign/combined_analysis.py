@@ -57,25 +57,11 @@ Every requested quote ID must appear exactly once in speakers, and every
 character ID used must be established or present in characters. Return only
 new or updated character entries. Narration can be omitted when unchanged."""
 
-_CUE_SYSTEM_PROMPT = SYSTEM_PROMPT + """
+PERFORMANCE_CUE_SYSTEM_PROMPT = SYSTEM_PROMPT + f"""
 
 Also assess performance for quotes marked cue="true". If such a quote already
 has a speaker attribute, preserve it and omit that ID from speakers and uncertain.
-Use surrounding narration and nearby dialogue as evidence."""
-
-PERFORMANCE_CUE_SYSTEM_PROMPT = _CUE_SYSTEM_PROMPT + f""" Add a sparse top-level
-"delivery" object such as {{"3":{{"direction":"quietly, with relief","after":"sighs"}}}}.
-Use only IDs marked cue="true" and omit quotes with no clear cue. For normal
-speech or quoted material marked NOT_SPEECH, leave delivery empty. Direction is
-optional: a short, plain English note about how to speak this quote, at most
-{MAX_DELIVERY_DIRECTION_CHARS} characters. Record an optional before or after
-sound only when the passage clearly places it on that side of the same speaker's
-quote and it adds to the performance without repeating narrated action. Use only
-these event names: {", ".join(DELIVERY_EVENTS)}. Do not invent spoken words,
-rewrite quotations, add dialogue, guess at emotions, or decorate ordinary lines.
-Return only JSON."""
-
-LOCAL_PERFORMANCE_CUE_SYSTEM_PROMPT = _CUE_SYSTEM_PROMPT + f"""
+Use surrounding narration and nearby dialogue as evidence.
 
 Give a short delivery direction to nearly every spoken quote marked cue="true",
 including everyday dialogue. Pick one detail an actor can use from the wording,
