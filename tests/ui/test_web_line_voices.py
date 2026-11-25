@@ -100,13 +100,31 @@ class TestLineVoices(unittest.TestCase):
         ])
         self.assertEqual(web_line_voices.line_voice_rows(session, 99), [])
 
-    def test_browser_assign_and_clear_update_state_and_visible_rows(self):
+    def test_rendering_last_page_only_reads_text_for_that_page(self):
+        class OffPageLine(PhraseGroup):
+            @property
+            def text(self):
+                raise AssertionError("Rendering this page read a line on another page")
+
+        off_page = OffPageLine([Phrase("Earlier line.", Reason.SENTENCE)])
+        last = PhraseGroup([Phrase("Final line.", Reason.SECTION_BREAK)])
+        session = BookSession(Book([BookSection([off_page] * 50_600 + [last])]), "large-project")
+        self.assertEqual(web_line_voices.line_voice_rows(session, 0, 2025), [[50_601, "Automatic", "Final line."]])
+
+    def test_browser_pages_a_large_section_and_applies_global_voice_ranges(self):
         try:
             import gradio as gr
             from gradio.state_holder import SessionState
         except ImportError:
             self.skipTest("Gradio is not installed in this environment.")
         from tts_audiobook_tool import web_line_voice_panel
+
+        long_section = BookSection([
+            PhraseGroup([Phrase(f"Line {number}.", Reason.SENTENCE)])
+            for number in range(1, 50_605)
+        ], "Long chapter")
+        last_section = BookSection([PhraseGroup([Phrase("Closing line.", Reason.SECTION_BREAK)])], "Coda")
+        session = BookSession(Book([long_section, last_section]), "large-project")
 
         async def exercise(voice_id):
             with gr.Blocks(analytics_enabled=False) as app:
@@ -115,25 +133,72 @@ class TestLineVoices(unittest.TestCase):
                 panel.bind(app, book, event_options={"api_visibility": "private", "concurrency_id": "local-work"})
             app.has_launched = True
             state = SessionState(app)
-            state[book._id] = _session()
+            state[book._id] = session
             request = gr.Request(session_hash="test-line-voice")
-            callbacks = {tuple(fn.targets): fn for fn in app.fns.values()}
+            self.assertIsInstance(panel.lines, gr.Radio)
+            props = {component["id"]: dict(component["props"]) for component in app.config["components"]}
 
-            async def event(component, action, *values):
-                fn = callbacks[((component._id, action),)]
-                return await app.process_api(fn, list(values), state, request=request)
+            async def event(component, trigger):
+                callbacks = [fn for fn in app.fns.values() if (component._id, trigger) in fn.targets]
+                self.assertTrue(callbacks, f"No {trigger} callback on {component}")
+                changed = set()
+                for fn in callbacks:
+                    result = await app.process_api(
+                        fn, [None if item.stateful else props[item._id].get("value") for item in fn.inputs],
+                        state, request=request,
+                    )
+                    changed.update(result["changed_state_ids"])
+                    for item, update in zip(fn.outputs, result["data"], strict=True):
+                        if item.stateful:
+                            continue
+                        if isinstance(update, dict) and update.get("__type__") == "update":
+                            props[item._id].update(update)
+                        else:
+                            props[item._id]["value"] = update
+                return changed
 
-            load_choices = next(fn for fn in app.fns.values() if fn.name == "refresh_voices" and len(fn.targets) == 1)
-            await app.process_api(load_choices, [], state, request=request)
-            opened = await event(book, "change", None, None, None)
-            self.assertTrue(opened["data"][0]["visible"])
-            self.assertEqual(opened["data"][2]["data"][0], [1, "Automatic", "A line of narration."])
-            assigned = await event(panel.assign, "click", None, 0, "2-3", voice_id)
-            self.assertIn(book._id, assigned["changed_state_ids"])
-            self.assertEqual(assigned["data"][1]["data"][1], [2, "Guest", "“Hello.”"])
-            cleared = await event(panel.clear, "click", None, 0, "2")
-            self.assertEqual(cleared["data"][1]["data"][1], [2, "Automatic", "“Hello.”"])
-            self.assertEqual(state[book._id].book.phrase_groups[2].voice_index, 2)
+            def line_choices():
+                return [tuple(choice) for choice in props[panel.lines._id]["choices"]]
+
+            await event(book, "change")
+            self.assertEqual(len(line_choices()), 0)
+            await event(panel.panel, "expand")
+            self.assertEqual([number for _, number in line_choices()], list(range(1, 26)))
+            await event(panel.next_page, "click")
+            self.assertEqual([number for _, number in line_choices()], list(range(26, 51)))
+            await event(panel.previous_page, "click")
+            self.assertEqual(line_choices()[0], ("1 · Automatic · Line 1.", 1))
+
+            props[panel.page._id]["value"] = 2025
+            await event(panel.page, "submit")
+            self.assertEqual([number for _, number in line_choices()], [50_601, 50_602, 50_603, 50_604])
+            self.assertEqual(line_choices()[-1], ("50,604 · Automatic · Line 50604.", 50_604))
+
+            props[panel.lines._id]["value"] = line_choices()[1][1]
+            await event(panel.lines, "input")
+            self.assertEqual(props[panel.ranges._id]["value"], "50602")
+            props[panel.ranges._id]["value"] = "25-26, 50602, 50605"
+            props[panel.voice._id]["value"] = voice_id
+            self.assertIn(book._id, await event(panel.assign, "click"))
+            await event(book, "change")
+            self.assertEqual(line_choices()[1], ("50,602 · Guest · Line 50602.", 50_602))
+            assigned = state[book._id].book.phrase_groups
+            self.assertTrue(all(assigned[line - 1].voice_index > 0 for line in (25, 26, 50_602, 50_605)))
+
+            props[panel.ranges._id]["value"] = "50602"
+            self.assertIn(book._id, await event(panel.clear, "click"))
+            await event(book, "change")
+            self.assertEqual(line_choices()[1], ("50,602 · Automatic · Line 50602.", 50_602))
+            props[panel.section._id]["value"] = 1
+            await event(panel.section, "input")
+            self.assertEqual(line_choices(), [("50,605 · Guest · Closing line.", 50_605)])
+
+            await event(panel.panel, "collapse")
+            self.assertEqual(line_choices(), [])
+            state[book._id] = _session()
+            await event(book, "change")
+            await event(panel.panel, "expand")
+            self.assertEqual(line_choices()[0], ("1 · Automatic · A line of narration.", 1))
 
         with TemporaryDirectory() as directory:
             root = Path(directory) / "library"

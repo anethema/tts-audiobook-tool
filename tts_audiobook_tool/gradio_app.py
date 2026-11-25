@@ -91,6 +91,9 @@ CSS = """
                   border-radius: var(--radius-lg); padding: 16px; }
 #voice-settings h2 { font-size: 1.1rem; margin: 0; }
 #sample-players > div { flex: 1 1 275px; }
+#line-voice-picker > .wrap:has(> label) { display: grid; grid-template-columns: minmax(0, 1fr);
+                                         max-height: 25rem; overflow-y: auto; }
+#line-voice-picker label { align-items: baseline; overflow-wrap: anywhere; }
 """ + ACTIVITY_CSS
 
 

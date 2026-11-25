@@ -13,6 +13,9 @@ if TYPE_CHECKING:
     from tts_audiobook_tool.web_render import RenderVoice
 
 
+LINE_VOICE_PAGE_SIZE = 25
+
+
 def set_line_voice(
         session: BookSession | None, ranges: str, voice: RenderVoice | None,
 ) -> tuple[BookSession, int]:
@@ -76,17 +79,26 @@ def line_voice_sections(session: BookSession | None) -> list[tuple[str, int]]:
         return []
     return [
         (UtteranceUtil.section_label(session.book, index), index)
-        for index, (start, end) in enumerate(session.book.section_ranges())
-        if start < end
+        for index, section in enumerate(session.book.sections)
+        if section.phrase_groups
     ]
 
 
-def line_voice_rows(session: BookSession | None, section: int | None) -> list[list[int | str]]:
+def line_voice_page_count(session: BookSession | None, section: int | None) -> int:
     if session is None or type(section) is not int or not 0 <= section < len(session.book.sections):
+        return 0
+    count = len(session.book.sections[section].phrase_groups)
+    return (count + LINE_VOICE_PAGE_SIZE - 1) // LINE_VOICE_PAGE_SIZE
+
+
+def line_voice_rows(session: BookSession | None, section: int | None, page: int = 1) -> list[list[int | str]]:
+    if (session is None or section is None or type(page) is not int
+            or not 1 <= page <= line_voice_page_count(session, section)):
         return []
     start, end = session.book.section_ranges()[section]
+    start += (page - 1) * LINE_VOICE_PAGE_SIZE
     rows = []
-    for index in range(start, end):
+    for index in range(start, min(start + LINE_VOICE_PAGE_SIZE, end)):
         group = session.book.phrase_groups[index]
         slot = group.voice_index
         voice = session.line_voices.get(slot) if slot > 0 else None
