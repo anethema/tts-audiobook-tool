@@ -105,7 +105,7 @@ def test_local_progress_arrives_before_completion_and_keeps_exact_reply(monkeypa
         now += 2
         yield json.dumps({"message": {"content": "café"}, "done": False}).encode()
         assert activity[-1] == "Qwen is writing tags · 18 reply characters · 2s"
-        yield b'{"message":{"content":"!"},"done":true,"done_reason":"length","prompt_eval_count":42,"eval_count":6}'
+        yield b'{"message":{"content":"!"},"done":true,"done_reason":"stop","prompt_eval_count":42,"eval_count":6}'
 
     calls = _mock_ollama(monkeypatch, chat_lines)
     with tagger.local_qwen(lambda _line: None, on_activity=activity.append) as model:
@@ -114,7 +114,7 @@ def test_local_progress_arrives_before_completion_and_keeps_exact_reply(monkeypa
     assert calls == ["show", "chat", "generate"]
     assert result.reply == "first private café!" and result.reasoning == ""
     assert result.input_tokens == 42 and result.output_tokens == 6
-    assert result.hit_output_limit and result.elapsed == 2.25
+    assert result.finish_reason == "stop" and result.elapsed == 2.25
     assert all("private" not in update for update in activity)
 
 

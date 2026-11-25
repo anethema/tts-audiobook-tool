@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import contextmanager
 import json
+from secrets import randbelow
 from time import monotonic
 
 from pydantic_core import from_json
@@ -11,11 +12,13 @@ import requests
 from urllib3.exceptions import ReadTimeoutError
 
 from tts_audiobook_tool.app_types.delivery_cue import DeliveryCue
+from tts_audiobook_tool.web_ollama_progress import observe_prompt_reading
 from tts_audiobook_tool.speaker_assign.llm_request_util import LlmRequestResult, SPEAKER_ASSIGN_LLM_TIMEOUT
 
 
 LOCAL_QWEN_MODEL = "hf.co/unsloth/Qwen3.8-27B-GGUF:UD-Q5_K_M"
-CONTEXT_LENGTH = 40960
+CONTEXT_LENGTH = 16_384
+MAX_CONTEXT_LENGTH = 40_960
 DEFAULT_LOCAL_THINKING = "medium"
 _OLLAMA = "http://127.0.0.1:11434"
 # Ollama can spend tens of minutes processing a chapter before it sends its first byte.
@@ -26,6 +29,23 @@ _CHAT_IDLE_MESSAGE = f"Ollama sent no data for {_CHAT_IDLE_MINUTES} minutes. Ret
 
 class LocalTaggerError(RuntimeError):
     """Local model setup or inference failed."""
+
+
+class _ContextOverflow(Exception):
+    """The complete book chunk and its reply could not fit in this context."""
+
+
+def _is_context_overflow(error: object) -> bool:
+    if not isinstance(error, str):
+        return False
+    message = error.casefold()
+    return any(marker in message for marker in (
+        "the prompt is longer than the context length",
+        "exceeds the available context size",
+        "larger than the max context size",
+        "context size has been exceeded",
+        "input length exceeds the context length",
+    ))
 
 
 def _writing_activity(fragments: list[str], characters: int, elapsed: float) -> str:
@@ -120,27 +140,57 @@ class LocalQwen:
             self.prepare()
             self.used = True
             self.log(
-                f"Tagging locally with {LOCAL_QWEN_MODEL}, thinking {self.thinking}, "
-                f"and a {CONTEXT_LENGTH:,}-token context.\n"
+                f"Tagging locally with {LOCAL_QWEN_MODEL}, thinking {self.thinking}. "
+                f"Chunks start at {CONTEXT_LENGTH:,} tokens and can expand to {MAX_CONTEXT_LENGTH:,}.\n"
             )
         started = monotonic()
         if self.on_activity:
             self.on_activity("Qwen is preparing the prompt…")
-        with self._post("/api/chat", stream=True, json={
-            "model": LOCAL_QWEN_MODEL, "stream": True, "format": "json", "truncate": False,
-            "think": False if self.thinking == "off" else self.thinking,
-            "options": {"num_ctx": CONTEXT_LENGTH, "temperature": 0.2},
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
-        }) as response:
-            if response.status_code != 200:
-                raise LocalTaggerError(f"Local Qwen tagging failed (HTTP {response.status_code}). Check the Ollama log.")
-            return self._read_chat(response, started)
+        for context_length in (CONTEXT_LENGTH, MAX_CONTEXT_LENGTH):
+            try:
+                return self._send_with_context(system, prompt, context_length, started)
+            except _ContextOverflow:
+                if context_length == MAX_CONTEXT_LENGTH:
+                    break
+                message = f"Chunk exceeded {context_length:,} tokens. Retrying with {MAX_CONTEXT_LENGTH:,}."
+                self.log(message + "\n")
+                if self.on_activity:
+                    self.on_activity(message)
+        raise LocalTaggerError(f"This dialogue chunk exceeded Qwen's {MAX_CONTEXT_LENGTH:,}-token context.")
 
-    def _read_chat(self, response: requests.Response, started: float) -> LlmRequestResult:
+    def _send_with_context(
+        self, system: str, prompt: str, context_length: int, started: float,
+    ) -> LlmRequestResult:
+        seed = randbelow(2**31 - 1) + 1
+        request = {
+            "model": LOCAL_QWEN_MODEL, "stream": True, "format": "json", "truncate": False, "shift": False,
+            "think": False if self.thinking == "off" else self.thinking,
+            "options": {"num_ctx": context_length, "temperature": 0.2, "seed": seed},
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+        }
+        with observe_prompt_reading(seed, self.on_activity) as stop_prefill:
+            with self._post("/api/chat", stream=True, json=request) as response:
+                if response.status_code != 200:
+                    try:
+                        body = response.json()
+                    except ValueError:
+                        body = None
+                    if isinstance(body, dict) and _is_context_overflow(body.get("error")):
+                        raise _ContextOverflow
+                    raise LocalTaggerError(f"Local Qwen tagging failed (HTTP {response.status_code}). Check the Ollama log.")
+                result = self._read_chat(response, started, stop_prefill=stop_prefill)
+        if result.hit_output_limit:
+            raise _ContextOverflow
+        return result
+
+    def _read_chat(
+        self, response: requests.Response, started: float, *, stop_prefill: Callable[[], None],
+    ) -> LlmRequestResult:
         fragments: list[str] = []
         characters = 0
         last_report = None
         last_reasoning_report = None
+        reading_prompt = True
         try:
             for line in response.iter_lines():
                 if not line:
@@ -149,6 +199,8 @@ class LocalQwen:
                 if not isinstance(update, dict):
                     raise ValueError
                 if "error" in update:
+                    if _is_context_overflow(update["error"]):
+                        raise _ContextOverflow
                     raise LocalTaggerError("Local Qwen tagging failed during streaming. Check the Ollama log.")
                 message = update["message"]
                 if not isinstance(message, dict):
@@ -157,6 +209,9 @@ class LocalQwen:
                 fragment = message.get("content", "") if reasoning else message["content"]
                 if not isinstance(fragment, str) or not isinstance(update.get("done"), bool):
                     raise ValueError
+                if reading_prompt and (reasoning or fragment):
+                    stop_prefill()
+                    reading_prompt = False
                 if fragment:
                     fragments.append(fragment)
                     characters += len(fragment)

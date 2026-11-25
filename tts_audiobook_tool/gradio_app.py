@@ -215,7 +215,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                             use_local_qwen = gr.Checkbox(
                                 label="Use local Qwen3.8-27B for book analysis", value=False,
                                 info="Downloads the Hugging Face UD-Q5_K_M model through local Ollama on first use "
-                                     "(about 21 GB). Tags characters and delivery with a 40,960-token context. "
+                                     "(about 21 GB). Starts at 16,384 tokens and retries larger chunks at 40,960. "
                                      "Leave unchecked to use the configured LLM.",
                             )
                             local_thinking = gr.Dropdown(
@@ -733,7 +733,8 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                          character_voices, performance_cues, request: gr.Request):
             activity = activity_panel.session(request.session_hash)
             chunk = (0, 0, "Preparing book analysis")
-            last_console_update = None
+            last_console_phase = ""
+            last_console_update = 0.0
             secret = "" if use_qwen else (key or "").strip()
 
             def redact(message: str) -> str:
@@ -748,12 +749,13 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                 activity.update_analysis(*chunk)
 
             def report_qwen(detail: str) -> None:
-                nonlocal last_console_update
+                nonlocal last_console_phase, last_console_update
                 activity.update_analysis(*chunk, detail)
+                phase = detail.partition(" · ")[0]
                 now = monotonic()
-                if last_console_update is None or now - last_console_update >= 10:
+                if phase != last_console_phase or now - last_console_update >= 5:
                     log(f"{chunk[2]} · {detail}")
-                    last_console_update = now
+                    last_console_phase, last_console_update = phase, now
 
             activity.write("\nAnalyzing book.\n")
             yield gr.skip(), gr.skip(), gr.skip(), voice_status("Analyzing characters and dialogue…")

@@ -233,6 +233,7 @@ def test_local_qwen_activity_is_visible_during_analysis_and_hidden_afterward(tmp
     monkeypatch.setattr(gradio_app, "installed_model_choices", lambda: [("Breeze TTS 2", "venv-breeze")])
     streaming = Event()
     finish = Event()
+    reading = "Qwen is reading the prompt · 2,515 input tokens processed"
     writing = "Qwen is writing tags · 18 speaker labels drafted · 982 characters · 3s"
     notice = "The model disconnected." if fail else "3 of 3 dialogue chunks complete."
 
@@ -242,6 +243,9 @@ def test_local_qwen_activity_is_visible_during_analysis_and_hidden_afterward(tmp
 
     def analyze_dialogue(session, _key, _model, *, on_progress, local_tagger, **_kwargs):
         on_progress(1, 3, "Chunk 2/3 (lines 7–12) · analyzing")
+        local_tagger("Qwen is preparing the prompt…")
+        local_tagger(reading)
+        local_tagger("Qwen is reasoning · 2s")
         local_tagger(writing)
         streaming.set()
         assert finish.wait(10)
@@ -274,6 +278,8 @@ def test_local_qwen_activity_is_visible_during_analysis_and_hidden_afterward(tmp
         try:
             assert await asyncio.to_thread(streaming.wait, 10)
             (midway,) = await ui.run(refresh)
+            assert reading in midway[0]
+            assert "Qwen is reasoning" in midway[0] and writing in midway[0]
             panel = midway[2]
             assert panel["visible"] is True
             assert "Chunk 2/3 (lines 7–12)" in panel["value"]
