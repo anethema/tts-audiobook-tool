@@ -513,6 +513,7 @@ def _run_generate_command(
                 is_regen=command.is_regen,
                 staging_dir=command.staging_dir,
                 suppress_validation_passes=command.suppress_validation_passes,
+                guard_first_batch=command.guard_first_batch,
             )
         if did_stop:
             status = (
@@ -1458,6 +1459,7 @@ class ModelWorker:
         is_regen: bool,
         staging_dir: str = "",
         suppress_validation_passes: bool = False,
+        guard_first_batch: bool = False,
     ) -> str:
         error = cls.start()
         if error:
@@ -1476,6 +1478,7 @@ class ModelWorker:
                 settings=settings,
                 staging_dir=staging_dir,
                 suppress_validation_passes=suppress_validation_passes,
+                guard_first_batch=guard_first_batch,
             )
             cancellation_event = cls._cancellation_event
             command_queue = cls._command_queue

@@ -458,6 +458,42 @@ def test_clear_models_blocking_reports_synthesized_worker_exited(monkeypatch) ->
     assert not ModelWorker.is_busy()
 
 
+def test_generation_forwards_recovery_watchdog_option(tmp_path, monkeypatch) -> None:
+    from tts_audiobook_tool.generate_util import GenerateUtil
+
+    project = Project(dir_path=str(tmp_path))
+    state = SimpleNamespace(project=project, prefs=Prefs())
+    commands = queue.Queue()
+    events = queue.Queue()
+    cancellation_event = threading.Event()
+    monkeypatch.setattr(ModelWorker, "start", classmethod(lambda cls: ""))
+    monkeypatch.setattr(ModelWorker, "_command_queue", commands)
+    monkeypatch.setattr(ModelWorker, "_cancellation_event", cancellation_event)
+    monkeypatch.setattr(ModelWorker, "_active_operation_id", None)
+    monkeypatch.setattr(model_worker_module, "_make_worker_state", lambda command: state)
+
+    def generate_files(*, guard_first_batch: bool, **kwargs) -> bool:
+        assert guard_first_batch is True
+        GenerationEvents.emit(GenerationTimedOut(timeout_seconds=180.0))
+        return True
+
+    monkeypatch.setattr(GenerateUtil, "generate_files", staticmethod(generate_files))
+    operation_id = ModelWorker.submit_generation(
+        state=state, indices={0}, batch_size=1, is_regen=False, guard_first_batch=True,
+    )
+    model_worker_module._run_generate_command(
+        commands.get_nowait(), events, cancellation_event
+    )
+
+    assert events.get_nowait() == GenerationUpdate(
+        operation_id, GenerationTimedOut(timeout_seconds=180.0)
+    )
+    terminal = events.get_nowait()
+    assert isinstance(terminal, GenerationFinished)
+    assert terminal.operation_id == operation_id
+    assert terminal.status is GenerationTerminalStatus.ABORTED
+
+
 def test_spawned_worker_runs_generation_command_and_returns_terminal_event(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(L, "d", lambda *_: None)
     phrase_group = PhraseGroup([Phrase("Hello.", Reason.SENTENCE)])

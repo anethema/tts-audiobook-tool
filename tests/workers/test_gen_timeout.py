@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import patch
 
+import pytest
+
 from tts_audiobook_tool import gen_timeout_util, real_time_playback
 from tts_audiobook_tool.app_types.phrase import Phrase, PhraseGroup, Reason
 from tts_audiobook_tool.generate_util import GenerateUtil
@@ -145,29 +147,34 @@ def test_tracker_exempts_first_gen_only() -> None:
     assert events == [GenerationTimedOut(timeout_seconds=0.2)]
 
 
-def test_generate_files_aborts_after_gen_timeout(monkeypatch, capsys) -> None:
+@pytest.mark.parametrize("guard_first_batch, expected_calls", [(False, 2), (True, 1)])
+def test_generate_files_aborts_after_gen_timeout(
+    monkeypatch, capsys, guard_first_batch: bool, expected_calls: int
+) -> None:
     monkeypatch.setattr(gen_timeout_util, "GEN_TIMEOUT", 0.2)
     state = make_generate_state(num_groups=2)
-    calls = {"n": 0}
+    calls = 0
+    events = []
 
-    # Both gens are slow: the first is exempt (warm-up), the second times out.
     def slow_batch(**_: object) -> list:
-        calls["n"] += 1
+        nonlocal calls
+        calls += 1
         time.sleep(0.6)
         return [StubValidationResult(True)]
 
-    with generate_files_mock_stack(slow_batch):
+    with generate_files_mock_stack(slow_batch), GenerationEvents.using_sink(events.append):
         did_interrupt = GenerateUtil.generate_files(
-            state, {0, 1}, batch_size=1, is_regen=False
+            state, {0, 1}, batch_size=1, is_regen=False, guard_first_batch=guard_first_batch,
         )
 
     assert did_interrupt is True
-    assert calls["n"] == 2
+    assert calls == expected_calls
+    assert [event for event in events if isinstance(event, GenerationTimedOut)] == [
+        GenerationTimedOut(timeout_seconds=0.2)
+    ]
     output = capsys.readouterr().out
-    # Watchdog feedback fired exactly once (for the second gen), citing the cap...
     assert output.count("GEN_TIMEOUT") == 1
     assert "0.2s" in output
-    # ...and the loop aborted rather than processing the late result.
     assert "Aborting generation run" in output
 
 

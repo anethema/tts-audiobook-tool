@@ -76,6 +76,7 @@ class GenerateCommand:
     # directory, and the project's generation range is left untouched.
     staging_dir: str = ""
     suppress_validation_passes: bool = False
+    guard_first_batch: bool = False
 
 
 @dataclass(frozen=True)

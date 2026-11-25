@@ -108,6 +108,7 @@ class GenerateUtil:
             staging_dir: str = "",
             *,
             suppress_validation_passes: bool = False,
+            guard_first_batch: bool = False,
     ) -> bool:
         """
         Subroutine for doing a series of audio generations to files
@@ -122,6 +123,8 @@ class GenerateUtil:
             directory, and the project's generation range is not updated.
         :param suppress_validation_passes:
             Omit routine first-attempt validation passes from console output.
+        :param guard_first_batch:
+            Apply the watchdog from the first generate-and-validate batch.
 
         Returns:
             True if ended because interrupted (user pressed control-c)
@@ -139,6 +142,7 @@ class GenerateUtil:
             try:
                 return GenerateUtil._generate_files(
                     state, indices_set, batch_size, is_regen, staging_dir, suppress_validation_passes, writer,
+                    guard_first_batch=guard_first_batch,
                 )
             finally:
                 Interrupts().clear()
@@ -152,6 +156,8 @@ class GenerateUtil:
         staging_dir: str,
         suppress_validation_passes: bool,
         writer: CheckpointWriteQueue | None,
+        *,
+        guard_first_batch: bool,
     ) -> bool:
         project = state.project
         max_retries = project.max_retries
@@ -346,10 +352,9 @@ class GenerateUtil:
         current_round: list[SubBatch] = []
         last_voice: int | None = None
 
-        # The first gen may be dominated by model warm-up or download time,
-        # so it alone is exempt from the watchdog. SGL-Omni uses a more
-        # generous outer deadline as a last-resort client-worker backstop.
-        gen_timeout_tracker = make_backend_gen_timeout_tracker()
+        gen_timeout_tracker = make_backend_gen_timeout_tracker(
+            guard_first_batch=guard_first_batch,
+        )
 
         while True:
             receive_queued_saves()

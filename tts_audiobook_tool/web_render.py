@@ -67,6 +67,7 @@ from tts_audiobook_tool.speaker_assign.roster import (
 )
 from tts_audiobook_tool.speaker_assign.speaker_assign_types import NOT_SPEECH
 from tts_audiobook_tool.state import State
+from tts_audiobook_tool.text_ops.range_string_util import RangeStringUtil
 from tts_audiobook_tool.tts import Tts
 from tts_audiobook_tool.tts_models.breeze_base_model import BreezeBaseModel
 from tts_audiobook_tool.tts_models.model_spec import TtsBackendKind
@@ -83,6 +84,18 @@ if TYPE_CHECKING:
 
 class WebRenderError(ValueError):
     """An error that can be shown in a web callback."""
+
+
+class _TransientRenderError(WebRenderError):
+    """A worker failure that requires recycling before local render recovery."""
+
+    def __init__(
+        self, message: str, current_indices: tuple[int, ...], *, reason: str = "", is_remote: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason or message
+        self.current_indices = current_indices
+        self.is_remote = is_remote
 
 
 def _validate_trim(trim_start: float, trim_end: float | None) -> None:
@@ -151,6 +164,7 @@ class RenderVoice:
 
 _render_lock = threading.Lock()
 _CANCEL_GRACE_SECONDS = 2.0
+_RENDER_RECOVERY_RETRIES = 2
 _NARRATOR = "NARRATOR"
 
 # Initialize multiprocessing's exit hook first so it cannot join the
@@ -389,6 +403,8 @@ def _wait_for_job(
 ) -> GenerationFinished | TtsPreviewFinished:
     cancellation_deadline = None
     reported_phases: set[str] = set()
+    current_indices: tuple[int, ...] = ()
+    recycle_worker = False
 
     def relay_output(event: ConsoleOutput) -> None:
         if transcript is not None:
@@ -430,26 +446,45 @@ def _wait_for_job(
                 raise WebRenderError("The model could not finish rendering the audio.")
             if isinstance(event, WorkerCommandCancelled):
                 raise WebRenderError("Rendering stopped.")
-            if isinstance(event, (WorkerExited, WorkerCommandFailed)):
+            if isinstance(event, WorkerExited):
+                raise _TransientRenderError(
+                    "The model worker stopped before rendering completed.", current_indices, reason=event.message,
+                )
+            if isinstance(event, WorkerCommandFailed):
                 L.w(event.message)
                 raise WebRenderError("The model worker stopped before rendering completed.")
             if isinstance(event, GenerationUpdate):
                 update = event.update
                 if isinstance(update, GenerationTimedOut):
-                    raise WebRenderError("The model took too long to generate an audio segment.")
+                    message = "The model took too long to generate the audio sample."
+                    if result_type is GenerationFinished:
+                        message = f"An audiobook batch exceeded the {update.timeout_seconds:g}s synthesis and validation deadline."
+                    raise _TransientRenderError(
+                        message, current_indices, is_remote=update.is_remote,
+                    )
                 if isinstance(update, ModelUnhealthy):
-                    L.w(update.reason)
-                    raise WebRenderError("The model could not continue rendering.")
+                    raise _TransientRenderError(
+                        "The model could not continue rendering.", current_indices, reason=update.reason,
+                    )
                 if on_console is not None and isinstance(update, GenerationPhase) and update.label not in reported_phases:
                     reported_phases.add(update.label)
                     on_console(f"{update.label}\n")
-                if on_progress is not None and isinstance(update, GenerationProgress):
-                    on_progress(update)
+                if isinstance(update, GenerationProgress):
+                    if update.current_indices:
+                        current_indices = update.current_indices
+                    if on_progress is not None:
+                        on_progress(update)
                 if on_stats is not None and isinstance(update, GenerationStats):
                     on_stats(update)
+    except _TransientRenderError as error:
+        recycle_worker = True
+        _check_cancelled(cancel_event)
+        if result_type is TtsPreviewFinished:
+            L.w(error.reason)
+        raise
     finally:
-        if ModelWorker.is_busy():
-            # End a hung or cancelled job before removing its temporary project.
+        if recycle_worker or ModelWorker.is_busy():
+            # Quiesce the worker before the caller scans or removes its files.
             ModelWorker.shutdown()
 
 
@@ -960,19 +995,87 @@ def _render_book_checkpoint(
 
             staging = tempfile.TemporaryDirectory(dir=work, prefix=".regeneration-") if regenerate else nullcontext("")
             with staging as staging_dir, _generation_log(work, state.prefs.save_gen_log) as transcript:
-                try:
-                    operation_id = ModelWorker.submit_generation(
-                        state=state, indices=remaining, batch_size=batch_size, is_regen=regenerate, staging_dir=staging_dir,
-                        suppress_validation_passes=True,
-                    )
-                except ModelWorkerUnavailable as error:
-                    L.w(str(error))
-                    raise WebRenderError("The model worker could not start.") from error
-                _wait_for_job(
-                    operation_id, GenerationFinished, cancel_event, report_generation_progress,
-                    on_stats=report_generation_stats if on_telemetry is not None else None,
-                    transcript=transcript, on_console=on_console,
-                )
+                effective_batch_size = batch_size
+                guard_first_batch = remote_selection is None and len(remaining) < total
+                retries_without_progress = 0
+                recovery_attempts = 0
+                while remaining:
+                    _check_cancelled(cancel_event)
+                    try:
+                        operation_id = ModelWorker.submit_generation(
+                            state=state, indices=remaining, batch_size=effective_batch_size,
+                            is_regen=regenerate, staging_dir=staging_dir, suppress_validation_passes=True,
+                            guard_first_batch=guard_first_batch,
+                        )
+                    except ModelWorkerUnavailable as error:
+                        L.w(str(error))
+                        raise WebRenderError("The model worker could not start.") from error
+                    try:
+                        _wait_for_job(
+                            operation_id, GenerationFinished, cancel_event, report_generation_progress,
+                            on_stats=report_generation_stats if on_telemetry is not None else None,
+                            transcript=transcript, on_console=on_console,
+                        )
+                    except _TransientRenderError as error:
+                        _check_cancelled(cancel_event)
+                        if remote_selection is not None or error.is_remote:
+                            L.w(error.reason)
+                            raise
+                        if regenerate:
+                            outstanding = remaining - _best_staged_takes(state.project, staging_dir, remaining).keys()
+                        else:
+                            state.project.sound_segments.force_invalidate()
+                            outstanding = _missing_segments(state.project, remaining)
+                        if len(outstanding) < len(remaining):
+                            retries_without_progress = 0
+                        remaining = outstanding
+                        eta_seconds = None
+                        report_progress(total - len(remaining))
+                        _check_cancelled(cancel_event)
+                        reason = f"{error.reason.strip().rstrip('. ')}."
+                        if error.current_indices:
+                            attempted = RangeStringUtil.make_ranges_string(
+                                set(error.current_indices), len(book.phrase_groups) + 1,
+                            )
+                            reason = f"{reason} Last attempted lines {attempted}."
+                        if not remaining:
+                            message = f"{reason} All selected lines were recovered from saved takes."
+                        elif retries_without_progress >= _RENDER_RECOVERY_RETRIES:
+                            incomplete = RangeStringUtil.make_ranges_string(
+                                set(sorted(remaining)[:32]), len(book.phrase_groups) + 1,
+                            )
+                            if len(remaining) > 32:
+                                incomplete += ", …"
+                            pending = (
+                                "1 selected line still needs audio" if len(remaining) == 1
+                                else f"{len(remaining)} selected lines still need audio"
+                            )
+                            message = (
+                                f"{reason} Render stopped after {retries_without_progress} retries without saving more audio. "
+                                f"{pending} ({incomplete})."
+                            )
+                            L.w(message)
+                            if transcript is not None:
+                                transcript.write_lines([message])
+                            if on_console is not None:
+                                on_console(f"{message}\n")
+                            raise WebRenderError(message) from error
+                        else:
+                            retries_without_progress += 1
+                            recovery_attempts += 1
+                            effective_batch_size = max(1, effective_batch_size // 2)
+                            guard_first_batch = True
+                            message = (
+                                f"{reason} Restarting the model worker for recovery attempt {recovery_attempts}. "
+                                f"Resuming {len(remaining)} lines at batch size {effective_batch_size}."
+                            )
+                        L.w(message)
+                        if transcript is not None:
+                            transcript.write_lines([message])
+                        if on_console is not None:
+                            on_console(f"{message}\n")
+                    else:
+                        break
                 _check_cancelled(cancel_event)
                 if regenerate:
                     _publish_regenerated_takes(state.project, staging_dir, selected, output)
@@ -1031,21 +1134,32 @@ def _generation_log(project_dir: Path, enabled: bool) -> Iterator[GenerationTran
         transcript.close()
 
 
-def _publish_regenerated_takes(project: Project, staging_dir: str, selected: set[int], output: Path) -> None:
+def _best_staged_takes(project: Project, staging_dir: str, selected: set[int]) -> dict[int, Path]:
     from tts_audiobook_tool.project_support.segment_staging_util import list_staged_segments
     from tts_audiobook_tool.project_support.sound_segment_util import (
-        SoundSegmentUtil, get_segment_error_rank, get_segment_stt_info_path,
+        SoundSegmentUtil, get_segment_error_rank,
     )
 
     best = {}
     for path, segment in list_staged_segments(staging_dir):
-        if segment.idx not in selected or path.is_symlink() or not _has_complete_audio(path):
+        if segment.idx not in selected or path.is_symlink() or not SoundSegmentUtil.is_current_segment(segment, project):
             continue
-        if segment.hash != SoundSegmentUtil.calc_segment_hash(segment.idx, project.phrase_groups[segment.idx].text):
+        if not _has_complete_audio(path):
+            L.w(f"Discarding unreadable staged segment {path.name} for resumed generation")
+            project.sound_segments.delete_sound_segment_and_sidecars(path)
+            if path.exists():
+                raise WebRenderError(f"The unreadable staged audio take could not be removed: {path.name}")
             continue
         rank = get_segment_error_rank(segment, staging_dir)
         if segment.idx not in best or rank < best[segment.idx][0]:
             best[segment.idx] = (rank, path)
+    return {index: path for index, (_, path) in best.items()}
+
+
+def _publish_regenerated_takes(project: Project, staging_dir: str, selected: set[int], output: Path) -> None:
+    from tts_audiobook_tool.project_support.sound_segment_util import get_segment_stt_info_path
+
+    best = _best_staged_takes(project, staging_dir, selected)
     if len(best) != len(selected):
         missing = len(selected) - len(best)
         raise WebRenderError(f"The model did not produce new audio for {missing} of {len(selected)} text segments.")
@@ -1058,7 +1172,7 @@ def _publish_regenerated_takes(project: Project, staging_dir: str, selected: set
         # in the staging directory until publication succeeds.
         if output.is_file():
             output.replace(previous_output)
-        for _, path in best.values():
+        for path in best.values():
             while True:
                 destination = segments_dir / f"{path.stem} [take {uuid4().hex[:12]}]{path.suffix}"
                 destination_sidecar = get_segment_stt_info_path(destination)

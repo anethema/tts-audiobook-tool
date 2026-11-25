@@ -23,11 +23,11 @@ The watchdog deliberately takes no notice of interrupt/cancel state: a
 pending cancellation is only observable at loop boundaries, between calls,
 so an in-flight inference stays armed until it finishes or times out.
 
-The very first inference of a run is exempt (``GenTimeoutTracker``): it may
-legitimately spend far longer than the cap on first-run model warm-up, lazy
-loading, or a model download. Single-shot callers (the diagnostic TTS preview)
-use the always-armed ``backend_gen_timeout_scope()`` instead and decide that
-exemption for themselves.
+Ordinary runs exempt their first inference (``GenTimeoutTracker``) because
+first-run model warm-up, lazy loading, or a model download can exceed the cap.
+Recovery runs can arm the watchdog from the first batch. Single-shot callers
+(the diagnostic TTS preview) use the always-armed
+``backend_gen_timeout_scope()`` and decide that exemption for themselves.
 """
 
 from __future__ import annotations
@@ -114,13 +114,12 @@ def gen_timeout_scope(
 
 
 class GenTimeoutTracker:
-    """Applies the GEN_TIMEOUT watchdog to every generation step except the
-    first one.
+    """Applies the GEN_TIMEOUT watchdog to each generation step.
 
     The first inference of a run may legitimately take far longer than
     ``GEN_TIMEOUT``: first-run model warm-up, lazy loading, or even a model
-    download. A fresh tracker exempts its first ``scope()`` from timing out;
-    every later scope is armed.
+    download. The first ``scope()`` is exempt by default. Recovery runs pass
+    ``guard_first_batch=True`` to arm every scope.
 
     One tracker belongs to one generation run (its lifetime defines which
     step is "first"), so a run with retries shares it across all of them.
@@ -131,16 +130,17 @@ class GenTimeoutTracker:
         timeout_seconds: float | None = None,
         *,
         is_remote: bool = False,
+        guard_first_batch: bool = False,
     ) -> None:
-        self._did_first_gen = False
+        self._exempt_next_scope = not guard_first_batch
         self._timeout_seconds = timeout_seconds
         self._is_remote = is_remote
 
     @contextmanager
     def scope(self, timeout_seconds: float | None = None) -> Iterator[GenTimeoutGuard]:
-        if not self._did_first_gen:
+        if self._exempt_next_scope:
             # First gen of the run: untimed (warm-up/download may dominate).
-            self._did_first_gen = True
+            self._exempt_next_scope = False
             yield GenTimeoutGuard()
             return
         effective_timeout = (
@@ -170,12 +170,15 @@ def get_backend_gen_timeout() -> tuple[float, bool]:
     return GEN_TIMEOUT, False
 
 
-def make_backend_gen_timeout_tracker() -> GenTimeoutTracker:
+def make_backend_gen_timeout_tracker(
+    *, guard_first_batch: bool = False
+) -> GenTimeoutTracker:
     """Create a tracker with the current backend's timeout policy."""
     timeout_seconds, is_remote = get_backend_gen_timeout()
     return GenTimeoutTracker(
         timeout_seconds=timeout_seconds,
         is_remote=is_remote,
+        guard_first_batch=guard_first_batch,
     )
 
 
@@ -184,7 +187,7 @@ def backend_gen_timeout_scope() -> Iterator[GenTimeoutGuard]:
     """
     Watch one *single-shot* generation step for GEN_TIMEOUT.
 
-    A ``GenTimeoutTracker`` exempts the first step of a run, because that step
+    By default, ``GenTimeoutTracker`` exempts the first step of a run because it
     may legitimately carry first-run model warm-up, lazy loading, or a
     download. Callers that make exactly one inference per call (the diagnostic
     TTS preview) have no "later step" to fall back on, so this scope is always
