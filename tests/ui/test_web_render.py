@@ -829,7 +829,7 @@ def test_book_uses_selected_validation_prefs_and_saves_native_generation_log(mon
     assert Path(log).read_text(encoding="utf-8") == "Generated audio in 1.0s\nLines saved: 1 (all)\nGeneration completed.\n"
 
 
-def test_automatic_export_rebuilds_for_bitrate_without_regenerating_takes(monkeypatch, tmp_path):
+def test_automatic_export_rebuilds_for_pacing_and_bitrate_without_regenerating_takes(monkeypatch, tmp_path):
     from tts_audiobook_tool.app_types.validation_result import SkippedResult
     from tts_audiobook_tool.concat_util import ConcatUtil
     from tts_audiobook_tool.generate_util import GenerateUtil
@@ -854,6 +854,7 @@ def test_automatic_export_rebuilds_for_bitrate_without_regenerating_takes(monkey
         return "job"
 
     def make_file(*, state, **kwargs):
+        assert state.project.reason_pauses.id == "natural"
         bitrates.append(state.prefs.aac_bitrate)
         return native_export(state=state, **kwargs)
 
@@ -863,15 +864,27 @@ def test_automatic_export_rebuilds_for_bitrate_without_regenerating_takes(monkey
     ))
     monkeypatch.setattr(ConcatUtil, "make_file", make_file)
     output = Path(web_render.render_book(session, {}, validate_audio=False))
-    previous = output.read_bytes()
     files = sorted((output.parent / "segments").glob("*.flac"))
     assert len(files) == 1
     rendered_audio = files[0].read_bytes()
 
-    # An old default export had no marker and should still be reused.
-    output.with_suffix(".bitrate.json").unlink()
+    # Pre-upgrade workspaces saved the old default in the render project.
+    config = output.parent / "project.json"
+    project = json.loads(config.read_text(encoding="utf-8"))
+    project["reason_pauses"] = "normal"
+    config.write_text(json.dumps(project), encoding="utf-8")
+    marker = output.with_suffix(".bitrate.json")
+    stamp = json.loads(marker.read_text(encoding="utf-8"))
+    assert stamp.pop("reason_pauses") == "natural"
+    marker.write_text(json.dumps(stamp), encoding="utf-8")
+    assert not web_render._automatic_export_matches(output, AAC_BITRATE_DEFAULT)
+    marker.write_text(json.dumps({**stamp, "reason_pauses": "normal"}), encoding="utf-8")
+    assert not web_render._automatic_export_matches(output, AAC_BITRATE_DEFAULT)
+    marker.unlink()
     assert web_render.render_book(session, {}, validate_audio=False) == str(output)
-    assert bitrates == [AAC_BITRATE_DEFAULT]
+    assert web_render.render_book(session, {}, validate_audio=False) == str(output)
+    assert bitrates == [AAC_BITRATE_DEFAULT] * 2
+    previous = output.read_bytes()
 
     other_bitrate = next(value for value in AAC_BITRATES if value != AAC_BITRATE_DEFAULT)
     runtime = WebRuntimeSettings(aac_bitrate=other_bitrate)
@@ -891,7 +904,7 @@ def test_automatic_export_rebuilds_for_bitrate_without_regenerating_takes(monkey
 
     assert web_render.render_book(session, {}, validate_audio=False, runtime_settings=runtime) == str(output)
     assert web_render.render_book(session, {}, validate_audio=False, runtime_settings=runtime) == str(output)
-    assert bitrates == [AAC_BITRATE_DEFAULT, other_bitrate, other_bitrate]
+    assert bitrates == [AAC_BITRATE_DEFAULT] * 2 + [other_bitrate] * 2
     assert generate == [{0}]
     assert sorted((output.parent / "segments").glob("*.flac")) == files
     assert files[0].read_bytes() == rendered_audio

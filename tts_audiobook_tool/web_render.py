@@ -24,7 +24,7 @@ from tts_audiobook_tool.app_support.interrupts import Interrupts
 from tts_audiobook_tool.app_types import Book, ExportType, RoomReverb, Sound, Strictness, SttConfig, SttVariant
 from tts_audiobook_tool.app_types.book_serialization import book_to_project_text_json_dict
 from tts_audiobook_tool.app_types.voice import VOLUME_DEFAULT, VOLUME_MAX, VOLUME_MIN, Voice
-from tts_audiobook_tool.constants import AAC_BITRATE_DEFAULT, PROJECT_JSON_FILE_NAME, PROJECT_SOUND_SEGMENTS_SUBDIR
+from tts_audiobook_tool.constants import PROJECT_JSON_FILE_NAME, PROJECT_SOUND_SEGMENTS_SUBDIR
 from tts_audiobook_tool.constants_config import (
     IMPORT_LIMIT_SILENCE_DURATION_MAX,
     IMPORT_LIMIT_SILENCE_DURATION_MIN,
@@ -60,6 +60,7 @@ from tts_audiobook_tool.project import Project
 from tts_audiobook_tool.project_support.project_load_util import ProjectLoadUtil
 from tts_audiobook_tool.project_support.project_text_io_util import ProjectTextIOUtil
 from tts_audiobook_tool.project_support.project_voice_util import ProjectVoiceUtil
+from tts_audiobook_tool.reason_pauses import ReasonPauseTypes
 from tts_audiobook_tool.sound.checkpoint_audio import has_complete_audio as _has_complete_audio
 from tts_audiobook_tool.speaker_assign.roster import (
     NEUTRAL_CHARACTER_VOICE_DIRECTION,
@@ -1198,9 +1199,9 @@ def _publish_regenerated_takes(project: Project, staging_dir: str, selected: set
         raise WebRenderError("The new audio takes could not be saved.") from error
 
 
-def _export_stamp(audio: Path, bitrate: str) -> dict[str, str | int]:
+def _export_stamp(audio: Path, bitrate: str, reason_pauses: str) -> dict[str, str | int]:
     stat = audio.stat()
-    return {"bitrate": bitrate, "size": stat.st_size, "modified_ns": stat.st_mtime_ns}
+    return {"bitrate": bitrate, "reason_pauses": reason_pauses, "size": stat.st_size, "modified_ns": stat.st_mtime_ns}
 
 
 def _segment_fingerprint(directory: Path) -> str:
@@ -1226,23 +1227,20 @@ def _automatic_export_matches(output: Path, bitrate: str) -> bool:
         return False
     try:
         saved = json.loads(marker.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        # Exports produced before the bitrate preference always used the app default.
-        return bitrate == AAC_BITRATE_DEFAULT
+        if not isinstance(saved, dict):
+            return False
+        segments = saved.pop("segments", None)
+        expected = _export_stamp(output, bitrate, ReasonPauseTypes.default().value.id)
+        return saved == expected and segments == _segment_fingerprint(output.parent / PROJECT_SOUND_SEGMENTS_SUBDIR)
     except (OSError, ValueError):
-        return False
-    try:
-        expected = _export_stamp(output, bitrate)
-        if isinstance(saved, dict) and "segments" in saved:
-            expected["segments"] = _segment_fingerprint(output.parent / PROJECT_SOUND_SEGMENTS_SUBDIR)
-        return saved == expected
-    except OSError:
         return False
 
 
 def _export_checkpoint(state: State, output: Path, total: int, cancel_event: threading.Event | None) -> str:
     from tts_audiobook_tool.concat_util import ConcatUtil
 
+    # Resumed checkpoints can still have the previous default recorded in project.json.
+    state.project.reason_pauses = ReasonPauseTypes.default().value
     staging_dir = output.parent / "export"
     staging_dir.mkdir(exist_ok=True)
     interrupts = Interrupts()
@@ -1266,7 +1264,7 @@ def _export_checkpoint(state: State, output: Path, total: int, cancel_event: thr
     replacement = Path(path)
     prepared_marker = staging_dir / "aac-bitrate.json"
     try:
-        stamp = _export_stamp(replacement, state.prefs.aac_bitrate)
+        stamp = _export_stamp(replacement, state.prefs.aac_bitrate, state.project.reason_pauses.id)
         stamp["segments"] = source_signature
         prepared_marker.write_text(json.dumps(stamp), encoding="utf-8")
         # Publish the new file's stamp first. If interrupted before the audio

@@ -46,7 +46,7 @@ def test_concat_menu_places_reason_pauses_in_pause_timing_rules_submenu() -> Non
     sub_labels = [get_string_from(state, item.label) for item in sub_items]
     assert sub_labels[0].startswith("Pauses between segments")
     assert "currently:" in sub_labels[0]
-    assert ReasonPauseTypes.NORMAL.value.menu_label in sub_labels[0]
+    assert ReasonPauseTypes.default().value.menu_label in sub_labels[0]
     assert sub_labels[1].startswith("Maximum silence inside segments")
     assert sub_labels[2].startswith("Minimum sentence silence inside segments")
 
@@ -65,7 +65,7 @@ def test_reason_pauses_menu_uses_options_and_saves_selection() -> None:
     assert kwargs["heading_text"] == "Pauses between segments"
     assert kwargs["labels"] == [item.value.label for item in ReasonPauseTypes]
     assert kwargs["values"] == list(ReasonPauseTypes)
-    assert kwargs["current_value"] is ReasonPauseTypes.NORMAL
+    assert kwargs["current_value"] is ReasonPauseTypes.default()
     assert kwargs["default_value"] is ReasonPauseTypes.default()
     assert kwargs["sublabels"] == [
         item.value.description for item in ReasonPauseTypes

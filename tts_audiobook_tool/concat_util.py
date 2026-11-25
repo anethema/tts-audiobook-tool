@@ -696,7 +696,7 @@ class ConcatUtil:
         # One shared spatial processor; its room tails span voice changes.
         spatial = VoiceSpatialProcessor(channels=channels, room_reverb_stereo=room_reverb_stereo)
 
-        def flush_pending(next_sound: Sound | PacketTake | None) -> None:
+        def flush_pending(next_sound: Sound | PacketTake | None, following_text: str = "") -> None:
             """
             Appends the (possibly compensated) trailing pause to the held
             segment and streams it to the output writer. `next_sound` is the following
@@ -707,6 +707,7 @@ class ConcatUtil:
             assert pending is not None
             sound, phrase, idx, path = pending
             is_final_segment = next_sound is None
+            pause_target = reason_pauses.get_join_pause(phrase, following_text)
 
             break_effect = tracker.next_break_effect(
                 idx,
@@ -740,12 +741,12 @@ class ConcatUtil:
                     ) or 0.0
 
                 if end_pseudo + start_pseudo > 0:
-                    base = reason_pauses.get_pause_for(break_effect if break_effect is not None else phrase.reason)
+                    base = reason_pauses.get_pause_for(break_effect) if break_effect is not None else pause_target
                     L.d(f"\n\npseudosilence - effect={break_effect} base={base:.3f} end={end_pseudo:.3f} start={start_pseudo:.3f} AMOUNT={end_pseudo + start_pseudo}\n")
 
             if isinstance(sound, PacketTake) and break_effect is None:
                 assert packet_export is not None
-                pause = max(0.0, reason_pauses.get_pause_for(phrase.reason) - end_pseudo - start_pseudo)
+                pause = max(0.0, pause_target - end_pseudo - start_pseudo)
                 samples = sound.profile.samples + int(pause * APP_SAMPLE_RATE)
                 packet_export.append(idx, sound, samples, final=is_final_segment)
                 duration = samples / APP_SAMPLE_RATE
@@ -761,6 +762,7 @@ class ConcatUtil:
                     preceding_silence=end_pseudo,
                     following_silence=start_pseudo,
                     effect_level_offset_db=level_offset_db,
+                    pause_target=pause_target,
                 )
 
                 # Only direct narration feeds the room. Appended effects stay centered.
@@ -808,7 +810,7 @@ class ConcatUtil:
                 leveling_stats.clamped += sound.profile.gain_clamped
             # The next segment supplies the start of the pause compensation.
             if pending is not None:
-                flush_pending(sound)
+                flush_pending(sound, phrase.text)
             pending = (sound, phrase, index, path)
 
         try:

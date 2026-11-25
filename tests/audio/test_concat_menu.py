@@ -251,7 +251,7 @@ def test_enabled_option_confirmation_lines_only_include_enabled_options() -> Non
     ]
     project.room_tone = RoomTone.OFF
     project.voice_references = []
-    project.reason_pauses = ReasonPauseTypes.NORMAL.value
+    project.reason_pauses = ReasonPauseTypes.default().value
     project.min_segment_sentence_silence = MinSegmentSentenceSilence.DISABLED
     project.limit_silence_gaps = False
     project.high_shelf = HighShelfEq.MODERATE.id

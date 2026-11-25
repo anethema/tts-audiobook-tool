@@ -97,6 +97,25 @@ def test_packet_copy_preserves_takes_and_updates_actual_timing(tmp_path: Path):
     assert not Path(staging_path_for(str(output))).exists()
 
 
+@pytest.mark.parametrize("extension", ["flac", "m4b"])
+def test_natural_pauses_apply_to_pcm_and_packet_exports(tmp_path: Path, extension: str):
+    # The same saved takes go through PCM mixing for FLAC and packet copying for M4B.
+    samples = 9001
+    phrases = [
+        Phrase("They stopped.", Reason.SENTENCE),
+        Phrase("But she hesitated.", Reason.SENTENCE),
+        Phrase("Then she spoke.", Reason.PARAGRAPH),
+    ]
+    pairs = [(phrase, _take(tmp_path, i, samples)[0]) for i, phrase in enumerate(phrases)]
+    output = tmp_path / f"natural.{extension}"
+    result = _export(output, pairs, reason_pauses=ReasonPauseTypes.NATURAL.value)
+    targets = [samples + round(pause * SR) for pause in (0.55, 1.0, 0.9)]
+    # Allow individual packet joins to round to AAC frames while the total stays exact.
+    cumulative = np.cumsum(result.durations) * SR
+    np.testing.assert_allclose(cumulative, np.cumsum(targets), atol=FRAME_SAMPLES // 2, rtol=0)
+    assert round(cumulative[-1]) == sum(targets)
+
+
 def test_short_pause_rebuilds_only_the_adjacent_takes(tmp_path: Path):
     samples = 9001
     paths = [_take(tmp_path, i, samples)[0] for i in range(4)]

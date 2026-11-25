@@ -1,12 +1,16 @@
 import pytest
 
-from tts_audiobook_tool.app_types.phrase import Reason
+from tts_audiobook_tool.app_types.phrase import Phrase, Reason
 from tts_audiobook_tool.project import Project
 from tts_audiobook_tool.project_support.project_serialization_util import ProjectSerializationUtil
 from tts_audiobook_tool.reason_pauses import ReasonPauses, ReasonPauseTypes
 
 
 EXPECTED_PAUSES = {
+    ReasonPauseTypes.NATURAL: {
+        Reason.SENTENCE: 0.7,
+        Reason.PARAGRAPH: 0.9,
+    },
     ReasonPauseTypes.NORMAL: {
         Reason.UNDEFINED: 1.0,
         Reason.WORD: 0.1,
@@ -45,6 +49,25 @@ def test_reason_pause_type_has_all_current_pause_durations(
         assert pauses.get_pause_for(reason) == expected_pause
 
 
+@pytest.mark.parametrize(("phrase", "reason", "following", "seconds"), [
+    ("We can go.", Reason.SENTENCE, "The gate opened.", 0.70),
+    ("We can go. ", Reason.SENTENCE, "But not yet.", 0.55),
+    ("She hesitated.", Reason.SENTENCE, "And then she spoke.", 1.0),
+    ("She never hesitated.", Reason.SENTENCE, "She spoke first.", 0.7),
+    ("“Perhaps…” ", Reason.SENTENCE, "She looked up.", 1.0),
+    ("We can go.\n", Reason.PARAGRAPH, "But not yet.", 0.9),
+    ("She hesitated.", Reason.SENTENCE, "", 0.7),
+])
+def test_natural_pause_at_a_take_boundary(phrase, reason, following, seconds) -> None:
+    assert ReasonPauseTypes.NATURAL.value.get_join_pause(Phrase(phrase, reason), following) == seconds
+
+
+def test_static_presets_keep_their_sentence_target() -> None:
+    phrase = Phrase("She hesitated.", Reason.SENTENCE)
+    for preset in (ReasonPauseTypes.NORMAL, ReasonPauseTypes.SHORTER):
+        assert preset.value.get_join_pause(phrase, "But then…") == preset.value.get_pause_for(Reason.SENTENCE)
+
+
 def test_reason_pause_types_have_distinct_ids() -> None:
     assert ReasonPauseTypes.NORMAL.value.id == "normal"
     assert ReasonPauseTypes.SHORTER.value.id == "shorter"
@@ -61,7 +84,8 @@ def test_reason_pause_types_have_distinct_ids() -> None:
 
 
 def test_reason_pause_type_default_and_lookup() -> None:
-    assert ReasonPauseTypes.default() is ReasonPauseTypes.NORMAL
+    assert ReasonPauseTypes.default() is ReasonPauseTypes.NATURAL
+    assert ReasonPauseTypes.get_by_id("natural") is ReasonPauseTypes.NATURAL
     assert ReasonPauseTypes.get_by_id("normal") is ReasonPauseTypes.NORMAL
     assert ReasonPauseTypes.get_by_id("shorter") is ReasonPauseTypes.SHORTER
     assert ReasonPauseTypes.get_by_id("unknown") is None
@@ -75,10 +99,10 @@ def test_get_pause_for_requires_a_known_reason() -> None:
 
 
 def test_project_reason_pauses_defaults_for_missing_or_invalid_id() -> None:
-    assert Project.model_validate({}).reason_pauses is ReasonPauseTypes.NORMAL.value
+    assert Project.model_validate({}).reason_pauses is ReasonPauseTypes.NATURAL.value
     assert (
         Project.model_validate({"reason_pauses": "unknown"}).reason_pauses
-        is ReasonPauseTypes.NORMAL.value
+        is ReasonPauseTypes.NATURAL.value
     )
 
 

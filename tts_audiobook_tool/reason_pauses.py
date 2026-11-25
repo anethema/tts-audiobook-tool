@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
 from typing import Mapping
 
-from tts_audiobook_tool.app_types.phrase import Reason
+from tts_audiobook_tool.app_types.phrase import Phrase, Reason
+
+
+# Pacing cues at the join only. Punctuation in the middle of a take is performed by the voice.
+_DELIBERATE_END = re.compile(
+    r"""(?:…|\.{3}|\b(?:he|she|they|we|i) (?:pauses?|paused|hesitates?|hesitated)\.)["'”’»)]*\s*$""",
+    re.I,
+)
+_CONTINUATION_START = re.compile(r"(?:and|but|or|so)\s+", re.I)
 
 
 @dataclass(frozen=True)
@@ -21,6 +30,15 @@ class ReasonPauses:
     def get_pause_for(self, reason: Reason) -> float:
         """Return the pause duration in seconds for ``reason``."""
         return self.pauses[reason]
+
+    def get_join_pause(self, phrase: Phrase, following_text: str) -> float:
+        """Target gap after a completed take, before its audible edge silence is deducted."""
+        if self.id == "natural" and phrase.reason is Reason.SENTENCE and following_text:
+            if _DELIBERATE_END.search(phrase.text):
+                return 1.0
+            if phrase.text.rstrip().endswith(".") and _CONTINUATION_START.match(following_text.lstrip()):
+                return 0.55
+        return self.get_pause_for(phrase.reason)
 
     def _clone(self) -> "ReasonPauses":
         # The `pauses` mapping is a MappingProxyType, which copy.copy/deepcopy
@@ -55,6 +73,12 @@ NORMAL_REASON_PAUSES = MappingProxyType(
     }
 )
 
+NATURAL_REASON_PAUSES = MappingProxyType({
+    **NORMAL_REASON_PAUSES,
+    Reason.SENTENCE: 0.7,
+    Reason.PARAGRAPH: 0.9,
+})
+
 SHORTER_REASON_PAUSES = MappingProxyType(
     {
         Reason.UNDEFINED: 1.0,
@@ -80,6 +104,13 @@ def make_pauses_description(pauses: Mapping[Reason, float]) -> str:
 class ReasonPauseTypes(Enum):
     """Enumerates the available pause-duration policies."""
 
+    NATURAL = ReasonPauses(
+        id="natural",
+        label="Natural",
+        menu_label="natural",
+        description="sentence 0.7s (0.55s for continuations, 1.0s for hesitation), paragraph 0.9s",
+        pauses=NATURAL_REASON_PAUSES,
+    )
     NORMAL = ReasonPauses(
         id="normal",
         label="Normal",
@@ -97,7 +128,7 @@ class ReasonPauseTypes(Enum):
 
     @staticmethod
     def default() -> ReasonPauseTypes:
-        return ReasonPauseTypes.NORMAL
+        return ReasonPauseTypes.NATURAL
 
     @staticmethod
     def get_by_id(id: str) -> ReasonPauseTypes | None:

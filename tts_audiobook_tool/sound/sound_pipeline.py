@@ -330,6 +330,7 @@ class SoundPipeline:
         preceding_silence: float = 0.0,
         following_silence: float = 0.0,
         effect_level_offset_db: float = 0.0,
+        pause_target: float | None = None,
     ) -> Sound:
         """
         Appends the trailing break effect or pause for a segment.
@@ -351,6 +352,8 @@ class SoundPipeline:
             compensation.
         :param effect_level_offset_db:
             Gain for the break effect asset (see `make_break_effect_sound`).
+        :param pause_target:
+            Contextual target gap when the adjacent exported phrases are known.
         """
 
         if break_effect is not None:
@@ -366,10 +369,9 @@ class SoundPipeline:
                 new_data = np.concatenate([sound.data, result.data.astype(sound.data.dtype)])
                 return Sound(new_data, sound.sr)
 
-        pause_duration = max(
-            0.0,
-            reason_pauses.get_pause_for(reason) - preceding_silence - following_silence,
-        )
+        if pause_target is None:
+            pause_target = reason_pauses.get_pause_for(reason)
+        pause_duration = max(0.0, pause_target - preceding_silence - following_silence)
         if pause_duration > 0:
             return SoundUtil.add_silence(sound, pause_duration)
 

@@ -205,6 +205,7 @@ def test_concatenate_does_not_append_break_effect_to_final_segment(reason: Reaso
         preceding_silence=0.0,
         following_silence=0.0,
         effect_level_offset_db=0.0,
+        pause_target=ReasonPauseTypes.NORMAL.value.get_pause_for(reason),
     )
 
 

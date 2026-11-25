@@ -16,6 +16,7 @@ from tts_audiobook_tool.l import L
 from tts_audiobook_tool.project import Project
 from tts_audiobook_tool.project_support.project_text_io_util import ProjectTextIOUtil
 from tts_audiobook_tool.project_support.sound_segment_util import SoundSegmentUtil, get_segment_stt_info_path
+from tts_audiobook_tool.reason_pauses import ReasonPauseTypes
 from tts_audiobook_tool.web_backend import BookSession
 
 
@@ -121,6 +122,7 @@ def test_review_export_uses_native_audio_and_embedded_metadata(rendered_book, co
         session, RUN_ID, first_line=1, last_line=2, bookmarks=(2,),
         options=web_book_outputs.BookExportOptions(
             export_type=container, normalization_type=NormalizationType.STRONGER, use_break_sound_effect=False,
+            reason_pauses=ReasonPauseTypes.SHORTER,
         ),
     )
     assert (result.line_start, result.line_end, result.missing_lines) == (1, 2, 1)
@@ -131,6 +133,7 @@ def test_review_export_uses_native_audio_and_embedded_metadata(rendered_book, co
     assert metadata.title == "An audiobook"
     assert metadata.bookmark_indices == [1]
     assert metadata.project_snapshot["export_type"] == container.id
+    assert metadata.project_snapshot["reason_pauses"] == "shorter"
     assert config_path.read_bytes() == before
     choices = web_book_outputs.list_book_exports(session, RUN_ID)
     assert len(choices) == 1

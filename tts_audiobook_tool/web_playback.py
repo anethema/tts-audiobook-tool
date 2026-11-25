@@ -293,7 +293,9 @@ def _run_playback(
                 _check_cancelled(cancel)
                 cancel.wait(0.1)
             group = book.phrase_groups[next_line - 1]
-            pause = pauses.get_pause_for(group.phrases[-1].reason) if next_line < last and group.phrases else 0.0
+            pause = 0.0
+            if next_line < last and group.phrases:
+                pause = pauses.get_join_pause(group.phrases[-1], book.phrase_groups[next_line].text)
             wave = encoder.wave(takes[next_line], references[group.voice_index], pause, next_line == last)
             path = _ready_path(directory, next_line)
             temporary = path.with_suffix(".tmp")

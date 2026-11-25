@@ -73,6 +73,7 @@ class TestWebPlayback(unittest.TestCase):
             project = _session(root / "project")
             output = root / "output"
             output.mkdir()
+            project.book.phrase_groups[1].phrases[0].text = "But then it stopped."
             first = _write_take(project, 1, 0.125)
             third = _write_take(project, 3, -0.125)
             payload = {
@@ -105,9 +106,11 @@ class TestWebPlayback(unittest.TestCase):
             self.assertEqual((calls[0]["first_line"], calls[0]["last_line"]), (2, 3))
             self.assertFalse(calls[0]["auto_concat"])
             self.assertEqual(set(first.parent.iterdir()), {first, third})
+            pause_targets = (0.55, 0.70, 0.0)
             for index, value in enumerate((0.0625, 0.125, -0.0625), start=1):
                 wave, rate = soundfile.read(web_playback._ready_path(output, index))
                 self.assertEqual(rate, APP_SAMPLE_RATE)
+                self.assertEqual(len(wave), 4800 + round(rate * pause_targets[index - 1]))
                 np.testing.assert_allclose(wave[:100], np.full((100, 2), value), atol=0.001)
 
     def test_cancellation_stops_process_and_removes_staging(self):
