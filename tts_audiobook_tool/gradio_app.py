@@ -6,6 +6,7 @@ from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from threading import Event, Lock
+from time import monotonic
 
 import gradio as gr
 
@@ -251,6 +252,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                                 analysis_status = gr.Textbox(
                                     label="Analysis status", interactive=False, visible=False, scale=3,
                                 )
+                            analysis_progress = gr.HTML(visible=False)
                             characters = gr.Dataframe(
                                 label="Identified characters",
                                 headers=["Character", "Voice direction"], datatype="str",
@@ -410,7 +412,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                     with gr.Tab("Settings"):
                         runtime_panel = create_runtime_panel(book, private_event=PRIVATE_EVENT, app=app)
 
-                activity_panel.bind(app, book_progress)
+                activity_panel.bind(app, book_progress, analysis_progress)
 
         voice_panel.bind(app, cast_library_voice, event_options=PRIVATE_EVENT)
         text_import.bind(event_options=PRIVATE_EVENT)
@@ -718,35 +720,54 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
 
         def analyze_book(session, key, model, reasoning, endpoint, settings_json, selected_role, use_qwen, character_voices,
                          performance_cues, request: gr.Request):
-            console = activity_panel.console_for(request.session_hash)
+            activity = activity_panel.session(request.session_hash)
+            chunk = (0, 0, "Preparing book analysis")
+            last_console_update = None
             secret = "" if use_qwen else (key or "").strip()
 
             def redact(message: str) -> str:
                 return message.replace(secret, "[redacted]") if secret else message
 
             def log(message: str) -> None:
-                console(redact(message).rstrip() + "\n")
+                activity.write(redact(message).rstrip() + "\n")
 
-            console("\nAnalyzing book.\n")
+            def report_chunk(done: int, total: int, phase: str) -> None:
+                nonlocal chunk
+                chunk = (done, total, phase)
+                activity.update_analysis(*chunk)
+
+            def report_qwen(detail: str) -> None:
+                nonlocal last_console_update
+                activity.update_analysis(*chunk, detail)
+                now = monotonic()
+                if last_console_update is None or now - last_console_update >= 10:
+                    log(f"{chunk[2]} · {detail}")
+                    last_console_update = now
+
+            activity.write("\nAnalyzing book.\n")
             yield gr.skip(), gr.skip(), gr.skip(), voice_status("Analyzing characters and dialogue…")
+            message = None
             try:
+                activity.update_analysis(*chunk)
                 if session is None:
                     raise WebBackendError("Import book text first.")
                 if not use_qwen and not secret:
                     secret = load_api_key(endpoint or "")
                 if secret and secret in (endpoint or ""):
                     raise WebBackendError("Remove the API key from the chat completions URL.")
-                with local_qwen(log) if use_qwen else nullcontext() as tagger:
+                with local_qwen(log, on_activity=report_qwen) if use_qwen else nullcontext() as tagger:
                     session = analyze_book_dialogue(
                         session, secret, model, effort=reasoning or "", endpoint=endpoint,
                         settings_json=settings_json or "", on_log=log, performance_cues=performance_cues,
-                        character_voices=character_voices, local_tagger=tagger,
+                        character_voices=character_voices, local_tagger=tagger, on_progress=report_chunk,
                     )
             except (StoredApiKeyError, WebBackendError) as exc:
                 message = str(exc)
             except Exception:
                 message = "Book analysis failed. Check your LLM settings and try again."
-            else:
+            finally:
+                activity.finish_analysis()
+            if message is None:
                 notice = redact(session.attribution_notice)
                 if notice != session.attribution_notice:
                     session = replace(session, attribution_notice=notice)

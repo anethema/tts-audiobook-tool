@@ -252,8 +252,9 @@ def analyze_book_dialogue(
         performance_cues: bool = False,
         character_voices: bool = False,
         on_log: Callable[[str], None] | None = None,
+        on_progress: Callable[[int, int, str], None] | None = None,
 ) -> BookSession:
-    """Analyze dialogue and optional voice directions and cues together for each chunk."""
+    """Analyze each chunk, reporting the count with all requested results saved."""
     log = on_log if on_log is not None else lambda _message: None
     directory = session.attribution_dir or session.project_dir
     checkpoint = Path(SpeakerAssignFileUtil.attributions_path(directory))
@@ -293,6 +294,15 @@ def analyze_book_dialogue(
         not speakers and not cues_by_chunk.get(number) and not voices_by_chunk.get(number)
         for number, speakers in speakers_by_chunk.items()
     )
+
+    def progress(detail: str) -> None:
+        if on_progress is not None:
+            on_progress(complete, total, detail)
+
+    if complete:
+        progress(f"Reusing saved analysis for {_count_label(complete, 'chunk')}.")
+    else:
+        progress("Starting dialogue analysis.")
     prefs = None
     analysis_model = LOCAL_QWEN_MODEL if local_tagger is not None else model.strip()
     issue = ""
@@ -309,6 +319,8 @@ def analyze_book_dialogue(
             saved = "analysis" if performance_cues else "speaker labels"
             log(f"{label} reused saved {saved} for {quotes}.\n")
             continue
+        line_range = f"lines {chunk.start + 1:,}–{chunk.end:,}"
+        location = f"{label} ({line_range})"
         try:
             if local_tagger is None and prefs is None:
                 api_key, prefs = _request_settings(api_key, model, effort, endpoint, settings_json)
@@ -329,7 +341,7 @@ def analyze_book_dialogue(
             if voice_requests:
                 request_parts.append(f"voice directions for {_count_label(len(voice_requests), 'character')}")
             request_description = " and ".join(request_parts)
-            line_range = f"lines {chunk.start + 1:,}–{chunk.end:,}"
+            progress(f"{location} · requesting {request_description}")
             log(f"{label} requesting {request_description} ({line_range}).\n")
             system_prompt = PERFORMANCE_CUE_SYSTEM_PROMPT if cue_requests else COMBINED_ANALYSIS_SYSTEM_PROMPT
             if character_voices:
@@ -357,6 +369,7 @@ def analyze_book_dialogue(
                     else:
                         reason = "The reply did not match the expected analysis format."
                     if attempt < _ANALYSIS_REPLY_RETRIES:
+                        progress(f"{location} · retry {attempt + 1}/{_ANALYSIS_REPLY_RETRIES} after invalid reply")
                         log(f"{label} {reason} Retrying ({attempt + 1}/{_ANALYSIS_REPLY_RETRIES}).\n")
                         attempt_system_prompt = (
                             f"{system_prompt}\n\nRetry reminder: {reason} Return one valid JSON object. "
@@ -366,6 +379,7 @@ def analyze_book_dialogue(
                     break
             else:
                 skipped_chunks.append(chunk)
+                progress(f"{location} · skipped after {attempt + 1} invalid replies")
                 log(f"{label} skipped ({line_range}) after {attempt + 1} invalid replies. {reason}\n")
                 continue
 
@@ -381,6 +395,7 @@ def analyze_book_dialogue(
                 _save_analysis_checkpoint(checkpoint, next_roster, next_attributions)
         except (LocalTaggerError, WebBackendError) as exc:
             issue = str(exc)
+            progress(f"{location} · stopped")
             log(f"{label} stopped. {issue} Run Analyze book to retry this chunk.\n")
             break
         expected_voices = voice_requests | (next_roster.ids - roster.ids) if character_voices else set()
@@ -391,8 +406,11 @@ def analyze_book_dialogue(
         missing_voices = len(expected_voices) - added_voices
         roster, attributions = next_roster, next_attributions
         prior_speakers.update((utterance.first_line, utterance.speaker) for utterance in new_utterances)
-        if not missing_voices:
+        if missing_voices:
+            progress(f"{location} · missing {_count_label(missing_voices, 'character voice direction')}")
+        else:
             complete += 1
+            progress(f"{location} · complete")
         usage = ""
         if reply.input_tokens is not None and reply.output_tokens is not None:
             usage = f" {reply.input_tokens:,} input / {reply.output_tokens:,} output tokens."

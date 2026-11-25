@@ -62,16 +62,29 @@ def test_combined_chunks_resume_checkpoints_and_reuse_manual_corrections(tmp_pat
         _response(_reply({"1": "UNKNOWN"})),
     ])
     prompts = []
+    progress = []
+    progress_at_request = []
+
+    def track(done, total, detail):
+        progress.append((done, total, detail))
 
     def post(_http, _url, **kwargs):
         messages = kwargs["json"]["messages"]
         assert [message["role"] for message in messages] == ["system", "user"]
         prompts.append(messages)
+        progress_at_request.append(progress[-1])
         return next(responses)
 
     monkeypatch.setattr(requests.Session, "post", post)
     logs = []
-    partial = web_backend.analyze_book_dialogue(session, "test-key", on_log=logs.append)
+    partial = web_backend.analyze_book_dialogue(session, "test-key", on_log=logs.append, on_progress=track)
+    assert [done for done, _, _ in progress_at_request] == [0, 1, 1, 1, 1]
+    assert all(total == 3 for _, total, _ in progress)
+    assert "Chunk 2/3 (lines 3–4)" in progress_at_request[1][2]
+    assert "retry 1/2" in progress_at_request[2][2]
+    assert "retry 2/2" in progress_at_request[3][2]
+    assert any(done == 1 and "skipped" in detail for done, _, detail in progress)
+    assert progress[-1][:2] == (2, 3)
     assert "2 of 3" in partial.attribution_notice
     assert "Skipped chunk 2 (lines 3–4)" in partial.attribution_notice
     assert "Run Analyze book to retry" in partial.attribution_notice
@@ -95,7 +108,13 @@ def test_combined_chunks_resume_checkpoints_and_reuse_manual_corrections(tmp_pat
 
     # Recover both roster and labels even if the browser did not
     # receive the returned session.
-    complete = web_backend.analyze_book_dialogue(session, "test-key", on_log=logs.append)
+    progress.clear()
+    complete = web_backend.analyze_book_dialogue(session, "test-key", on_log=logs.append, on_progress=track)
+    assert progress[0][:2] == (2, 3)
+    assert "Reusing" in progress[0][2]
+    assert progress_at_request[-1][:2] == (2, 3)
+    assert "Chunk 2/3 (lines 3–4)" in progress_at_request[-1][2]
+    assert progress[-1][:2] == (3, 3)
     assert "3 of 3" in complete.attribution_notice
     assert "Skipped" not in complete.attribution_notice
     assert len(prompts) == 6
@@ -110,13 +129,18 @@ def test_combined_chunks_resume_checkpoints_and_reuse_manual_corrections(tmp_pat
 
     corrected = web_dialogue.correct_speaker(complete, 0, 1, "NOT_SPEECH")
     # The correction is recoverable with the roster even from the original browser state.
-    cached = web_backend.analyze_book_dialogue(session, "", on_log=logs.append)
+    progress.clear()
+    cached = web_backend.analyze_book_dialogue(session, "", on_log=logs.append, on_progress=track)
+    assert progress[0][:2] == (3, 3)
+    assert "Reusing" in progress[0][2]
     assert cached.roster == corrected.roster
     assert len(prompts) == 6
     assert cached.attributions.speaker_of_each_line(book)[1] == "NOT_SPEECH"
 
     edited_book = replace(book, sections=[book.sections[0], _section("REVISED-SECOND"), book.sections[2]])
-    edited = web_backend.analyze_book_dialogue(replace(cached, book=edited_book), "test-key", on_log=logs.append)
+    edited = web_backend.analyze_book_dialogue(
+        replace(cached, book=edited_book), "test-key", on_log=logs.append, on_progress=track,
+    )
     assert len(prompts) == 7
     assert "REVISED-SECOND" in prompts[-1][1]["content"]
     assert edited.attributions.speaker_of_each_line(edited_book) == {
@@ -487,7 +511,13 @@ def test_missing_character_voice_is_retryable_without_reviewing_the_quote_again(
         return _response(next(responses))
 
     monkeypatch.setattr(requests.Session, "post", post)
-    partial = web_backend.analyze_book_dialogue(session, "test-key", performance_cues=True, character_voices=True)
+    progress = []
+    partial = web_backend.analyze_book_dialogue(
+        session, "test-key", performance_cues=True, character_voices=True,
+        on_progress=lambda done, total, detail: progress.append((done, total, detail)),
+    )
+    assert all((done, total) == (0, 1) for done, total, _ in progress)
+    assert "missing 1 character voice direction" in progress[-1][2]
     assert partial.roster.get("SAM").voice_direction == ""
     assert partial.attributions.by_first_line(book)[1].delivery == DeliveryCue(after="sighs")
     assert "0 of 1" in partial.attribution_notice

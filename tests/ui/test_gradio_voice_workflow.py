@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import nullcontext
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -223,6 +224,65 @@ def test_live_console_and_overall_audio_speed_update_before_render_finishes(tmp_
         assert "Selected lines are ready" in completed[0]
         assert "4 of 4 segments · 100%" in completed[1]["value"]
         assert "8.0x" in completed[1]["value"]
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("fail", [False, True], ids=["success", "failure"])
+def test_local_qwen_activity_is_visible_during_analysis_and_hidden_afterward(tmp_path, monkeypatch, fail):
+    monkeypatch.setattr(gradio_app, "installed_model_choices", lambda: [("Breeze TTS 2", "venv-breeze")])
+    streaming = Event()
+    finish = Event()
+    writing = "Qwen is writing tags · 18 speaker labels drafted · 982 characters · 3s"
+    notice = "The model disconnected." if fail else "3 of 3 dialogue chunks complete."
+
+    def local_qwen(_log, *, on_activity):
+        return nullcontext(on_activity)
+
+    def analyze_dialogue(session, _key, _model, *, on_progress, local_tagger, **_kwargs):
+        on_progress(1, 3, "Chunk 2/3 (lines 7–12) · analyzing")
+        local_tagger(writing)
+        streaming.set()
+        assert finish.wait(10)
+        if fail:
+            raise gradio_app.WebBackendError(notice)
+        on_progress(3, 3, "Chunk 3/3 complete")
+        return replace(session, attribution_notice=notice)
+
+    monkeypatch.setattr(gradio_app, "local_qwen", local_qwen)
+    monkeypatch.setattr(gradio_app, "analyze_book_dialogue", analyze_dialogue)
+    ui = VoiceApp()
+    analyze = ui.event("analyze_book")
+    refresh = ui.event("refresh_activity")
+    book = Book([BookSection([PhraseGroup([Phrase("Hello.", Reason.SECTION_BREAK)], is_dialog=True)])])
+    ui.state[analyze.inputs[0]._id] = BookSession(book, str(tmp_path))
+    qwen = next(
+        component for component in analyze.inputs
+        if isinstance(component, gr.Checkbox) and component.label.startswith("Use local Qwen")
+    )
+    ui.values[qwen._id] = True
+
+    async def exercise():
+        job = asyncio.create_task(ui.run(analyze))
+        try:
+            assert await asyncio.to_thread(streaming.wait, 10)
+            (midway,) = await ui.run(refresh)
+            panel = midway[2]
+            assert panel["visible"] is True
+            assert "Chunk 2/3 (lines 7–12)" in panel["value"]
+            assert writing in panel["value"]
+            assert "1 of 3 chunks complete" in panel["value"]
+            assert 'max="3" value="1"' in panel["value"]
+
+            viewer = gr.Request(session_hash="another-session")
+            other = await ui.app.process_api(refresh, [None], SessionState(ui.app), request=viewer)
+            assert "value" not in other["data"][2]
+        finally:
+            finish.set()
+            frames = await job
+        assert frames[-1][-1]["value"] == notice
+        (completed,) = await ui.run(refresh)
+        assert completed[2]["visible"] is False
 
     asyncio.run(exercise())
 

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from html import escape
 import math
 from threading import Lock
+from time import monotonic
 from typing import TYPE_CHECKING
 
 import gradio as gr
@@ -68,6 +69,27 @@ class BookActivity:
         )
 
 
+@dataclass(frozen=True)
+class AnalysisActivity:
+    completed: int
+    total: int
+    phase: str
+    detail: str
+    started: float
+
+    def html(self) -> str:
+        elapsed = duration_string(int(monotonic() - self.started))
+        counts = f"{self.completed:,} of {self.total:,} chunks complete · " if self.total else ""
+        values = f'max="{self.total}" value="{self.completed}"' if self.total else ""
+        detail = f"<div>{escape(self.detail)}</div>" if self.detail else ""
+        return (
+            '<div class="book-progress-details">'
+            f'<span>{escape(self.phase)}</span><span>{counts}Elapsed {elapsed}</span></div>'
+            f'{detail}<div class="book-progress-track">'
+            f'<progress aria-label="Overall book analysis progress" {values}></progress></div>'
+        )
+
+
 class SessionActivity:
     def __init__(self, *, terminal_log: bool = False):
         self._lock = Lock()
@@ -76,6 +98,8 @@ class SessionActivity:
         self._book: BookActivity | None = None
         self._console_version = 0
         self._book_version = 0
+        self._analysis: AnalysisActivity | None = None
+        self._analysis_version = 0
 
     def write(self, text: str) -> None:
         if text:
@@ -108,15 +132,32 @@ class SessionActivity:
             self._book = BookActivity(label, telemetry, ended=True)
             self._book_version += 1
 
-    def changes_since(self, versions: tuple[int, int]):
+    def update_analysis(self, completed: int, total: int, phase: str, detail: str = "") -> None:
         with self._lock:
-            current = self._console_version, self._book_version
+            started = self._analysis.started if self._analysis else monotonic()
+            self._analysis = AnalysisActivity(completed, total, phase, detail, started)
+            self._analysis_version += 1
+
+    def finish_analysis(self) -> None:
+        with self._lock:
+            self._analysis = None
+            self._analysis_version += 1
+
+    def changes_since(self, versions: tuple[int, int, int]):
+        with self._lock:
+            current = self._console_version, self._book_version, self._analysis_version
             console = self._console if current[0] != versions[0] else gr.skip()
             if self._book is not None and current[1] != versions[1]:
                 progress = gr.update(value=self._book.html(), visible=True)
             else:
                 progress = gr.skip()
-        return console, progress, current if current != versions else gr.skip()
+            if self._analysis is not None:
+                analysis = gr.update(value=self._analysis.html(), visible=True)
+            elif current[2] != versions[2]:
+                analysis = gr.update(value="", visible=False)
+            else:
+                analysis = gr.skip()
+        return console, progress, analysis, current if current != versions else gr.skip()
 
 
 class ActivityPanel:
@@ -134,20 +175,20 @@ class ActivityPanel:
     def console_for(self, session_id: str | None):
         return self.session(session_id).write
 
-    def bind(self, app: gr.Blocks, progress: gr.HTML) -> None:
+    def bind(self, app: gr.Blocks, progress: gr.HTML, analysis_progress: gr.HTML) -> None:
         console = gr.Textbox(
             label="Console output", placeholder="No output yet. Generation activity will appear here.",
             lines=12, max_lines=12, interactive=False, buttons=["copy"],
             elem_id="console-output",
         )
         timer = gr.Timer(0.75)
-        versions = gr.State((0, 0))
+        versions = gr.State((0, 0, 0))
 
         def refresh_activity(last_seen, request: gr.Request):
             with self._lock:
                 activity = self._sessions.get(request.session_hash)
             if activity is None:
-                return gr.skip(), gr.skip(), gr.skip()
+                return gr.skip(), gr.skip(), gr.skip(), gr.skip()
             return activity.changes_since(last_seen)
 
         def discard_activity(request: gr.Request):
@@ -155,7 +196,7 @@ class ActivityPanel:
                 self._sessions.pop(request.session_hash, None)
 
         timer.tick(
-            refresh_activity, versions, [console, progress, versions],
+            refresh_activity, versions, [console, progress, analysis_progress, versions],
             queue=False, show_progress="hidden", api_visibility="private",
         )
         app.unload(discard_activity)

@@ -206,17 +206,17 @@ def test_activity_panel_shows_eta_from_preparation_through_first_estimate():
 
     activity = SessionActivity()
     activity.start_book()
-    _, update, version = activity.changes_since((0, 0))
+    _, update, _, version = activity.changes_since((0, 0, 0))
     assert "Preparing audiobook" in update["value"]
     assert "ETA measuring…" in update["value"]
 
     activity.update_book(BookRenderTelemetry(0, 2))
-    _, update, version = activity.changes_since(version)
+    _, update, _, version = activity.changes_since(version)
     assert "0 of 2 segments" in update["value"]
     assert "ETA measuring…" in update["value"]
 
     activity.update_book(BookRenderTelemetry(0, 2, eta_seconds=65))
-    _, update, _ = activity.changes_since(version)
+    _, update, _, _ = activity.changes_since(version)
     assert "ETA 1m 05s" in update["value"]
 
 
@@ -225,12 +225,12 @@ def test_activity_panel_switches_to_assembly_only_when_reported():
 
     activity = SessionActivity()
     activity.update_book(BookRenderTelemetry(2, 2, 3.0))
-    _, update, version = activity.changes_since((0, 0))
+    _, update, _, version = activity.changes_since((0, 0, 0))
     assert "Finalizing audio" in update["value"]
     assert "ETA" not in update["value"]
 
     activity.update_book(BookRenderTelemetry(2, 2, 3.0, assembling=True))
-    _, update, _ = activity.changes_since(version)
+    _, update, _, _ = activity.changes_since(version)
     assert "Assembling M4B" in update["value"]
     assert 'aria-label="Synthesis speed"' in update["value"]
     assert "ETA" not in update["value"]
