@@ -20,7 +20,7 @@ from tts_audiobook_tool.app_support.JsonSaveUtil import JsonArtifactType, JsonSa
 from tts_audiobook_tool.constants_config import PROJECT_MAX_RETRIES_DEFAULT
 from tts_audiobook_tool.speaker_assign.speaker_assign_file_util import SpeakerAssignFileUtil
 from tts_audiobook_tool.web_analysis_recovery import book_key
-from tts_audiobook_tool.web_backend import BookSession
+from tts_audiobook_tool.web_backend import MAX_ANALYSIS_REQUESTS, BookSession
 from tts_audiobook_tool.web_projects import (
     SavedProject, WebProjectError, _copy_asset, _copy_render_runs, _decode_snapshot, _find_project,
     _is_directory, _is_file, _project_root, _save_snapshot,
@@ -73,6 +73,9 @@ def _safe_controls(raw: dict) -> dict:
     for key in ("use_local_qwen", "regenerate_lines"):
         if type(raw.get(key)) is bool:
             controls[key] = raw[key]
+    concurrency = raw.get("request_concurrency")
+    if type(concurrency) in (int, float) and 1 <= concurrency <= MAX_ANALYSIS_REQUESTS and int(concurrency) == concurrency:
+        controls["request_concurrency"] = int(concurrency)
     for key in ("first_line", "last_line"):
         val = raw.get(key)
         if val is None and key in raw:

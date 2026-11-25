@@ -27,6 +27,7 @@ from tts_audiobook_tool.web_backend import (
     DEFAULT_LLM_ENDPOINT,
     DEFAULT_OPENAI_MODEL,
     DEFAULT_REASONING_EFFORT,
+    MAX_ANALYSIS_REQUESTS,
     UNIDENTIFIED_CAST_ROLES,
     BookSession,
     WebBackendError,
@@ -275,6 +276,11 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                                     REASONING_EFFORTS, value=DEFAULT_REASONING_EFFORT, label="Reasoning effort",
                                     info="Available levels vary by model.", interactive=True,
                                 )
+                            request_concurrency = gr.Slider(
+                                1, MAX_ANALYSIS_REQUESTS, step=1, precision=0, value=MAX_ANALYSIS_REQUESTS,
+                                label="Concurrent remote analysis requests",
+                                info="Identifies speakers in order and overlaps delivery cues. Choose 1 for a single combined request per chunk.",
+                            )
                             with gr.Accordion("LLM endpoint and request settings", open=False):
                                 llm_endpoint = gr.Textbox(value=DEFAULT_LLM_ENDPOINT, label="Chat completions URL")
                                 llm_extra_params = gr.Textbox(
@@ -809,7 +815,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
             "llm_model": llm_model, "reasoning_effort": effort, "llm_endpoint": llm_endpoint,
             "llm_extra_params": llm_extra_params, "use_local_qwen": use_local_qwen,
             "local_thinking": local_thinking, "first_line": first_line, "last_line": last_line,
-            "regenerate_lines": regenerate_lines,
+            "regenerate_lines": regenerate_lines, "request_concurrency": request_concurrency,
         }
         draft_inputs = [active_project, project_name, *persist_inputs, *draft_controls.values()]
         restore_outputs = list(dict.fromkeys([
@@ -944,14 +950,14 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
             )
 
         def show_thinking_control(use_qwen):
-            return gr.update(visible=use_qwen), gr.update(visible=not use_qwen)
+            return gr.update(visible=use_qwen), gr.update(visible=not use_qwen), gr.update(visible=not use_qwen)
 
         use_local_qwen.change(
-            show_thinking_control, use_local_qwen, [local_thinking, effort], queue=False, **PRIVATE_EVENT,
+            show_thinking_control, use_local_qwen, [local_thinking, effort, request_concurrency], queue=False, **PRIVATE_EVENT,
         )
 
         def analyze_book(session, key, model, reasoning, endpoint, settings_json, selected_role, use_qwen, thinking,
-                         character_voices, performance_cues, request: gr.Request):
+                         concurrency, character_voices, performance_cues, request: gr.Request):
             activity = activity_panel.session(request.session_hash)
             if session is None:
                 message = (
@@ -1008,7 +1014,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                         session, secret, model, effort=reasoning or "", endpoint=endpoint,
                         settings_json=settings_json or "", on_log=log, performance_cues=performance_cues,
                         character_voices=character_voices, local_tagger=tagger, on_progress=report_chunk,
-                        on_work_progress=report_work,
+                        on_work_progress=report_work, request_concurrency=1 if use_qwen else concurrency,
                     )
             except (StoredApiKeyError, WebBackendError) as exc:
                 message = str(exc)
@@ -1029,7 +1035,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
         analyzed = save_then_start(analyze).success(
             analyze_book, [
                 book, api_key, llm_model, effort, llm_endpoint, llm_extra_params, cast_role, use_local_qwen,
-                local_thinking, character_voices, analyze_performance_cues,
+                local_thinking, request_concurrency, character_voices, analyze_performance_cues,
             ],
             [book, characters, cast_role, analysis_status], show_progress="hidden", **PRIVATE_EVENT,
         )

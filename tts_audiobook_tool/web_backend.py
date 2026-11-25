@@ -1,10 +1,11 @@
 """EPUB and speaker assignment operations for the local browser interface."""
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
+from functools import partial
 from itertools import groupby
 import json
 from pathlib import Path
@@ -18,6 +19,8 @@ from typing import TYPE_CHECKING
 import requests
 
 from tts_audiobook_tool import web_analysis_recovery as recovery
+from tts_audiobook_tool.web_analysis_queue import ChunkAnalysisRequest, run_analysis_requests
+from tts_audiobook_tool.web_analysis_rate_limit import RequestRateLimiter, retry_after_seconds
 from tts_audiobook_tool.app_types import Book
 from tts_audiobook_tool.app_types.delivery_cue import DeliveryCue
 from tts_audiobook_tool.app_support.JsonSaveUtil import JsonArtifactType, JsonSaveUtil
@@ -31,11 +34,11 @@ from tts_audiobook_tool.speaker_assign.attribution import (
     UTTERANCE_TEXT_EXCERPT_CHARS, AttributionsFile, RangeAttribution, UtteranceAttribution,
 )
 from tts_audiobook_tool.speaker_assign.attribution_prompt_util import ATTRIBUTION_SYSTEM_PROMPT
-from tts_audiobook_tool.speaker_assign.attribution_reply_util import AttributionReplyUtil
+from tts_audiobook_tool.speaker_assign.attribution_reply_util import AttributionReplyUtil, ParsedReply
 from tts_audiobook_tool.speaker_assign.combined_analysis import SYSTEM_PROMPT as COMBINED_ANALYSIS_SYSTEM_PROMPT
 from tts_audiobook_tool.speaker_assign.combined_analysis import (
-    CHARACTER_VOICE_SYSTEM_INSTRUCTIONS, PERFORMANCE_CUE_SYSTEM_PROMPT,
-    InvalidChunkReplyError, build_prompt, parse_chunk_reply,
+    CHARACTER_VOICE_SYSTEM_INSTRUCTIONS, DELIVERY_ONLY_SYSTEM_PROMPT, PERFORMANCE_CUE_SYSTEM_PROMPT,
+    InvalidChunkReplyError, build_prompt, parse_chunk_reply, parse_delivery_reply,
 )
 from tts_audiobook_tool.speaker_assign.attribution_runner import AttributionRunner, AttributionRunListener
 from tts_audiobook_tool.speaker_assign.llm_request_util import LlmRequestResult, SPEAKER_ASSIGN_LLM_TIMEOUT
@@ -69,6 +72,7 @@ that is not spoken dialogue.
 """
 _REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 _FINISH_REASONS = ("stop", "length", "content_filter", "tool_calls", "function_call")
+MAX_ANALYSIS_REQUESTS = 20
 _ANALYSIS_REPLY_RETRIES = 2
 _WORKSPACE = tempfile.TemporaryDirectory(prefix="tts-audiobook-web-", ignore_cleanup_errors=True)
 
@@ -316,11 +320,14 @@ def analyze_book_dialogue(
         local_tagger: LocalQwen | None = None,
         performance_cues: bool = False,
         character_voices: bool = False,
+        request_concurrency: int = 1,
         on_log: Callable[[str], None] | None = None,
         on_progress: Callable[[int, int, str], None] | None = None,
         on_work_progress: Callable[[int, int], None] | None = None,
 ) -> BookSession:
     """Report overall chunk progress and the requested work completed during this run."""
+    if type(request_concurrency) is not int or not 1 <= request_concurrency <= MAX_ANALYSIS_REQUESTS:
+        raise WebBackendError(f"Choose between 1 and {MAX_ANALYSIS_REQUESTS} concurrent analysis requests.")
     log = on_log if on_log is not None else lambda _message: None
     directory = session.attribution_dir or session.project_dir
     checkpoint = Path(SpeakerAssignFileUtil.attributions_path(directory))
@@ -355,10 +362,53 @@ def analyze_book_dialogue(
 
             return _analyze_chunks(
                 session, roster, attributions, save, api_key, model, effort, endpoint, settings_json,
-                local_tagger, performance_cues, character_voices, log, on_progress, on_work_progress,
+                local_tagger, performance_cues, character_voices, log, on_progress, on_work_progress, request_concurrency,
             )
     except recovery.AnalysisRecoveryError as error:
         raise WebBackendError(str(error)) from None
+
+
+def _request_chunk_analysis(
+        request: ChunkAnalysisRequest, prompt: str, roster: Roster, character_voices: bool,
+        send: Callable[[str, str], LlmRequestResult], log: Callable[[str], None],
+        report_retry: Callable[[str], None] | None,
+) -> tuple[Roster, ParsedReply, LlmRequestResult]:
+    if request.delivery_only:
+        system_prompt = DELIVERY_ONLY_SYSTEM_PROMPT
+        reminder = "Return a JSON object with delivery keyed by the marked quote IDs."
+    else:
+        system_prompt = PERFORMANCE_CUE_SYSTEM_PROMPT if request.cues else COMBINED_ANALYSIS_SYSTEM_PROMPT
+        if character_voices:
+            system_prompt += CHARACTER_VOICE_SYSTEM_INSTRUCTIONS
+        reminder = "Include exactly the quote IDs needing speaker labels in speakers and use valid speaker IDs."
+    attempt_prompt = system_prompt
+    for attempt in range(_ANALYSIS_REPLY_RETRIES + 1):
+        reply = send(attempt_prompt, prompt)
+        if reply.error is not None:
+            raise WebBackendError(_request_error_message(reply.error))
+        if reply.hit_output_limit:
+            raise WebBackendError("The model reached its output limit. Try lower reasoning effort or a higher output limit.")
+        try:
+            if request.delivery_only:
+                return roster, parse_delivery_reply(reply.reply, request.cues), reply
+            updated, parsed = parse_chunk_reply(
+                reply.reply, roster, request.speakers, cue_requests=request.cues,
+                voice_requests=request.voices, character_voices=character_voices,
+            )
+            return updated, parsed, reply
+        except (ValueError, RecursionError) as error:
+            if isinstance(error, InvalidChunkReplyError):
+                reason = str(error)
+            elif isinstance(error, json.JSONDecodeError):
+                reason = "The reply could not be parsed as JSON."
+            else:
+                reason = "The reply did not match the expected analysis format."
+            if attempt == _ANALYSIS_REPLY_RETRIES:
+                raise InvalidChunkReplyError(reason) from None
+            if report_retry is not None:
+                report_retry(f"{request.location} · retry {attempt + 1}/{_ANALYSIS_REPLY_RETRIES} after invalid reply")
+            log(f"{request.label} {reason} Retrying ({attempt + 1}/{_ANALYSIS_REPLY_RETRIES}).\n")
+            attempt_prompt = f"{system_prompt}\n\nRetry reminder: {reason} Return one valid JSON object. {reminder}"
 
 
 def _analyze_chunks(
@@ -367,7 +417,7 @@ def _analyze_chunks(
         endpoint: str, settings_json: str, local_tagger: LocalQwen | None, performance_cues: bool,
         character_voices: bool, log: Callable[[str], None],
         on_progress: Callable[[int, int, str], None] | None,
-        on_work_progress: Callable[[int, int], None] | None,
+        on_work_progress: Callable[[int, int], None] | None, request_concurrency: int,
 ) -> BookSession:
     book = session.book
     plan = AssignPlan.make(book, attributions)
@@ -400,11 +450,22 @@ def _analyze_chunks(
             for number, utterances in utterances_by_chunk.items()
         }
     voices_by_chunk = _character_voice_requests(roster, utterances_by_chunk, effective_by_line) if character_voices else {}
-    work_by_chunk = {
-        number: len(speakers | cues_by_chunk.get(number, set())) + len(voices_by_chunk.get(number, ()))
-        for number, speakers in speakers_by_chunk.items()
+    stages = {
+        chunk.number: (speakers_by_chunk[chunk.number], cues_by_chunk.get(chunk.number, set()),
+                       voices_by_chunk.get(chunk.number, set()))
+        for chunk in plan.chunks
     }
-    complete = sum(units == 0 for units in work_by_chunk.values())
+    pending_chunks = sum(bool(speakers or cues or voices) for speakers, cues, voices in stages.values())
+    # A single fresh chunk gets both kinds of analysis in one request. One remaining
+    # cue-only chunk from an interrupted parallel run still uses the delivery contract.
+    split = (local_tagger is None and request_concurrency > 1 and any(cues_by_chunk.values())
+             and (pending_chunks > 1 or not any(s or v for s, _, v in stages.values())))
+    slots = request_concurrency if split else 1
+    work_by_chunk = {
+        number: (len(speakers) + len(cues) if split else len(speakers | cues)) + len(voices)
+        for number, (speakers, cues, voices) in stages.items()
+    }
+    complete = total - pending_chunks
     completed_work = 0
     total_work = sum(work_by_chunk.values())
 
@@ -418,129 +479,170 @@ def _analyze_chunks(
         progress(f"Reusing saved analysis for {_count_label(complete, 'chunk')}.")
     else:
         progress("Starting dialogue analysis.")
-    prefs = None
+    log(f"Analyzing {total:,} dialogue chunks.\n")
+    ordered, ready_cues = deque(), deque()
+    deferred_cues = {}
+    for chunk in plan.chunks:
+        speakers, cues, voices = stages[chunk.number]
+        if not (speakers or cues or voices):
+            quotes = _count_label(len(utterances_by_chunk[chunk.number]), "quote")
+            saved = "analysis" if performance_cues else "speaker labels"
+            log(f"Chunk {chunk.number:,}/{total:,} reused saved {saved} for {quotes}.\n")
+        elif split and not (speakers or voices):
+            ready_cues.append(ChunkAnalysisRequest(chunk, total, cues=cues, delivery_only=True))
+        elif split:
+            ordered.append(ChunkAnalysisRequest(chunk, total, speakers=speakers, voices=voices))
+            if cues:
+                deferred_cues[chunk.number] = cues
+        else:
+            ordered.append(ChunkAnalysisRequest(chunk, total, speakers, cues, voices))
+
+    limiter = RequestRateLimiter() if split else None
+    if split:
+        log(f"Using up to {slots} concurrent remote requests. Speaker identification runs in book order "
+            "and delivery cues start as each chunk's speakers become available.\n")
     analysis_model = LOCAL_QWEN_MODEL if local_tagger is not None else model.strip()
+    prefs = None
+
+    def send(system_prompt: str, prompt: str) -> LlmRequestResult:
+        if local_tagger is not None:
+            return local_tagger.send(system_prompt, prompt)
+
+        def submit() -> LlmRequestResult:
+            return _send(_make_session(prefs, api_key, system_prompt), prompt)
+        return limiter.send(submit, on_log=log) if limiter is not None else submit()
+
+    def prepare(request: ChunkAnalysisRequest):
+        nonlocal api_key, prefs
+        # Validation stays lazy so a fully cached run needs no credentials.
+        if local_tagger is None and prefs is None:
+            try:
+                api_key, prefs = _request_settings(api_key, model, effort, endpoint, settings_json)
+            except WebBackendError as error:
+                def invalid_settings(message=str(error)):
+                    raise WebBackendError(message)
+                return invalid_settings
+        utterances = utterances_by_chunk[request.chunk.number]
+        saved_speakers = {
+            number: next(iter(speakers))
+            for number, quote in enumerate(utterances, 1) if number not in request.speakers
+            if len(speakers := {effective_by_line[line].speaker for line in quote.lines}) == 1
+        }
+        prompt = build_prompt(
+            book, request.chunk, roster, prior_speakers, saved_speakers, speaker_requests=request.speakers,
+            cue_requests=request.cues, voice_requests=request.voices,
+        )
+        parts = []
+        if request.speakers:
+            parts.append(f"speakers for {_count_label(len(request.speakers), 'quote')}")
+        if request.cues:
+            parts.append(f"delivery cues for {_count_label(len(request.cues), 'quote')}")
+        if request.voices:
+            parts.append(f"voice directions for {_count_label(len(request.voices), 'character')}")
+        description = " and ".join(parts)
+        progress(f"{request.location} · requesting {description}")
+        log(f"{request.label} requesting {description} ({request.line_range}).\n")
+        return partial(_request_chunk_analysis, request, prompt, roster, character_voices, send, log,
+                       None if split else progress)
+
     issue = ""
     skipped_chunks: list[PlannedChunk] = []
-    log(f"Analyzing {total:,} dialogue chunks.\n")
-    for chunk in plan.chunks:
-        label = f"Chunk {chunk.number:,}/{total:,}"
-        utterances = utterances_by_chunk[chunk.number]
-        requested = speakers_by_chunk[chunk.number]
-        cue_requests = cues_by_chunk.get(chunk.number, set())
-        voice_requests = voices_by_chunk.get(chunk.number, set())
-        if not requested and not cue_requests and not voice_requests:
-            quotes = _count_label(len(utterances), "quote")
-            saved = "analysis" if performance_cues else "speaker labels"
-            log(f"{label} reused saved {saved} for {quotes}.\n")
-            continue
-        line_range = f"lines {chunk.start + 1:,}–{chunk.end:,}"
-        location = f"{label} ({line_range})"
-        try:
-            if local_tagger is None and prefs is None:
-                api_key, prefs = _request_settings(api_key, model, effort, endpoint, settings_json)
-            saved_speakers = {
-                number: next(iter(speakers))
-                for number, utterance in enumerate(utterances, 1) if number not in requested
-                if len(speakers := {effective_by_line[line].speaker for line in utterance.lines}) == 1
-            }
-            prompt = build_prompt(
-                book, chunk, roster, prior_speakers, saved_speakers,
-                speaker_requests=requested, cue_requests=cue_requests, voice_requests=voice_requests,
-            )
-            request_parts = []
-            if requested:
-                request_parts.append(f"speakers for {_count_label(len(requested), 'quote')}")
-            if cue_requests:
-                request_parts.append(f"delivery cues for {_count_label(len(cue_requests), 'quote')}")
-            if voice_requests:
-                request_parts.append(f"voice directions for {_count_label(len(voice_requests), 'character')}")
-            request_description = " and ".join(request_parts)
-            progress(f"{location} · requesting {request_description}")
-            log(f"{label} requesting {request_description} ({line_range}).\n")
-            system_prompt = PERFORMANCE_CUE_SYSTEM_PROMPT if cue_requests else COMBINED_ANALYSIS_SYSTEM_PROMPT
-            if character_voices:
-                system_prompt += CHARACTER_VOICE_SYSTEM_INSTRUCTIONS
-            attempt_system_prompt = system_prompt
-            for attempt in range(_ANALYSIS_REPLY_RETRIES + 1):
-                if local_tagger is None:
-                    reply = _send(_make_session(prefs, api_key, attempt_system_prompt), prompt)
-                else:
-                    reply = local_tagger.send(attempt_system_prompt, prompt)
-                if reply.error is not None:
-                    raise WebBackendError(_request_error_message(reply.error))
-                if reply.hit_output_limit:
-                    raise WebBackendError("The model reached its output limit. Try lower reasoning effort or a higher output limit.")
-                try:
-                    next_roster, parsed = parse_chunk_reply(
-                        reply.reply, roster, requested, cue_requests=cue_requests,
-                        voice_requests=voice_requests, character_voices=character_voices,
-                    )
-                except (ValueError, RecursionError) as error:
-                    if isinstance(error, InvalidChunkReplyError):
-                        reason = str(error)
-                    elif isinstance(error, json.JSONDecodeError):
-                        reason = "The reply could not be parsed as JSON."
-                    else:
-                        reason = "The reply did not match the expected analysis format."
-                    if attempt < _ANALYSIS_REPLY_RETRIES:
-                        progress(f"{location} · retry {attempt + 1}/{_ANALYSIS_REPLY_RETRIES} after invalid reply")
-                        log(f"{label} {reason} Retrying ({attempt + 1}/{_ANALYSIS_REPLY_RETRIES}).\n")
-                        attempt_system_prompt = (
-                            f"{system_prompt}\n\nRetry reminder: {reason} Return one valid JSON object. "
-                            "Include exactly the quote IDs needing speaker labels in speakers and use valid speaker IDs."
-                        )
-                else:
-                    break
-            else:
-                skipped_chunks.append(chunk)
-                progress(f"{location} · skipped after {attempt + 1} invalid replies")
-                log(f"{label} skipped ({line_range}) after {attempt + 1} invalid replies. {reason}\n")
-                continue
+    missing_voice_chunks = set()
 
+    def collect(request: ChunkAnalysisRequest, result) -> None:
+        nonlocal roster, attributions, complete, completed_work, issue
+        chunk = request.chunk
+        utterances = utterances_by_chunk[chunk.number]
+        try:
+            reply_roster, parsed, reply = result()
+            # Cue workers read a snapshot. A speaker request may have added new
+            # characters while they were running. Only the cast lane can change it.
+            next_roster = roster if request.delivery_only else reply_roster
             next_attributions, new_utterances = attributions, []
-            if requested or cue_requests:
+            if request.speakers or request.cues:
                 added = AttributionReplyUtil.make_range_attribution(
                     book, chunk.start, chunk.end, utterances, parsed, llm={"model": analysis_model},
                 )
                 next_attributions, new_utterances = _merge_chunk_analysis(
-                    book, attributions, added, requested, effective_by_line,
+                    book, attributions, added, request.speakers, effective_by_line,
                 )
             if next_roster != roster or next_attributions != attributions:
                 save(next_roster, next_attributions)
-        except (LocalTaggerError, WebBackendError) as exc:
-            issue = str(exc)
-            progress(f"{location} · stopped")
-            log(f"{label} stopped. {issue} Run Analyze book to retry this chunk.\n")
-            break
-        expected_voices = voice_requests | (next_roster.ids - roster.ids) if character_voices else set()
+        except InvalidChunkReplyError as error:
+            skipped_chunks.append(chunk)
+            attempts = _ANALYSIS_REPLY_RETRIES + 1
+            progress(f"{request.location} · skipped after {attempts} invalid replies")
+            log(f"{request.label} skipped ({request.line_range}) after {attempts} invalid replies. {error}\n")
+            return
+        except (LocalTaggerError, WebBackendError) as error:
+            issue = issue or str(error)
+            progress(f"{request.location} · stopped")
+            log(f"{request.label} stopped. {error} Run Analyze book to retry this chunk.\n")
+            return
+
+        expected_voices = request.voices | (next_roster.ids - roster.ids) if character_voices else set()
         added_voices = sum(
             is_current_character_voice_direction(entry.voice_direction)
             for entry in next_roster.characters if entry.id in expected_voices
         )
         missing_voices = len(expected_voices) - added_voices
-        roster, attributions = next_roster, next_attributions
-        prior_speakers.update((utterance.first_line, utterance.speaker) for utterance in new_utterances)
         if missing_voices:
-            progress(f"{location} · missing {_count_label(missing_voices, 'character voice direction')}")
-        else:
-            complete += 1
+            missing_voice_chunks.add(chunk.number)
+        roster, attributions = next_roster, next_attributions
+        for quote in new_utterances:
+            prior_speakers[quote.first_line] = quote.speaker
+            for line in quote.lines:
+                effective_by_line[line] = quote
+
+        # Quotes newly classified as NOT_SPEECH, or crossing an existing manual
+        # assignment, must not acquire either a cue or an assessed-plain marker.
+        deferred = deferred_cues.pop(chunk.number, set())
+        eligible = {number for number in deferred if _needs_delivery(utterances[number - 1], effective_by_line)}
+        if eligible:
+            ready_cues.append(ChunkAnalysisRequest(chunk, total, cues=eligible, delivery_only=True))
+        if split:
+            completed_work += (len(request.speakers) + len(request.cues) + max(0, len(request.voices) - missing_voices)
+                               + len(deferred) - len(eligible))
+        elif not missing_voices:
             completed_work += work_by_chunk[chunk.number]
-            progress(f"{location} · complete")
+        if missing_voices:
+            progress(f"{request.location} · missing {_count_label(missing_voices, 'character voice direction')}")
+        elif eligible:
+            progress(f"{request.location} · speakers saved, delivery cues pending")
+        elif chunk.number not in missing_voice_chunks:
+            complete += 1
+            progress(f"{request.location} · complete")
+            if limiter is not None:
+                elapsed = monotonic() - started
+                finished = complete - (total - pending_chunks)
+                log(f"Finished {finished:,} of {pending_chunks:,} remaining chunks in {elapsed:.1f}s "
+                    f"({elapsed / finished:.1f}s/chunk). Peak {limiter.peak_in_flight} simultaneous requests.\n")
+        else:
+            progress(f"{request.location} · delivery saved, character voice direction pending")
+
         usage = ""
         if reply.input_tokens is not None and reply.output_tokens is not None:
             usage = f" {reply.input_tokens:,} input / {reply.output_tokens:,} output tokens."
         saved_parts = []
-        if requested:
-            saved_parts.append(_count_label(len(requested), "speaker label"))
-        if cue_requests:
+        if request.speakers:
+            saved_parts.append(_count_label(len(request.speakers), "speaker label"))
+        if request.cues:
             saved_parts.append(_count_label(sum(bool(cue) for cue in parsed.delivery.values()), "delivery cue"))
         if added_voices:
             saved_parts.append(_count_label(added_voices, "character voice direction"))
         if saved_parts:
-            log(f"{label} saved {' and '.join(saved_parts)} in {reply.elapsed:.1f}s.{usage}\n")
+            log(f"{request.label} saved {' and '.join(saved_parts)} in {reply.elapsed:.1f}s.{usage}\n")
         if missing_voices:
-            log(f"{label} did not receive {_count_label(missing_voices, 'usable character voice direction')}.\n")
+            log(f"{request.label} did not receive {_count_label(missing_voices, 'usable character voice direction')}.\n")
+
+    started = monotonic()
+    run_analysis_requests(ordered, ready_cues, slots, prepare, collect, lambda: bool(issue))
+    if limiter is not None:
+        elapsed = monotonic() - started
+        newly_complete = complete - (total - pending_chunks)
+        log(f"Parallel analysis finished {newly_complete:,} of {pending_chunks:,} pending chunks in {elapsed:.1f}s. "
+            f"Peak {limiter.peak_in_flight} concurrent HTTP requests, {limiter.requests_sent} sent.\n")
+    skipped_chunks.sort(key=lambda chunk: chunk.number)
 
     if issue and not attributions.ranges and not skipped_chunks:
         raise WebBackendError(issue)
@@ -873,11 +975,12 @@ def _send(llm: LlmSession, prompt: str) -> LlmRequestResult:
 class _SanitizedHttpError(requests.HTTPError):
     """A provider status with no response text, request headers or raw JSON."""
 
-    def __init__(self, status: int, code: str = "") -> None:
+    def __init__(self, status: int, code: str = "", retry_after: float | None = None) -> None:
         response = requests.Response()
         response.status_code = status
         super().__init__(f"OpenAI request failed with HTTP {status}.", response=response)
         self.code = code
+        self.retry_after = retry_after
 
 
 def _request_error_message(error: Exception) -> str:
@@ -924,7 +1027,8 @@ class _WebOpenAISession(LlmSession):
                     allow_redirects=False,
                 ) as response:
                     if response.status_code != 200:
-                        raise _SanitizedHttpError(response.status_code, _safe_error_code(response))
+                        delay = retry_after_seconds(response.headers) if response.status_code == 429 else None
+                        raise _SanitizedHttpError(response.status_code, _safe_error_code(response), delay)
                     body = response.json()
                     choice = body["choices"][0]
                     content = choice["message"]["content"]

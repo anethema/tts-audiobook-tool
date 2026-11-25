@@ -249,6 +249,7 @@ def test_local_qwen_activity_is_visible_during_analysis_and_hidden_afterward(tmp
 
     def analyze_dialogue(session, _key, _model, *, on_progress, on_work_progress, local_tagger, **_kwargs):
         nonlocal now
+        assert _kwargs["request_concurrency"] == 1
         on_work_progress(0, 80)
         on_progress(0, 3, "Starting dialogue analysis")
         now += 10
@@ -284,7 +285,7 @@ def test_local_qwen_activity_is_visible_during_analysis_and_hidden_afterward(tmp
 
     async def exercise():
         (controls,) = await ui.run(ui.event("show_thinking_control"), True)
-        assert [control["visible"] for control in controls] == [True, False]
+        assert [control["visible"] for control in controls] == [True, False, False]
         job = asyncio.create_task(ui.run(analyze))
         try:
             assert await asyncio.to_thread(streaming.wait, 10)
@@ -487,6 +488,7 @@ def test_library_selection_reaches_samples_cast_and_saved_project(tmp_path, monk
     def analyze_dialogue(session, _key, _model, *, on_log, **_kwargs):
         assert _kwargs["performance_cues"] is True
         assert _kwargs["character_voices"] is True
+        assert _kwargs["request_concurrency"] == 20
         if session.attributions.ranges:
             on_log("Reusing saved dialogue labels.")
             return session
@@ -1039,6 +1041,9 @@ def test_browser_draft_restores_book_and_settings_without_starting_analysis(tmp_
         analyze = ui.event("analyze_book")
         model = next(c for c in analyze.inputs if getattr(c, "label", None) == "LLM model")
         ui.values[model._id] = "saved-model"
+        concurrency = next(c for c in analyze.inputs if getattr(c, "label", None) == "Concurrent remote analysis requests")
+        assert ui.values[concurrency._id] == 20
+        ui.values[concurrency._id] = 8
         ui.values[analyze.inputs[1]._id] = "secret-only-in-this-tab"
         await ui.run(ui.event("autosave_browser_session"))
         original = ui.state[load.inputs[0]._id]
@@ -1053,6 +1058,8 @@ def test_browser_draft_restores_book_and_settings_without_starting_analysis(tmp_
         analyze = reopened.event("analyze_book")
         model = next(c for c in analyze.inputs if getattr(c, "label", None) == "LLM model")
         assert reopened.values[model._id] == "saved-model"
+        concurrency = next(c for c in analyze.inputs if getattr(c, "label", None) == "Concurrent remote analysis requests")
+        assert reopened.values[concurrency._id] == 8
         assert not reopened.values[analyze.inputs[1]._id]
         summary = next(c for c in load.outputs if getattr(c, "label", None) == "Book summary")
         assert reopened.values[summary._id] == gradio_app._book_summary(restored)
