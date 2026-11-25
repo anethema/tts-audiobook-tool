@@ -1,6 +1,7 @@
 from dataclasses import replace
 import json
 import logging
+from pathlib import Path
 
 import pytest
 import requests
@@ -16,6 +17,11 @@ from tts_audiobook_tool.speaker_assign.roster import (
     CHARACTER_VOICE_DIRECTIONS, NEUTRAL_CHARACTER_VOICE_DIRECTION, Roster, RosterCharacter,
 )
 from tts_audiobook_tool.speaker_assign.utterance_util import UtteranceUtil
+
+
+@pytest.fixture(autouse=True)
+def isolated_dialogue_recovery(tmp_path, monkeypatch):
+    monkeypatch.setattr(web_backend.recovery, "recovery_root", lambda: tmp_path / "recovery")
 
 
 def _group(text, reason, *, dialogue=False):
@@ -45,6 +51,107 @@ def _content_response(content, *, finish_reason="stop"):
         "usage": {"prompt_tokens": 120, "completion_tokens": 20},
     }).encode("utf-8")
     return response
+
+
+def test_reimport_resumes_after_workspace_cleanup_with_matching_book_and_settings(tmp_path, monkeypatch):
+    book = Book(sections=[_section("FIRST"), _section("SECOND")])
+    anna = {"id": "ANNA", "name": "Anna"}
+    replies = iter([_response(_reply({"1": "ANNA"}, [anna])), requests.ConnectionError("offline"),
+                    _response(_reply({"1": "ANNA"})), _response(_reply({"1": "UNKNOWN"}))])
+    calls = []
+
+    def post(_http, _url, **kwargs):
+        calls.append(kwargs["json"]["messages"][1]["content"])
+        if len(calls) == 1:
+            concurrent = web_backend.new_book_session(book)
+            with pytest.raises(web_backend.WebBackendError, match="Another analysis"):
+                web_backend.analyze_book_dialogue(concurrent, "private-api-key")
+            web_backend.close_book_session(concurrent)
+        reply = next(replies)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(requests.Session, "post", post)
+    original = web_backend.new_book_session(book)
+    partial = web_backend.analyze_book_dialogue(original, "private-api-key")
+    assert len(partial.attributions.ranges) == 1
+    web_backend.close_book_session(partial)
+    assert not Path(original.attribution_dir).exists()
+
+    different = web_backend.new_book_session(Book(sections=[_section("OTHER"), _section("SECOND")]))
+    assert not different.analysis_recovery_notice
+    fresh = web_backend.new_book_session(book)
+    assert "1 saved chunk range" in fresh.analysis_recovery_notice
+    complete = web_backend.analyze_book_dialogue(fresh, "private-api-key")
+    assert len(calls) == 3 and "FIRST" not in calls[-1].split("Current passage, starting at line 3:")[-1]
+    assert len(complete.attributions.ranges) == 2 and complete.roster.ids == {"ANNA"}
+    web_backend.close_book_session(complete)
+
+    fresh = web_backend.new_book_session(book)
+    reused = web_backend.analyze_book_dialogue(fresh, "")
+    assert len(reused.attributions.ranges) == 2 and len(calls) == 3
+    corrected = web_dialogue.correct_speaker(reused, 0, 1, "OTHER:unidentified female")
+    reviewed = web_backend.analyze_book_dialogue(corrected, "")
+    assert reviewed.attributions.speaker_of_each_line(book)[1] == "OTHER:unidentified female"
+    root = tmp_path / "recovery"
+    [checkpoint] = list(root.glob("*/*.json"))
+    assert "private-api-key" not in checkpoint.read_text()
+    assert checkpoint.stat().st_mode & 0o077 == 0
+    assert root.stat().st_mode & 0o077 == 0
+    web_backend.close_book_session(reused)
+
+    # A different effort on a fresh import requires a new request.
+    with pytest.raises(web_backend.WebBackendError, match="API key"):
+        web_backend.analyze_book_dialogue(web_backend.new_book_session(book), "", effort="medium")
+
+    # An explicit saved project and preexisting manual labels take precedence.
+    loaded = web_backend.new_book_session(book, project_dir=str(tmp_path / "saved-project" / "render"),
+                                          roster=partial.roster, attributions=partial.attributions)
+    assert not loaded.analysis_recovery_notice
+    completed_project = web_backend.analyze_book_dialogue(loaded, "private-api-key")
+    assert completed_project.attributions.speaker_of_each_line(book) == {1: "ANNA", 3: "UNKNOWN"}
+    assert len(calls) == 4 and "Current passage, starting at line 3:" in calls[-1]
+
+
+def test_reopening_named_project_resumes_its_unsaved_dialogue_analysis(tmp_path, monkeypatch):
+    from tts_audiobook_tool.web_projects import create_project, load_project
+    from tts_audiobook_tool.web_render import RenderVoice
+
+    book = Book(sections=[_section("FIRST"), _section("SECOND")], title="Recovery test book")
+    root = tmp_path / "projects"
+    imported = web_backend.new_book_session(book)
+    project = create_project("Overnight analysis", imported, narrator=RenderVoice(), voices={},
+                             model_id="venv-breeze", analyze_performance_cues=True, root=root)
+    web_backend.close_book_session(imported)
+    first = load_project(project.project_id, root=root)
+    anna = {"id": "ANNA", "name": "Anna"}
+    reply = {**_reply({"1": "ANNA"}, [anna]), "delivery": {"1": {"direction": "warmly"}}}
+    results = iter([_response(reply), requests.ConnectionError("offline"), _response(reply)])
+    requests_sent = []
+
+    def post(_http, _url, **kwargs):
+        requests_sent.append(kwargs["json"]["messages"][1]["content"])
+        result = next(results)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(requests.Session, "post", post)
+    partial = web_backend.analyze_book_dialogue(first.session, "test-key", performance_cues=first.analyze_performance_cues)
+    assert len(partial.attributions.ranges) == 1
+    web_backend.close_book_session(partial)
+    assert not Path(partial.attribution_dir).exists()
+
+    reopened = load_project(project.project_id, root=root)
+    assert not reopened.session.attributions.ranges
+    assert "1 saved chunk range" in reopened.session.analysis_recovery_notice
+    result = web_backend.analyze_book_dialogue(reopened.session, "test-key", performance_cues=reopened.analyze_performance_cues)
+    assert len(requests_sent) == 3
+    assert "Current passage, starting at line 3:" in requests_sent[-1]
+    assert result.roster.ids == {"ANNA"}
+    assert [u.delivery.direction for r in result.attributions.ranges for u in r.utterances] == ["warmly", "warmly"]
+    web_backend.close_book_session(result)
 
 
 def test_combined_chunks_resume_checkpoints_and_reuse_manual_corrections(tmp_path, monkeypatch):

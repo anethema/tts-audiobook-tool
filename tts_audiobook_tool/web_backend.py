@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from itertools import groupby
 import json
@@ -16,6 +17,7 @@ from typing import TYPE_CHECKING
 
 import requests
 
+from tts_audiobook_tool import web_analysis_recovery as recovery
 from tts_audiobook_tool.app_types import Book
 from tts_audiobook_tool.app_types.delivery_cue import DeliveryCue
 from tts_audiobook_tool.app_support.JsonSaveUtil import JsonArtifactType, JsonSaveUtil
@@ -89,6 +91,7 @@ class BookSession:
     project_language: str | None = None
     word_substitutions: dict[str, str] = field(default_factory=dict)
     line_voices: dict[int, RenderVoice] = field(default_factory=dict)
+    analysis_recovery_notice: str = ""
 
     @property
     def language_code(self) -> str:
@@ -174,6 +177,12 @@ def new_book_session(
         word_substitutions=dict(word_substitutions or {}),
         line_voices=dict(line_voices or {}),
     )
+    if recovery.recovery_root().is_dir():
+        book_id = recovery.book_key(book, project_dir)
+        seed = recovery.baseline_key(roster or Roster(()), loaded)
+        notice = recovery.available_notice(recovery.checkpoint_dir(book_id, seed))
+        if notice:
+            session = replace(session, analysis_recovery_notice=notice)
     if loaded.ranges and SpeakerAssignFileUtil.save_attributions_file(workspace, loaded):
         close_book_session(session)
         raise WebBackendError("Saved dialogue assignments could not be copied into the session workspace.")
@@ -259,7 +268,63 @@ def analyze_book_dialogue(
     log = on_log if on_log is not None else lambda _message: None
     directory = session.attribution_dir or session.project_dir
     checkpoint = Path(SpeakerAssignFileUtil.attributions_path(directory))
-    roster, attributions = _load_analysis_checkpoint(session, checkpoint)
+    roster, attributions, previous = _read_analysis_checkpoint(session, checkpoint)
+    durable = nullcontext(None)
+    origin = None
+    if session.attribution_dir is not None:
+        scope = session.project_dir if session.project_dir != session.attribution_dir else None
+        book_id = recovery.book_key(session.book, scope)
+        if local_tagger is None:
+            try:
+                extra_params = json.loads(settings_json.strip() or "{}")
+            except ValueError:
+                extra_params = settings_json
+            provider = ("remote", model.strip(), (endpoint or "").strip(), effort.strip(), extra_params)
+        else:
+            provider = ("ollama", LOCAL_QWEN_MODEL, local_tagger.thinking)
+        config = recovery.settings_key(provider, performance_cues, character_voices)
+        # Review edits rewrite the local checkpoint without this marker. Their own
+        # roster and labels then become a separate, authoritative starting point.
+        if (isinstance(previous, dict) and previous.get("book") == book_id and previous.get("config") == config
+                and isinstance(previous.get("baseline"), str) and re.fullmatch(r"[0-9a-f]{64}", previous["baseline"])):
+            seed = previous["baseline"]
+        else:
+            seed = recovery.baseline_key(roster, attributions)
+        origin = {"book": book_id, "config": config, "baseline": seed}
+        durable = recovery.locked_checkpoint(recovery.checkpoint_dir(book_id, seed), config)
+
+    try:
+        with durable as backup:
+            if backup is not None and backup.exists():
+                roster, attributions, stored_origin = _read_analysis_checkpoint(session, backup)
+                if stored_origin != origin:
+                    raise WebBackendError("The saved dialogue recovery file does not match this book and its settings.")
+                recovery.copy_checkpoint(backup, checkpoint)
+                log(f"Restored dialogue checkpoint with {len(attributions.ranges):,} saved chunk ranges.\n")
+
+            def save(roster: Roster, attributions: AttributionsFile) -> None:
+                if backup is None:
+                    _save_analysis_checkpoint(checkpoint, roster, attributions)
+                else:
+                    _save_analysis_checkpoint(backup, roster, attributions, origin=origin)
+                    recovery.copy_checkpoint(backup, checkpoint)
+
+            return _analyze_chunks(
+                session, roster, attributions, save, api_key, model, effort, endpoint, settings_json,
+                local_tagger, performance_cues, character_voices, log, on_progress, on_work_progress,
+            )
+    except recovery.AnalysisRecoveryError as error:
+        raise WebBackendError(str(error)) from None
+
+
+def _analyze_chunks(
+        session: BookSession, roster: Roster, attributions: AttributionsFile,
+        save: Callable[[Roster, AttributionsFile], None], api_key: str, model: str, effort: str,
+        endpoint: str, settings_json: str, local_tagger: LocalQwen | None, performance_cues: bool,
+        character_voices: bool, log: Callable[[str], None],
+        on_progress: Callable[[int, int, str], None] | None,
+        on_work_progress: Callable[[int, int], None] | None,
+) -> BookSession:
     book = session.book
     plan = AssignPlan.make(book, attributions)
     total = len(plan.chunks)
@@ -398,7 +463,7 @@ def analyze_book_dialogue(
                     book, attributions, added, requested, effective_by_line,
                 )
             if next_roster != roster or next_attributions != attributions:
-                _save_analysis_checkpoint(checkpoint, next_roster, next_attributions)
+                save(next_roster, next_attributions)
         except (LocalTaggerError, WebBackendError) as exc:
             issue = str(exc)
             progress(f"{location} · stopped")
@@ -454,7 +519,7 @@ def analyze_book_dialogue(
     elif issue or remaining_voices:
         notice += " Run Analyze book to continue."
     log(notice + "\n")
-    return replace(session, roster=roster, attributions=attributions, attribution_notice=notice)
+    return replace(session, roster=roster, attributions=attributions, attribution_notice=notice, analysis_recovery_notice="")
 
 
 def _character_voice_requests(
@@ -551,32 +616,44 @@ def _count_label(count: int, singular: str) -> str:
 
 
 def _load_analysis_checkpoint(session: BookSession, checkpoint: Path) -> tuple[Roster, AttributionsFile]:
+    roster, attributions, _ = _read_analysis_checkpoint(session, checkpoint)
+    return roster, attributions
+
+
+def _read_analysis_checkpoint(session: BookSession, checkpoint: Path) -> tuple[Roster, AttributionsFile, object]:
     roster = session.roster or Roster(())
     try:
         value = json.loads(checkpoint.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return roster, AttributionsFile(tuple(session.attributions.valid_ranges(session.book)))
+        return roster, AttributionsFile(tuple(session.attributions.valid_ranges(session.book))), None
     except (OSError, ValueError):
         raise WebBackendError("Saved dialogue assignments could not be read.") from None
     try:
+        if not isinstance(value, dict):
+            raise ValueError
         saved = AttributionsFile(tuple(AttributionsFile.from_dict(value).valid_ranges(session.book)))
         if "combined_roster" in value:
             roster = Roster.from_dict(value["combined_roster"])
     except ValueError:
         raise WebBackendError("Saved dialogue assignments could not be read.") from None
-    return roster, saved
+    return roster, saved, value.get("analysis_recovery")
 
 
-def _save_analysis_checkpoint(checkpoint: Path, roster: Roster, attributions: AttributionsFile) -> None:
+def _save_analysis_checkpoint(
+        checkpoint: Path, roster: Roster, attributions: AttributionsFile, *, origin: dict[str, str] | None = None,
+) -> None:
     """Store roster and quote labels in one write, using the canonical attribution file."""
     try:
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
         raise WebBackendError("Dialogue analysis progress could not be saved.") from None
-    if JsonSaveUtil.save(
-        JsonArtifactType.SPEAKER_ATTRIBUTIONS, checkpoint,
-        lambda: {**attributions.to_dict(), "combined_roster": roster.to_dict()},
-    ):
+    def payload():
+        value = {**attributions.to_dict(), "combined_roster": roster.to_dict()}
+        if origin is not None:
+            value["analysis_recovery"] = origin
+        return value
+
+    if JsonSaveUtil.save(JsonArtifactType.SPEAKER_ATTRIBUTIONS, checkpoint, payload):
         raise WebBackendError("Dialogue analysis progress could not be saved.")
 
 

@@ -11,7 +11,9 @@ import pytest
 gr = pytest.importorskip("gradio", minversion="6.17.3")
 from gradio.state_holder import SessionState
 
-from tts_audiobook_tool import gradio_app, web_playback_panel, web_projects, web_voice_panel, web_voices
+from tts_audiobook_tool import (
+    gradio_app, web_analysis_recovery, web_playback_panel, web_projects, web_voice_panel, web_voices,
+)
 from tts_audiobook_tool.app_types import Book, BookSection, RoomReverb
 from tts_audiobook_tool.app_types.delivery_cue import DeliveryCue
 from tts_audiobook_tool.app_types.phrase import Phrase, PhraseGroup, Reason
@@ -306,6 +308,66 @@ def test_local_qwen_activity_is_visible_during_analysis_and_hidden_afterward(tmp
         assert frames[-1][-1]["value"] == notice
         (completed,) = await ui.run(refresh)
         assert completed[2]["visible"] is False
+
+    asyncio.run(exercise())
+
+
+
+def test_analyze_retry_keeps_book_state_and_requests_only_missing_chunks(tmp_path, monkeypatch):
+    import json
+
+    import requests
+
+    monkeypatch.setattr(web_analysis_recovery, "recovery_root", lambda: tmp_path / "recovery")
+    monkeypatch.setattr(gradio_app, "installed_model_choices", lambda: [])
+    ui = VoiceApp()
+    analyze = ui.event("analyze_book")
+    state_id = analyze.inputs[0]._id
+    ui.values[analyze.inputs[1]._id] = "test-key"
+    for setting in analyze.inputs:
+        if isinstance(setting, gr.Checkbox):
+            ui.values[setting._id] = False
+    sections = [
+        BookSection([
+            PhraseGroup([Phrase("word " * 3200, Reason.PARAGRAPH)]),
+            PhraseGroup([Phrase(f"“{line}”", Reason.SECTION_BREAK)], is_dialog=True),
+        ])
+        for line in ("First.", "Second.")
+    ]
+    original = BookSession(Book(sections=sections), str(tmp_path), attribution_dir=str(tmp_path))
+    requested = []
+
+    def post(_http, _url, **kwargs):
+        prompt = kwargs["json"]["messages"][1]["content"]
+        requested.append("first" if "Current passage, starting at line 1:" in prompt else "second")
+        if len(requested) in (1, 3):
+            raise requests.Timeout()
+        response = requests.Response()
+        response.status_code = 200
+        reply = {"characters": [], "speakers": {"1": "UNKNOWN"}, "uncertain": []}
+        response._content = json.dumps({"choices": [{"message": {"content": json.dumps(reply)}}]}).encode()
+        return response
+
+    monkeypatch.setattr(requests.Session, "post", post)
+
+    async def exercise():
+        (empty,) = await ui.run(analyze)
+        assert "saved project" in empty[-1]["value"] and "segmentation settings" in empty[-1]["value"]
+        assert requested == []
+
+        ui.state[state_id] = original
+        failed = await ui.run(analyze)
+        assert "timed out" in failed[-1][-1]["value"]
+        assert ui.state[state_id] is original
+
+        partial = await ui.run(analyze)
+        assert "1 of 2 dialogue chunks complete" in partial[-1][-1]["value"]
+        assert len(ui.state[state_id].attributions.ranges) == 1
+
+        complete = await ui.run(analyze)
+        assert "2 of 2 dialogue chunks complete" in complete[-1][-1]["value"]
+        assert len(ui.state[state_id].attributions.ranges) == 2
+        assert requested == ["first", "first", "second", "second"]
 
     asyncio.run(exercise())
 
@@ -658,6 +720,11 @@ def test_library_selection_reaches_samples_cast_and_saved_project(tmp_path, monk
 
 def test_saved_analysis_status_returns_on_reopen_and_clears_on_import(tmp_path, monkeypatch):
     monkeypatch.setenv("GRADIO_TEMP_DIR", str(tmp_path / "cache"))
+    recovery_dir = tmp_path / "recovery"
+    recovery_dir.mkdir()
+    monkeypatch.setattr(web_analysis_recovery, "recovery_root", lambda: recovery_dir)
+    recovery_notice = "Dialogue recovery available with 1 saved chunk range."
+    monkeypatch.setattr(web_analysis_recovery, "available_notice", lambda _directory: recovery_notice)
     monkeypatch.setattr(gradio_app, "installed_model_choices", lambda: [("Breeze TTS 2", "venv-breeze")])
     project_root = tmp_path / "projects"
     for method in ("create_project", "list_projects", "load_project"):
@@ -678,7 +745,8 @@ def test_saved_analysis_status_returns_on_reopen_and_clears_on_import(tmp_path, 
         analysis_status = analyze.outputs[-1]
         ui.values[load.inputs[2]._id] = "manual"
         ui.values[load.inputs[5]._id] = "“Hello.”"
-        await ui.run(load)
+        (imported,) = await ui.run(load)
+        assert imported[load.outputs.index(analysis_status)]["value"] == recovery_notice
         ui.values[analyze.inputs[1]._id] = "fixture-key"
         await ui.run(analyze)
         ui.values[save.inputs[0]._id] = "Skipped analysis"
@@ -687,8 +755,9 @@ def test_saved_analysis_status_returns_on_reopen_and_clears_on_import(tmp_path, 
         (opened,) = await ui.run(reopen, project.project_id, None)
         reopened_status = opened[reopen.outputs.index(analysis_status)]
         assert reopened_status["visible"] is True
-        assert reopened_status["value"] == f"{notice} [redacted]"
+        assert reopened_status["value"] == f"{notice} [redacted] {recovery_notice}"
 
+        monkeypatch.setattr(web_analysis_recovery, "available_notice", lambda _directory: "")
         ui.values[load.inputs[5]._id] = "A different book."
         (imported,) = await ui.run(load)
         cleared_status = imported[load.outputs.index(analysis_status)]

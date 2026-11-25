@@ -472,7 +472,7 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
         def present_book(session, voices, problem=None):
             table, roles = _review_components(session)
             has_text = session is not None and bool(session.book.sections)
-            notice = session.attribution_notice if session else ""
+            notice = f"{session.attribution_notice} {session.analysis_recovery_notice}".strip() if session else ""
             return (
                 session,
                 voices,
@@ -736,6 +736,16 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
         def analyze_book(session, key, model, reasoning, endpoint, settings_json, selected_role, use_qwen, thinking,
                          character_voices, performance_cues, request: gr.Request):
             activity = activity_panel.session(request.session_hash)
+            if session is None:
+                message = (
+                    "This tab has no active book. Open your saved project, or import the same book with its "
+                    "original segmentation settings. If a recovery checkpoint is available, use the matching "
+                    "analysis settings and select Analyze book to resume."
+                )
+                activity.write(message + "\n")
+                yield gr.skip(), gr.skip(), gr.skip(), voice_status(message)
+                return
+
             chunk = (0, 0, "Preparing book analysis")
             work = None
             last_console_phase = ""
@@ -771,8 +781,6 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
             message = None
             try:
                 activity.update_analysis(*chunk)
-                if session is None:
-                    raise WebBackendError("Import book text first.")
                 if not use_qwen and not secret:
                     secret = load_api_key(endpoint or "")
                 if secret and secret in (endpoint or ""):
