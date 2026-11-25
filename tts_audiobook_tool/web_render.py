@@ -740,6 +740,7 @@ def _checkpoint_id(
     voice_labels: list[str] | None = None,
 ) -> str:
     voice_settings = []
+    clip_digests: dict[str, str] = {}
     defaults = asdict(RenderVoice())
     uses_builtin_presets = model_id == "pocket_local" or (
         model_id == "qwen3tts_local" and (model_options or {}).get("model_type") == "custom_voice"
@@ -748,12 +749,14 @@ def _checkpoint_id(
         clip_digest = ""
         has_active_preset = uses_builtin_presets and model_id in dict(voice.presets)
         if voice.reference_path and not has_active_preset:
-            try:
-                with Path(voice.reference_path).open("rb") as clip:
-                    clip_digest = hashlib.file_digest(clip, "sha256").hexdigest()
-            except OSError as error:
-                label = voice_labels[index] if voice_labels is not None else _voice_label(index, voice.name)
-                raise WebRenderError(f"{label} reference audio is unavailable.") from error
+            if voice.reference_path not in clip_digests:
+                try:
+                    with Path(voice.reference_path).open("rb") as clip:
+                        clip_digests[voice.reference_path] = hashlib.file_digest(clip, "sha256").hexdigest()
+                except OSError as error:
+                    label = voice_labels[index] if voice_labels is not None else _voice_label(index, voice.name)
+                    raise WebRenderError(f"{label} reference audio is unavailable.") from error
+            clip_digest = clip_digests[voice.reference_path]
         settings = asdict(voice)
         del settings["reference_path"]
         voice_key = [clip_digest, settings.pop("transcript").strip(), settings.pop("instructions").strip()]
@@ -815,6 +818,7 @@ def render_book(
     batch_size: int = PROJECT_BATCH_SIZE_DEFAULT,
     on_progress: Callable[[int, int], None] | None = None,
     on_telemetry: Callable[[BookRenderTelemetry], None] | None = None,
+    on_checkpoint_progress: Callable[[Project], None] | None = None,
     cancel_event: threading.Event | None = None,
     model_options: dict[str, object] | None = None,
     first_line: int = 1,
@@ -889,7 +893,7 @@ def render_book(
                 return _render_book_checkpoint(
                     work, book, references, language_code, validate_audio,
                     batch_size, on_progress, cancel_event, model=model, model_options=options,
-                    on_telemetry=on_telemetry,
+                    on_telemetry=on_telemetry, on_checkpoint_progress=on_checkpoint_progress,
                     word_substitutions=session.word_substitutions, selected=selected, regenerate=regenerate,
                     auto_concat=auto_concat, strictness=tolerance, max_retries=max_retries,
                     runtime_settings=runtime_settings,
@@ -912,6 +916,7 @@ def _render_book_checkpoint(
     cancel_event: threading.Event | None,
     *,
     on_telemetry: Callable[[BookRenderTelemetry], None] | None,
+    on_checkpoint_progress: Callable[[Project], None] | None,
     model: TtsModelType,
     model_options: dict[str, object],
     word_substitutions: dict[str, str],
@@ -986,6 +991,8 @@ def _render_book_checkpoint(
                 eta_seconds = update.eta_seconds
                 completed = update.saved if update.saved is not None else update.processed
                 report_progress(total - update.total + completed)
+                if on_checkpoint_progress is not None:
+                    on_checkpoint_progress(state.project)
 
             def report_generation_stats(update: GenerationStats) -> None:
                 nonlocal synthesis_seconds, audio_seconds

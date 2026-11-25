@@ -109,7 +109,9 @@ def test_combined_chunks_resume_checkpoints_and_reuse_manual_corrections(tmp_pat
     assert "3/3 reused saved speaker labels for 1 quote" in "".join(logs)
 
     corrected = web_dialogue.correct_speaker(complete, 0, 1, "NOT_SPEECH")
-    cached = web_backend.analyze_book_dialogue(corrected, "", on_log=logs.append)
+    # The correction is recoverable with the roster even from the original browser state.
+    cached = web_backend.analyze_book_dialogue(session, "", on_log=logs.append)
+    assert cached.roster == corrected.roster
     assert len(prompts) == 6
     assert cached.attributions.speaker_of_each_line(book)[1] == "NOT_SPEECH"
 
@@ -252,13 +254,17 @@ def test_combined_analysis_only_requests_missing_quotes_inside_a_chunk(tmp_path,
         _group("“First.” ", Reason.PARAGRAPH, dialogue=True),
         _group("“Second.” ", Reason.PARAGRAPH, dialogue=True),
     ])])
-    existing = RangeAttribution(0, 1, UtteranceUtil.range_text_hash(book, 0, 1), (
+    # A matching saved range alone cannot certify that both quotes were tagged.
+    existing = RangeAttribution(0, 2, UtteranceUtil.range_text_hash(book, 0, 2), (
         UtteranceAttribution((0,), "ANNA"),
     ))
     session = web_backend.BookSession(
         book, str(tmp_path), roster=Roster((RosterCharacter("ANNA", "Anna"),)),
         attributions=AttributionsFile((existing,)),
     )
+    assert web_backend.book_cast_problem(session, first_line=1, last_line=1) is None
+    assert web_backend.book_cast_problem(session, first_line=2, last_line=2)
+    assert not web_dialogue.dialogue_sections(session)
     invalid = _response(_reply({}))
     responses = iter([invalid, invalid, invalid, _response(_reply({"2": "NOT_SPEECH"}))])
 
@@ -279,6 +285,8 @@ def test_combined_analysis_only_requests_missing_quotes_inside_a_chunk(tmp_path,
     finally:
         web_backend.close_book_session(reopened)
     assert result.attributions.speaker_of_each_line(book) == {0: "ANNA", 1: "NOT_SPEECH"}
+    assert web_backend.book_cast_problem(result) is None
+    assert web_dialogue.dialogue_sections(result)
 
 
 def test_combined_analysis_adds_delivery_without_replacing_saved_speakers(tmp_path, monkeypatch):

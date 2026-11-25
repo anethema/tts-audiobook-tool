@@ -18,7 +18,7 @@ from tts_audiobook_tool.app_types import (
     ExportType, HighShelfEq, MinSegmentSentenceSilence, NormalizationType, RoomReverbStereo, RoomTone, SectionMarkerMode,
 )
 from tts_audiobook_tool.constants import (
-    AAC_BITRATE_DEFAULT, AAC_BITRATES, PROJECT_JSON_FILE_NAME, PROJECT_SOUND_SEGMENTS_SUBDIR, PROJECT_TEXT_FILE_NAME,
+    AAC_BITRATE_DEFAULT, AAC_BITRATES, PROJECT_CONCAT_SUBDIR, PROJECT_JSON_FILE_NAME, PROJECT_SOUND_SEGMENTS_SUBDIR, PROJECT_TEXT_FILE_NAME,
     PROJECT_TEXT_RAW_FILE_NAME,
 )
 from tts_audiobook_tool.constants_config import SILENCE_GAP_DURATION_MAX, SILENCE_GAP_DURATION_MIN
@@ -177,7 +177,7 @@ def review_book_line(session: BookSession, run_id: str, line: int) -> BookLineRe
         index = _line_index(line, len(project.phrase_groups))
         best = project.sound_segments.get_best_item_for(index)
         takes = []
-        for item in project.sound_segments.sound_segments_map.get(index, []):
+        for item in project.sound_segments.get_items_for(index):
             rank = get_segment_error_rank(item, project.sound_segments_path)
             takes.append(BookTake(
                 item.file_name, None if rank == UNKNOWN_ERROR_RANK and item.num_errors < 0 else rank,
@@ -217,12 +217,12 @@ def list_book_exports(session: BookSession, run_id: str) -> tuple[tuple[str, str
     directory = _run_directory(session, run_id)
     default = _resolved_export(directory, directory / "audiobook.abr.m4b")
     files = [] if default is None else [(default.name, default.name)]
-    with _open_render_project(directory) as project:
-        if Path(project.concat_path).is_symlink():
-            return tuple(files)
-        for filename, timestamp in ProjectUtil.get_latest_concat_files(project, limit=sys.maxsize):
-            if path := _resolved_export(directory, Path(filename)):
-                files.append((f"{path.name} · {timestamp}", path.relative_to(directory).as_posix()))
+    combined = directory / PROJECT_CONCAT_SUBDIR
+    if combined.is_symlink():
+        return tuple(files)
+    for filename, timestamp in ProjectUtil.list_concat_files(str(combined), limit=sys.maxsize):
+        if path := _resolved_export(directory, Path(filename)):
+            files.append((f"{path.name} · {timestamp}", path.relative_to(directory).as_posix()))
     return tuple(files)
 
 
@@ -317,7 +317,10 @@ def export_book_audio_parts(
             if parent.is_symlink():
                 raise WebBookOutputError("The export folder is unavailable.")
             title = app_text.sanitize_for_filename(project.book.title)[:70].strip(" ._") or "Audiobook"
-            with tempfile.TemporaryDirectory(dir=directory, prefix=".export-") as scratch:
+            with (
+                tempfile.TemporaryDirectory(dir=directory, prefix=".export-") as scratch,
+                _export_upsampler(options.use_upsampler),
+            ):
                 staged = Path(scratch)
                 publication = staged / "files"
                 publication.mkdir()
@@ -329,8 +332,8 @@ def export_book_audio_parts(
                         stem += f" [{part} of {len(ranges)}]"
                     if start != 0 or end != count - 1:
                         stem += f" [Lines {start + 1}-{end + 1}]"
-                    path, error = _make_audio_file(
-                        state, start, end, bookmark_indices, str(staged / stem), options.use_upsampler,
+                    path, error = ConcatUtil.make_file(
+                        state, start, end, bookmark_indices, str(staged / stem), use_upsampler=options.use_upsampler,
                     )
                     if error or _resolved_export(staged, Path(path)) is None:
                         if error:
@@ -381,11 +384,11 @@ def _bookmark_indices(
     return indices
 
 
-def _make_audio_file(state, first_idx, last_idx, bookmarks, destination, use_upsampler):
-    from tts_audiobook_tool.concat_util import ConcatUtil
-
-    if not use_upsampler:
-        return ConcatUtil.make_file(state, first_idx, last_idx, bookmarks, destination, use_upsampler=False)
+@contextmanager
+def _export_upsampler(enabled: bool) -> Iterator[None]:
+    if not enabled:
+        yield
+        return
 
     from tts_audiobook_tool.model_worker import ModelWorker
     from tts_audiobook_tool.model_runtime import mark_interactive_main
@@ -395,6 +398,6 @@ def _make_audio_file(state, first_idx, last_idx, bookmarks, destination, use_ups
         available, error = ModelWorker.probe_lava_sr_blocking()
         if error or not available:
             raise WebBookOutputError("LavaSR v2 is unavailable in the browser server's environment.")
-        return ConcatUtil.make_file(state, first_idx, last_idx, bookmarks, destination, use_upsampler=True)
+        yield
     finally:
         ModelWorker.shutdown()

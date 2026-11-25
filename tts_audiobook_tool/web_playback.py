@@ -27,7 +27,8 @@ from tts_audiobook_tool.web_remote_models import (
 )
 
 if TYPE_CHECKING:
-    from tts_audiobook_tool.app_types import Book
+    from tts_audiobook_tool.app_types import Book, SoundSegment
+    from tts_audiobook_tool.project import Project
     from tts_audiobook_tool.web_backend import BookSession
     from tts_audiobook_tool.web_render import RenderVoice
     from tts_audiobook_tool.web_runtime_settings import WebRuntimeSettings
@@ -158,24 +159,29 @@ def _check_cancelled(cancel: Event) -> None:
         raise WebPlaybackError("Playback stopped.")
 
 
-def _best_takes(work: Path, book: Book, first: int, last: int) -> dict[int, Path]:
-    from tts_audiobook_tool.project_support.sound_segment_util import SoundSegmentUtil, get_segment_error_rank
-    from tts_audiobook_tool.sound.checkpoint_audio import has_complete_audio
+def _take_index(work: Path, book: Book) -> dict[int, list[SoundSegment]]:
+    from tts_audiobook_tool.project_support.sound_segment_util import SoundSegmentUtil
 
     audio = work / PROJECT_SOUND_SEGMENTS_SUBDIR
     if work.is_symlink() or audio.is_symlink() or not audio.is_dir():
         return {}
     source = SimpleNamespace(dir_path=str(work), sound_segments_path=str(audio), phrase_groups=book.phrase_groups)
-    takes = SoundSegmentUtil.make_sound_segments_map(source)
-    result = {}
-    for index in range(first - 1, last):
-        candidates = sorted(takes.get(index, ()), key=lambda take: get_segment_error_rank(take, audio))
-        for take in candidates:
-            path = audio / take.file_name
-            if not path.is_symlink() and has_complete_audio(path):
-                result[index + 1] = path
-                break
-    return result
+    return SoundSegmentUtil.make_sound_segments_map(source)
+
+
+def _best_take(audio: Path, candidates: list[SoundSegment] | None) -> Path | None:
+    from tts_audiobook_tool.project_support.sound_segment_util import get_segment_error_rank
+    from tts_audiobook_tool.sound.checkpoint_audio import has_complete_audio
+
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        candidates = sorted(candidates, key=lambda take: get_segment_error_rank(take, audio))
+    for take in candidates:
+        path = audio / take.file_name
+        if not path.is_symlink() and has_complete_audio(path):
+            return path
+    return None
 
 
 class _PlaybackAudio:
@@ -279,15 +285,19 @@ def _run_playback(
             max_retries=retries, **renderer_options,
         )
     root = Path(session.project_dir) / "renders"
-    existing = _best_takes(root / run_id, book, first, last) if not root.is_symlink() else {}
+    existing = _take_index(root / run_id, book) if not root.is_symlink() else {}
+    original_audio = root / run_id / PROJECT_SOUND_SEGMENTS_SUBDIR
     encoder = _PlaybackAudio()
     pauses = ReasonPauseTypes.default().value
     next_line = first
 
-    def send_ready(takes: dict[int, Path]) -> None:
+    def send_ready(audio: Path, items_for: Callable[[int], list[SoundSegment] | None]) -> None:
         nonlocal next_line
-        while next_line <= last and next_line in takes:
+        while next_line <= last:
             _check_cancelled(cancel)
+            take = _best_take(audio, items_for(next_line - 1))
+            if take is None:
+                break
             # Limit staged browser chunks without blocking the model's disk writes.
             while next_line >= first + 12 and _ready_path(directory, next_line - 12).exists():
                 _check_cancelled(cancel)
@@ -296,14 +306,14 @@ def _run_playback(
             pause = 0.0
             if next_line < last and group.phrases:
                 pause = pauses.get_join_pause(group.phrases[-1], book.phrase_groups[next_line].text)
-            wave = encoder.wave(takes[next_line], references[group.voice_index], pause, next_line == last)
+            wave = encoder.wave(take, references[group.voice_index], pause, next_line == last)
             path = _ready_path(directory, next_line)
             temporary = path.with_suffix(".tmp")
             temporary.write_bytes(wave)
             temporary.replace(path)
             next_line += 1
 
-    send_ready(existing)
+    send_ready(original_audio, existing.get)
     if next_line > last:
         return
     # Keep new synthesis temporary. Reviewable book takes and their manifests
@@ -312,23 +322,24 @@ def _run_playback(
     stage = work / "renders" / run_id
     audio = stage / PROJECT_SOUND_SEGMENTS_SUBDIR
     audio.mkdir(parents=True)
-    for line, path in existing.items():
-        if line >= next_line:
+    for index, candidates in existing.items():
+        if next_line <= index + 1 <= last:
             _check_cancelled(cancel)
-            shutil.copyfile(path, audio / path.name)
+            if path := _best_take(original_audio, candidates):
+                shutil.copyfile(path, audio / path.name)
 
-    def report(_current: int, _total: int) -> None:
-        _check_cancelled(cancel)
-        if next_line <= last:
-            send_ready(_best_takes(stage, book, next_line, last))
+    def report(project: Project) -> None:
+        send_ready(audio, project.sound_segments.get_items_for)
 
     render_book(
         replace(session, project_dir=str(work)), voices, validate_audio=validate, batch_size=batch,
         model_options=options, strictness=strictness, max_retries=retries, first_line=next_line, last_line=last,
         performance_cues=performance_cues, character_voices=character_voices,
-        auto_concat=False, cancel_event=cancel, on_progress=report, on_console=on_console, **renderer_options,
+        auto_concat=False, cancel_event=cancel, on_checkpoint_progress=report, on_console=on_console, **renderer_options,
     )
-    report(0, 0)
+    if next_line <= last:
+        # A final file can reach disk ahead of its directory watcher event.
+        send_ready(audio, _take_index(stage, book).get)
     if next_line <= last:
         raise WebPlaybackError(f"Audio is unavailable for line {next_line:,}.")
 

@@ -20,7 +20,6 @@ from tts_audiobook_tool.model_worker import ModelWorker
 from tts_audiobook_tool.project_support.project_book_util import ProjectBookUtil
 from tts_audiobook_tool.project_support.voice_spatial_policy import VoiceSpatialPolicy
 from tts_audiobook_tool.project_support.project_serialization_util import ProjectSerializationUtil
-from tts_audiobook_tool.project_support.project_text_io_util import ProjectTextIOUtil
 from tts_audiobook_tool.project_support.segment_transcript_util import SegmentTranscriptUtil
 from tts_audiobook_tool.sound.loudness_leveling import LevelingStats, LoudnessLeveling
 from tts_audiobook_tool.sound import audio_writers, m4b_chapter_util
@@ -168,16 +167,16 @@ class ConcatUtil:
         start_time = time.time()
 
         # Preflight checks
-        lava_sr_available, lava_probe_error = ModelWorker.probe_lava_sr_blocking()
-        if lava_probe_error:
-            lava_sr_available = False
-        use_upsampler = state.project.use_upsampler and lava_sr_available
-        if state.project.use_upsampler and not lava_sr_available:
-            printt(
-                f"{COL_DIM_ITALICS}Warning: LavaSR v2 upsampling is enabled, "
-                "but LavaSR is not installed. Continuing without upsampling."
-            )
-            printt()
+        use_upsampler = state.project.use_upsampler
+        if use_upsampler:
+            available, error = ModelWorker.probe_lava_sr_blocking()
+            use_upsampler = available and not error
+            if not use_upsampler:
+                printt(
+                    f"{COL_DIM_ITALICS}Warning: LavaSR v2 upsampling is enabled, "
+                    "but LavaSR is not installed. Continuing without upsampling."
+                )
+                printt()
         if use_upsampler:
             unload_error = ConcatUtil.unload_models_for_upsampling()
             if unload_error:
@@ -302,16 +301,6 @@ class ConcatUtil:
         Returns successful file path, error message if any
         """
 
-        # Load raw text for app metadata. If unavailable, continue with a
-        # phrase-group fallback rather than aborting concat.
-        raw_text = ProjectTextIOUtil.load_raw_text(state.project)
-        if not raw_text:
-            raw_text = "\n".join(
-                group.as_flattened_phrase().text for group in state.project.phrase_groups
-            )
-            if not raw_text:
-                raw_text = ""
-
         # Intermediate file paths etc
 
         is_aac = (state.project.export_type == ExportType.AAC)
@@ -332,9 +321,10 @@ class ConcatUtil:
         high_shelf = HighShelfEq.get_by_id(state.project.high_shelf) or HighShelfEq.DISABLED
 
         # Make phrase/path list # TODO: Duplicated logic; refactor OutputRangeInfo and add phrase info etc
-        phrases_and_paths = ConcatUtil.make_phrases_and_paths(
-            state.project, index_start, index_end
-        )
+        try:
+            phrases_and_paths = ConcatUtil.make_phrases_and_paths(state.project, index_start, index_end)
+        except OSError as error:
+            return "", make_error_string(error)
         section_start_indices = ProjectBookUtil.get_section_start_indices(state.project)
         spatial_policy = VoiceSpatialPolicy.from_project(state.project)
         voice_pans = [
@@ -446,7 +436,7 @@ class ConcatUtil:
             timed_phrases=timed_phrases,
             title=state.project.book.title,
             version=ABR_VERSION,
-            raw_text=raw_text,
+            raw_text="",  # Legacy field, omitted from current ABR files.
             bookmark_indices=bookmark_indices,
             has_break_audio=state.project.use_break_sound_effect,
             project_snapshot=ProjectSerializationUtil.to_snapshot_dict(state.project),
@@ -496,7 +486,7 @@ class ConcatUtil:
             if out_of_range:
                 file_path = ""
             else:
-                file_name = project.sound_segments.get_best_file_for(group_index)
+                file_name = project.sound_segments.get_export_file_for(group_index)
                 if file_name:
                     file_path = os.path.join(project.sound_segments_path, file_name)
                 else:
@@ -511,15 +501,8 @@ class ConcatUtil:
         index_start: int,
         index_end: int
     ) -> int:
-        num_missing = 0
-        for group_index in range(len(project.phrase_groups)):
-            out_of_range = (group_index < index_start or group_index > index_end)
-            if out_of_range:
-                continue
-            file_name = project.sound_segments.get_best_file_for(group_index)
-            if not file_name:
-                num_missing += 1
-        return num_missing
+        indices = range(max(0, index_start), min(index_end + 1, len(project.phrase_groups)))
+        return sum(not project.sound_segments.get_filenames_for(i) for i in indices)
 
     @staticmethod
     def concatenate_sound_segments(
@@ -1088,10 +1071,7 @@ def make_stem(
     extant_file_paths: list[str] = []
     num_missing = 0
 
-    for group_index in range(len(project.phrase_groups)):
-        out_of_range = (group_index < index_start or group_index > index_end)
-        if out_of_range:
-            continue
+    for group_index in range(max(0, index_start), min(index_end + 1, len(project.phrase_groups))):
         stem = project.sound_segments.get_best_file_for(group_index)
         if stem:
             file_path = os.path.join(project.sound_segments_path, stem)

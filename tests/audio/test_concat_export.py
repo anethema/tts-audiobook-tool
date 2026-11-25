@@ -221,7 +221,7 @@ def test_make_file_end_to_end_m4b(out_dir: Path, checkpoint_suffix: str) -> None
     stem = str(out_dir / "Buch ü")
 
     with no_ffmpeg_exe(), \
-            patch.object(ProjectTextIOUtil, "load_raw_text", return_value="\n".join(TITLES)), \
+            patch.object(ProjectTextIOUtil, "load_raw_text", side_effect=AssertionError("Raw text is not exported")), \
             patch.object(ConcatUtil, "make_phrases_and_paths", return_value=pairs), \
             patch("tts_audiobook_tool.concat_util.DEV", False):
         final_path, error = ConcatUtil.make_file(cast(State, state), 0, len(TITLES) - 1, [], stem, use_upsampler=False)

@@ -38,6 +38,9 @@ def make_fake_project(num_groups: int, missing_indices: frozenset[int] = frozens
         return "" if index in missing_indices else f"seg{index}.flac"
 
     project.sound_segments.get_best_file_for.side_effect = get_best_file_for
+    project.sound_segments.get_filenames_for.side_effect = lambda index: (
+        [] if index in missing_indices else [get_best_file_for(index)]
+    )
     return project
 
 

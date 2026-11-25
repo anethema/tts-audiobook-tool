@@ -53,6 +53,25 @@ def test_with_range_replaces_and_makes_newest() -> None:
     assert file.speakers_by_line(BOOK) == {0: "HELENE", 2: "DIDIER"}
 
 
+def test_newer_range_reassigns_continuation_after_two_partial_ranges() -> None:
+    book = make_book([
+        ("“Come ", Reason.SENTENCE, DIALOG),
+        ("back.” ", Reason.PARAGRAPH, DIALOG),
+    ])
+    def saved(start, end, lines, speaker):
+        return RangeAttribution(
+            start, end, UtteranceUtil.range_text_hash(book, start, end),
+            (UtteranceAttribution(lines, speaker),),
+        )
+
+    file = AttributionsFile((
+        saved(0, 1, (0,), "ANNA"),
+        saved(1, 2, (1,), "BEN"),
+        saved(0, 2, (0, 1), "CORA"),
+    ))
+    assert file.speaker_of_each_line(book) == {0: "CORA", 1: "CORA"}
+
+
 def test_ranges_whose_text_changed_are_ignored() -> None:
     file = AttributionsFile((attribution(0, 2, {0: "BARON"}), attribution(2, 4, {2: "DIDIER"})))
     edited = make_book([

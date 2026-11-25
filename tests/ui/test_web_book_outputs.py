@@ -86,6 +86,24 @@ def test_review_and_resume_share_aac_take_validation(rendered_book):
         assert project.sound_segments.get_best_item_for(0).num_errors == 2
 
 
+def test_manual_export_uses_an_intact_alternate_without_deleting_takes(rendered_book):
+    session, directory, best = rendered_book
+    preferred = directory / "segments" / best
+    preferred.write_bytes(b"truncated FLAC")
+    result = web_book_outputs.export_book_audio(
+        session, RUN_ID, first_line=1, last_line=1,
+        options=web_book_outputs.BookExportOptions(export_type=ExportType.FLAC),
+    )
+    assert result.missing_lines == 0
+    assert soundfile.info(result.path).duration >= 1
+    assert preferred.read_bytes() == b"truncated FLAC"
+    for take in preferred.parent.glob("[[]00001]*.flac"):
+        take.write_bytes(b"truncated FLAC")
+    with pytest.raises(web_book_outputs.WebBookOutputError, match="could not be exported"):
+        web_book_outputs.export_book_audio(session, RUN_ID, first_line=1, last_line=1)
+    assert len(web_book_outputs.list_book_exports(session, RUN_ID)) == 1
+
+
 def test_render_review_uses_stored_text_and_native_take_ranking(rendered_book):
     session, directory, best = rendered_book
     (directory.parent / ("b" * 64)).mkdir()
@@ -181,7 +199,7 @@ def test_split_validation_runs_before_writing_and_errors_do_not_publish_parts(re
     session, directory, _ = rendered_book
     calls = []
 
-    def make_file(_state, start, end, _marks, stem, _upsample):
+    def make_file(_state, start, end, _marks, stem, *, use_upsampler):
         calls.append((start, end))
         if start:
             return "", "Simulated encoding failure"
@@ -189,7 +207,8 @@ def test_split_validation_runs_before_writing_and_errors_do_not_publish_parts(re
         output.write_bytes(b"First part")
         return str(output), ""
 
-    monkeypatch.setattr(web_book_outputs, "_make_audio_file", make_file)
+    from tts_audiobook_tool.concat_util import ConcatUtil
+    monkeypatch.setattr(ConcatUtil, "make_file", make_file)
     with pytest.raises(web_book_outputs.WebBookOutputError, match="Bookmarks are available"):
         web_book_outputs.export_book_audio_parts(session, RUN_ID, cut_lines=(3,), bookmarks=(1,))
     with pytest.raises(web_book_outputs.WebBookOutputError, match="Split lines must be within the export range"):
@@ -205,7 +224,35 @@ def test_split_validation_runs_before_writing_and_errors_do_not_publish_parts(re
     assert not tuple(directory.glob(".export-*"))
 
 
-def test_saved_exports_can_open_all_parts_of_a_split(rendered_book):
+def test_split_export_shares_one_upsampler_and_releases_it_on_error(rendered_book, monkeypatch):
+    from unittest.mock import Mock
+    from tts_audiobook_tool.concat_util import ConcatUtil
+    from tts_audiobook_tool.model_worker import ModelWorker
+
+    session, _, _ = rendered_book
+    probe = Mock(return_value=(True, ""))
+    shutdown = Mock()
+    monkeypatch.setattr(ModelWorker, "probe_lava_sr_blocking", probe)
+    monkeypatch.setattr(ModelWorker, "shutdown", shutdown)
+    monkeypatch.setattr("tts_audiobook_tool.model_runtime.mark_interactive_main", lambda: None)
+    def assemble(_state, start, end, _marks, stem, *, use_upsampler):
+        assert use_upsampler and not shutdown.called
+        if start:
+            return "", "Second part failed"
+        path = Path(stem + ".abr.m4b")
+        path.write_bytes(b"staged audio")
+        return str(path), ""
+    monkeypatch.setattr(ConcatUtil, "make_file", assemble)
+    with pytest.raises(web_book_outputs.WebBookOutputError, match="could not be exported"):
+        web_book_outputs.export_book_audio_parts(
+            session, RUN_ID, cut_lines=(3,), options=web_book_outputs.BookExportOptions(use_upsampler=True),
+        )
+    probe.assert_called_once_with()
+    shutdown.assert_called_once_with()
+    assert not web_book_outputs.list_book_exports(session, RUN_ID)
+
+
+def test_saved_exports_can_open_all_parts_of_a_split(rendered_book, monkeypatch):
     session, directory, _ = rendered_book
     with web_book_outputs._open_render_project(directory) as project:
         export_dir = Path(project.concat_path) / "export-twelve"
@@ -213,6 +260,9 @@ def test_saved_exports_can_open_all_parts_of_a_split(rendered_book):
     files = [export_dir / f"Book [{part} of 12].abr.flac" for part in range(1, 13)]
     for file in files:
         file.write_bytes(b"Saved audio")
+    def unexpected_open(*args, **kwargs):
+        pytest.fail("Listing completed exports should not reopen the rendering project")
+    monkeypatch.setattr(web_book_outputs, "_open_render_project", unexpected_open)
     choices = web_book_outputs.list_book_exports(session, RUN_ID)
     assert len(choices) == 12
     assert [web_book_outputs.get_book_export_path(session, RUN_ID, export_id) for _, export_id in choices] == list(map(str, files))

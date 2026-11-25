@@ -1446,7 +1446,7 @@ def test_command_producers_snapshot_live_project_selection(kind, tmp_path, monke
     project.audio_cpp_model_id = "unsaved-server-selection"
     prefs = Prefs(
         project_dir=str(tmp_path), stt_variant=SttVariant.DISABLED,
-        remote_tts_url="http://example.test:9009", tts_force_cpu=True,
+        remote_tts_url="http://example.test:9009", tts_force_cpu=True, aac_bitrate="64k",
         save_debug_files=True,
     )
     state = SimpleNamespace(project=project, prefs=prefs)
@@ -1485,9 +1485,10 @@ def test_command_producers_snapshot_live_project_selection(kind, tmp_path, monke
     assert command.settings.stt_variant_id == SttVariant.DISABLED.id
     assert command.settings.tts_force_cpu is True
     assert command.settings.save_debug_files is True
+    assert command.settings.aac_bitrate == "64k"
     assert {field.name for field in fields(command.settings)} == {
         "stt_variant_id", "stt_config_id", "tts_force_cpu", "tts_model_type_id",
-        "remote_tts_url", "save_debug_files", "audio_cpp_model_id",
+        "remote_tts_url", "save_debug_files", "audio_cpp_model_id", "aac_bitrate",
     }
     # A queued snapshot remains independent of further live edits.
     project.tts_model_type = "vibevoice_local"

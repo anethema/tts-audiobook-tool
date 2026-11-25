@@ -256,6 +256,26 @@ def test_voice_settings_remain_hashable_across_worker_json_and_change_checkpoint
     assert len(ids) == len(variations)
 
 
+def test_checkpoint_reads_each_shared_reference_once_and_detects_edits(tmp_path, monkeypatch):
+    clip = tmp_path / "voice.wav"
+    clip.write_bytes(b"original")
+    narrator = web_render.RenderVoice(reference_path=str(clip))
+    cast = [narrator, replace(narrator, instructions="Softly.")]
+    original_digest = hashlib.file_digest
+    reads = []
+
+    def record_digest(file, algorithm):
+        reads.append(file.name)
+        return original_digest(file, algorithm)
+
+    monkeypatch.setattr(hashlib, "file_digest", record_digest)
+    args = (Book([]), cast, "breeze_tts_2_local", "en", False, 1)
+    first = web_render._checkpoint_id(*args)
+    clip.write_bytes(b"second")
+    assert web_render._checkpoint_id(*args) != first
+    assert reads == [str(clip), str(clip)]
+
+
 def test_book_checkpoint_retains_default_checksum_and_tracks_validation_and_substitution_order():
     voice = web_render.RenderVoice()
     book = Book([])

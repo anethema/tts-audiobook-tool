@@ -164,6 +164,10 @@ class ProjectUtil:
 
     @staticmethod
     def get_latest_concat_files(project: Project, limit=10) -> list[tuple[str, str]]:
+        return ProjectUtil.list_concat_files(project.concat_path, limit)
+
+    @staticmethod
+    def list_concat_files(concat_dir: str, limit: int) -> list[tuple[str, str]]:
         """
         Finds latest concatenated audio files within the project's concat directory,
         returning up to `limit` tuples of (path, modified_date) where modified_date is
@@ -174,7 +178,6 @@ class ProjectUtil:
         if limit <= 0:
             return []
 
-        concat_dir = project.concat_path
         if not concat_dir or not os.path.exists(concat_dir):
             return []
         

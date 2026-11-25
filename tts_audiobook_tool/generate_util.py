@@ -418,15 +418,24 @@ class GenerateUtil:
             # Generate and validate
             gen_start_time = monotonic()
             with gen_timeout_tracker.scope() as gen_timeout_guard:
-                results = GenerateUtil.generate_and_validate_batch(
-                    state=state,
-                    indices=indices,
-                    phrase_groups=project.phrase_groups,
-                    stt_variant=stt_variant, stt_config=stt_config,
-                    force_random_seed=is_regen or any(count > 0 for count in retry_counts),
-                    is_realtime=False,
-                    voice_selection_index=sub.voice_selection_index,
-                )
+                try:
+                    results = GenerateUtil.generate_and_validate_batch(
+                        state=state,
+                        indices=indices,
+                        phrase_groups=project.phrase_groups,
+                        stt_variant=stt_variant, stt_config=stt_config,
+                        force_random_seed=is_regen or any(count > 0 for count in retry_counts),
+                        is_realtime=False,
+                        voice_selection_index=sub.voice_selection_index,
+                    )
+                except RuntimeError as error:
+                    # Some GPU backends raise during lazy initialization, before
+                    # synthesis/Whisper can return a per-line OOM result.
+                    message = f"{type(error).__name__}: {error}"
+                    if type(error).__name__ != "OutOfMemoryError" and "out of memory" not in str(error).lower():
+                        raise
+                    printt(f"{COL_ERROR}{message}")
+                    results = [TtsModelError(message)]
             if gen_timeout_guard.did_time_out:
                 # The watchdog already reported the timeout and requested the
                 # worker reset; abort the run regardless of any pending cancel.

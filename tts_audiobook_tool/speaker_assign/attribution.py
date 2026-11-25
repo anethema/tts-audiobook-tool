@@ -167,6 +167,9 @@ class AttributionsFile:
         result: dict[int, UtteranceAttribution] = {}
         for attribution in self.valid_ranges(book):
             for utterance in attribution.utterances:
+                # Line-level consumers apply these in order. A reassigned quote
+                # must take precedence over older assignments to its continuation.
+                result.pop(utterance.first_line, None)
                 result[utterance.first_line] = utterance
         return result
 

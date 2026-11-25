@@ -231,18 +231,12 @@ def book_cast_problem(
         return None
 
     speakers = session.attributions.speaker_of_each_line(session.book)
-    unattributed = {
-        index for index in range(first_line - 1, last_line)
-        if groups[index].is_dialog and index not in speakers
+    if any(
+        groups[index].is_dialog and index not in speakers
         and not (groups[index].voice_index > 0 and groups[index].voice_index in session.line_voices)
-    }
-    if unattributed:
-        for chunk in AssignPlan.make(session.book, session.attributions).chunks:
-            if chunk.done:
-                unattributed.difference_update(range(max(first_line - 1, chunk.start), min(last_line, chunk.end)))
-        if unattributed:
-            return "Run Analyze book for the selected lines before generating audio."
-
+        for index in range(first_line - 1, last_line)
+    ):
+        return "Run Analyze book for the selected lines before generating audio."
     return None
 
 

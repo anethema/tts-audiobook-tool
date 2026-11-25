@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
+from functools import lru_cache
 from hashlib import sha256
 import json
 import math
@@ -85,13 +86,23 @@ def list_projects(*, root: str | os.PathLike[str] | None = None) -> list[Project
             if not _PROJECT_ID.fullmatch(project_dir.name) or not _is_directory(project_dir):
                 continue
             try:
-                _, metadata = _read_snapshot(project_dir)
-                summaries.append(_summary(project_dir.name, metadata))
-            except WebProjectError:
+                stamp = (project_dir / PROJECT_TEXT_FILE_NAME).lstat()
+                if stat.S_ISREG(stamp.st_mode):
+                    summaries.append(_listed_summary(
+                        project_dir, (stamp.st_dev, stamp.st_ino, stamp.st_size, stamp.st_mtime_ns, stamp.st_ctime_ns),
+                    ))
+            except (OSError, WebProjectError):
                 continue
     except OSError:
         raise WebProjectError("Could not list saved projects.") from None
     return sorted(summaries, key=lambda item: item.updated, reverse=True)
+
+
+@lru_cache(maxsize=1024)
+def _listed_summary(project_dir: Path, _file_stamp: tuple[int, ...]) -> ProjectSummary:
+    """Cache only dropdown details. The stamp changes on external edits and atomic saves."""
+    _, metadata = _read_snapshot(project_dir)
+    return _summary(project_dir.name, metadata)
 
 
 def open_project_folder(project_id: str, *, root: str | os.PathLike[str] | None = None) -> Path:
@@ -331,9 +342,19 @@ def _save_snapshot(
         raise WebProjectError("Choose a valid character voice setting.")
 
     updated = datetime.now(timezone.utc).isoformat()
-    narrator_data = _save_voice(assets, narrator)
-    voices_data = {speaker_id: _save_voice(assets, voice) for speaker_id, voice in voices.items()}
-    line_voices_data = {str(slot): _save_voice(assets, voice) for slot, voice in session.line_voices.items()}
+    saved_references: dict[str, str] = {}
+
+    def save_voice(voice: RenderVoice) -> dict:
+        data = asdict(voice)
+        source = data.pop("reference_path")
+        if source and source not in saved_references:
+            saved_references[source] = _copy_asset(assets, source)
+        data["reference"] = saved_references.get(source)
+        return data
+
+    narrator_data = save_voice(narrator)
+    voices_data = {speaker_id: save_voice(voice) for speaker_id, voice in voices.items()}
+    line_voices_data = {str(slot): save_voice(voice) for slot, voice in session.line_voices.items()}
     source_name = _copy_asset(assets, source_epub) if source_epub else None
     summary = ProjectSummary(project_dir.name, name, session.book.title, updated)
     _copy_render_runs(Path(session.project_dir), project_dir / "render")
@@ -461,7 +482,7 @@ def _read_snapshot(project_dir: Path) -> tuple[dict, dict]:
         metadata = snapshot["web_project"]
         if metadata["version"] != 1:
             raise ValueError
-    except (KeyError, OSError, TypeError, ValueError):
+    except (KeyError, OSError, RecursionError, TypeError, ValueError):
         raise WebProjectError("The saved project could not be read.") from None
     return snapshot, metadata
 
@@ -493,13 +514,6 @@ def _copy_model_options(data: object) -> dict[str, dict[str, object]]:
                 raise ValueError
         options[model_id] = dict(settings)
     return options
-
-
-def _save_voice(assets: Path, voice: RenderVoice) -> dict:
-    data = asdict(voice)
-    reference_path = data.pop("reference_path")
-    data["reference"] = _copy_asset(assets, reference_path) if reference_path else None
-    return data
 
 
 def _read_voice(project_dir: Path, data: dict) -> RenderVoice:

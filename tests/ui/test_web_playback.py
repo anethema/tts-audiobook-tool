@@ -88,11 +88,14 @@ class TestWebPlayback(unittest.TestCase):
                 stage = Path(session.project_dir) / "renders" / _RUN / PROJECT_SOUND_SEGMENTS_SUBDIR
                 self.assertEqual((stage / third.name).read_bytes(), third.read_bytes())
                 self.assertEqual(Path(session.project_dir).parent, output)
+                empty_index = SimpleNamespace(get_items_for=lambda _: [])
+                for _ in range(10):
+                    settings["on_checkpoint_progress"](SimpleNamespace(sound_segments=empty_index))
                 _write_take(session, 2, 0.25)
-                settings["on_progress"](2, 2)
 
             model = SimpleNamespace(id="breeze_tts_2_local", can_batch=lambda: True)
             with (
+                patch.object(web_playback, "_take_index", wraps=web_playback._take_index) as scans,
                 patch.object(web_render, "_render_job", side_effect=lambda _: nullcontext()),
                 patch.object(web_render, "_detect_model", return_value=model),
                 patch.object(web_render, "_checkpoint_id", return_value=_RUN),
@@ -100,6 +103,7 @@ class TestWebPlayback(unittest.TestCase):
                 patch.object(web_render, "render_book", side_effect=generate),
             ):
                 web_playback._run_playback(output, project, {"NARRATOR": RenderVoice(volume=50)}, payload, Event())
+                self.assertEqual(scans.call_count, 2)  # original checkpoint, then final staging scan
                 payload["first"] = payload["last"] = 3
                 web_playback._run_playback(output, project, {"NARRATOR": RenderVoice(volume=50)}, payload, Event())
             self.assertEqual(len(calls), 1)
@@ -225,8 +229,11 @@ class TestWebPlayback(unittest.TestCase):
                 self.assertEqual(os.environ[WEB_REMOTE_ENTRY_ID_ENV], selected.server_model_id)
                 self.assertEqual((settings["first_line"], settings["last_line"]), (2, 2))
                 self.assertTrue(web_playback._ready_path(Path(staged.project_dir).parent, 1).is_file())
-                _write_take(staged, 2, 0.25, checkpoints[0])
-                settings["on_progress"](1, 1)
+                take = _write_take(staged, 2, 0.25, checkpoints[0])
+                item = SoundSegmentUtil.make_from_file_name(take.name)
+                index = SimpleNamespace(get_items_for=lambda i: [item] if i == 1 else [])
+                settings["on_checkpoint_progress"](SimpleNamespace(sound_segments=index))
+                self.assertTrue(web_playback._ready_path(Path(staged.project_dir).parent, 2).is_file())
 
             def spawn(command, **_):
                 launched.append(command[0])

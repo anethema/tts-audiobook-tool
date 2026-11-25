@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 from tts_audiobook_tool.app_types.delivery_cue import DeliveryCue
-from tts_audiobook_tool.speaker_assign.assign_plan import AssignPlan
 from tts_audiobook_tool.speaker_assign.roster import (
     NEUTRAL_CHARACTER_VOICE_DIRECTION,
     is_current_character_voice_direction,
@@ -14,7 +14,9 @@ from tts_audiobook_tool.speaker_assign.roster import (
 from tts_audiobook_tool.speaker_assign.speaker_assign_file_util import SpeakerAssignFileUtil
 from tts_audiobook_tool.speaker_assign.speaker_assign_types import NOT_SPEECH, OTHER, UNKNOWN
 from tts_audiobook_tool.speaker_assign.utterance_util import UtteranceUtil
-from tts_audiobook_tool.web_backend import BookSession, UNIDENTIFIED_CAST_ROLES, WebBackendError, canonical_cast_role
+from tts_audiobook_tool.web_backend import (
+    BookSession, UNIDENTIFIED_CAST_ROLES, WebBackendError, _save_analysis_checkpoint, canonical_cast_role,
+)
 
 
 _RESERVED_NAMES = {
@@ -50,11 +52,13 @@ def dialogue_sections(session: BookSession | None) -> list[tuple[str, int]]:
     """List reviewable sections after the whole-book assignment has completed."""
     if session is None or session.roster is None or not session.attributions.ranges:
         return []
-    plan = AssignPlan.make(session.book, session.attributions)
-    if not plan.chunks or not plan.is_complete:
+    assignments = session.attributions.by_first_line(session.book)
+    covered = {line for assignment in assignments.values() for line in assignment.lines}
+    dialogue = session.book.dialog_line_indices()
+    if not dialogue or not covered.issuperset(dialogue):
         return []
 
-    assigned_lines = sorted(session.attributions.by_first_line(session.book))
+    assigned_lines = sorted(assignments)
     choices = []
     for index, (start, end) in enumerate(session.book.section_ranges()):
         first = bisect_left(assigned_lines, start)
@@ -98,7 +102,7 @@ def dialogue_rows(session: BookSession, section: int) -> list[DialogueRow]:
 
 
 def correct_speaker(session: BookSession, section: int, first_line: int, speaker: str) -> BookSession:
-    if section not in {index for _, index in dialogue_sections(session)}:
+    if session.roster is None or section not in {index for _, index in dialogue_sections(session)}:
         raise WebBackendError("Complete the dialogue assignment before making corrections.")
     start, end = _section_range(session, section)
     if type(first_line) is not int or not start <= first_line < end:
@@ -132,8 +136,8 @@ def correct_speaker(session: BookSession, section: int, first_line: int, speaker
         ),
     )
     directory = session.attribution_dir or session.project_dir
-    if SpeakerAssignFileUtil.save_attributions_file(directory, attributions):
-        raise WebBackendError("Could not save the dialogue correction.")
+    checkpoint = Path(SpeakerAssignFileUtil.attributions_path(directory))
+    _save_analysis_checkpoint(checkpoint, session.roster, attributions)
     return replace(session, attributions=attributions)
 
 

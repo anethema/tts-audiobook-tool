@@ -77,6 +77,46 @@ class TestWebProjects(unittest.TestCase):
         self.assertFalse((copied / "external-link").is_symlink())
         self.assertFalse((copied / ".render.lock").exists())
 
+    def test_project_list_reads_only_changed_snapshots_and_skips_unreadable_books(self):
+        summary = web_projects.create_project(
+            "My project", self.session, narrator=RenderVoice(), voices={}, model_id="", root=self.root,
+        )
+        with patch.object(web_projects, "_read_snapshot", wraps=web_projects._read_snapshot) as read:
+            self.assertEqual(web_projects.list_projects(root=self.root), [summary])
+            self.assertEqual(web_projects.list_projects(root=self.root), [summary])
+            self.assertEqual(read.call_count, 1)
+            snapshot = self.root / summary.project_id / PROJECT_TEXT_FILE_NAME
+            updated = json.loads(snapshot.read_text())
+            updated["web_project"]["name"] = "Updated title"
+            replacement = snapshot.with_suffix(".tmp")
+            replacement.write_text(json.dumps(updated))
+            replacement.replace(snapshot)
+            self.assertEqual(web_projects.list_projects(root=self.root), [replace(summary, name="Updated title")])
+            self.assertEqual(read.call_count, 2)
+
+        broken = self.root / ("f" * 32)
+        broken.mkdir()
+        (broken / PROJECT_TEXT_FILE_NAME).write_text("[" * 10_000 + "]" * 10_000)
+        self.assertEqual(web_projects.list_projects(root=self.root), [replace(summary, name="Updated title")])
+        with self.assertRaises(web_projects.WebProjectError):
+            web_projects.load_project(broken.name, root=self.root)
+
+    def test_save_copies_a_shared_reference_once_across_cast_and_line_overrides(self):
+        audio = self.directory / "shared.wav"
+        audio.write_bytes(b"one shared reference")
+        voice = RenderVoice(str(audio), name="Narrator")
+        line = replace(voice, name="Line override")
+        session = replace(self.session, line_voices={1: line})
+        with patch.object(web_projects, "_copy_asset", wraps=web_projects._copy_asset) as copy:
+            summary = web_projects.create_project(
+                "Shared cast", session, narrator=voice, voices={"RUE": voice}, model_id="", root=self.root,
+            )
+        self.assertEqual(copy.call_count, 1)
+        saved = self._open(summary.project_id)
+        self.assertEqual(saved.voices["RUE"], saved.narrator)
+        self.assertEqual(saved.session.line_voices[1], replace(saved.narrator, name="Line override"))
+        self.assertEqual(Path(saved.narrator.reference_path).read_bytes(), audio.read_bytes())
+
     def test_abr_settings_template_imports_into_an_empty_browser_project(self):
         audio = self.directory / "book.m4b"
         audio.write_bytes(b"audio")

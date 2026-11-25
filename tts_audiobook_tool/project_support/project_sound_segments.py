@@ -19,6 +19,7 @@ from tts_audiobook_tool.app_support import app_text
 from tts_audiobook_tool.constants import COL_DIM_ITALICS
 from tts_audiobook_tool.system_support.ansi import Ansi
 from tts_audiobook_tool.util import delete_silently, printt
+from tts_audiobook_tool.sound.checkpoint_audio import has_complete_audio
 from tts_audiobook_tool.validator import Validator
 from tts_audiobook_tool.app_types.validation_findings import ValidationFindings
 
@@ -126,6 +127,11 @@ class ProjectSoundSegments:
             self._rebuild_if_needed()
             return {index: items.copy() for index, items in self._sound_segments_map.items()}
 
+    def get_items_for(self, index: int) -> list[SoundSegment]:
+        with self._lock:
+            self._rebuild_if_needed()
+            return self._sound_segments_map.get(index, []).copy()
+
     def get_filenames_for(self, index: int) -> list[str]:
         with self._lock:
             self._rebuild_if_needed()
@@ -150,6 +156,18 @@ class ProjectSoundSegments:
     def get_best_file_for(self, index: int) -> str:
         item = self.get_best_item_for(index)
         return item.file_name if item else ""
+
+    def get_export_file_for(self, index: int) -> str:
+        """Select the highest-ranked intact alternate if an interrupted take exists."""
+        items = self.get_items_for(index)
+        if len(items) <= 1:
+            # The exporter will decode the only take. Avoid opening it twice.
+            return items[0].file_name if items else ""
+        directory = Path(self.project.sound_segments_path)
+        for item in sorted(items, key=lambda take: get_segment_error_rank(take, directory)):
+            if has_complete_audio(directory / item.file_name):
+                return item.file_name
+        raise OSError(f"None of the saved takes for line {index + 1} is readable.")
 
     # ---
 

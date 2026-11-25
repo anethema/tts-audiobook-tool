@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import patch
 
+import pytest
+
 from tts_audiobook_tool import real_time_playback
 from tts_audiobook_tool.app_types.phrase import Phrase, PhraseGroup, Reason
 from tts_audiobook_tool.generate_util import GenerateUtil, TtsModelError
@@ -49,11 +51,15 @@ def test_generate_files_emits_model_unhealthy_after_consecutive_model_errors(
     assert "Too many consecutive TTS model errors" in output
 
 
-def test_generate_files_emits_model_unhealthy_on_oom(capsys) -> None:
+@pytest.mark.parametrize("raises", [False, True])
+def test_generate_files_emits_model_unhealthy_on_oom(capsys, raises) -> None:
     state = make_generate_state(num_groups=1)
     events: list[object] = []
 
     def oom_batch(**_: object) -> list:
+        if raises:
+            # Lazy model loading (including Whisper validation) can raise directly.
+            raise RuntimeError("CUDA failed with error out of memory")
         return [TtsModelError("CUDA out of memory")]
 
     with generate_files_mock_stack(oom_batch):
