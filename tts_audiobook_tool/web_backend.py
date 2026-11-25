@@ -43,6 +43,7 @@ from tts_audiobook_tool.speaker_assign.speaker_assign_file_util import SpeakerAs
 from tts_audiobook_tool.speaker_assign.speaker_assign_types import NOT_SPEECH, Utterance
 from tts_audiobook_tool.speaker_assign.utterance_util import UtteranceUtil
 from tts_audiobook_tool.text_ops.epub_extractor import EpubExtractor
+from tts_audiobook_tool.web_local_tagger import LOCAL_QWEN_MODEL, LocalQwen, LocalTaggerError
 
 if TYPE_CHECKING:
     from tts_audiobook_tool.web_render import RenderVoice
@@ -253,6 +254,7 @@ def analyze_book_dialogue(
         effort: str = DEFAULT_REASONING_EFFORT,
         endpoint: str = DEFAULT_LLM_ENDPOINT,
         settings_json: str = "",
+        local_tagger: LocalQwen | None = None,
         performance_cues: bool = False,
         character_voices: bool = False,
         on_log: Callable[[str], None] | None = None,
@@ -298,6 +300,7 @@ def analyze_book_dialogue(
         for number, speakers in speakers_by_chunk.items()
     )
     prefs = None
+    analysis_model = LOCAL_QWEN_MODEL if local_tagger is not None else model.strip()
     issue = ""
     skipped_chunks: list[PlannedChunk] = []
     log(f"Analyzing {total:,} dialogue chunks.\n")
@@ -313,7 +316,7 @@ def analyze_book_dialogue(
             log(f"{label} reused saved {saved} for {quotes}.\n")
             continue
         try:
-            if prefs is None:
+            if local_tagger is None and prefs is None:
                 api_key, prefs = _request_settings(api_key, model, effort, endpoint, settings_json)
             saved_speakers = {
                 number: next(iter(speakers))
@@ -339,7 +342,10 @@ def analyze_book_dialogue(
                 system_prompt += CHARACTER_VOICE_SYSTEM_INSTRUCTIONS
             attempt_system_prompt = system_prompt
             for attempt in range(_ANALYSIS_REPLY_RETRIES + 1):
-                reply = _send(_make_session(prefs, api_key, attempt_system_prompt), prompt)
+                if local_tagger is None:
+                    reply = _send(_make_session(prefs, api_key, attempt_system_prompt), prompt)
+                else:
+                    reply = local_tagger.send(attempt_system_prompt, prompt)
                 if reply.error is not None:
                     raise WebBackendError(_request_error_message(reply.error))
                 if reply.hit_output_limit:
@@ -372,14 +378,14 @@ def analyze_book_dialogue(
             next_attributions, new_utterances = attributions, []
             if requested or cue_requests:
                 added = AttributionReplyUtil.make_range_attribution(
-                    book, chunk.start, chunk.end, utterances, parsed, llm={"model": prefs.llm_model},
+                    book, chunk.start, chunk.end, utterances, parsed, llm={"model": analysis_model},
                 )
                 next_attributions, new_utterances = _merge_chunk_analysis(
                     book, attributions, added, requested, effective_by_line,
                 )
             if next_roster != roster or next_attributions != attributions:
                 _save_analysis_checkpoint(checkpoint, next_roster, next_attributions)
-        except WebBackendError as exc:
+        except (LocalTaggerError, WebBackendError) as exc:
             issue = str(exc)
             log(f"{label} stopped. {issue} Run Analyze book to retry this chunk.\n")
             break

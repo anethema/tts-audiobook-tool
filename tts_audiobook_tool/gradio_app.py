@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from threading import Event, Lock
 
@@ -48,6 +48,7 @@ from tts_audiobook_tool.web_legacy_project import (
     WebLegacyProjectError, list_console_projects, load_console_project,
 )
 from tts_audiobook_tool.web_line_voice_panel import LineVoicePanel
+from tts_audiobook_tool.web_local_tagger import local_qwen
 from tts_audiobook_tool.web_model_panel import ModelPanel
 from tts_audiobook_tool.web_model_setup import ModelSetupProgress, WebModelSetupError, install_model, model_profiles
 from tts_audiobook_tool.web_playback_panel import PlaybackPanel
@@ -210,8 +211,11 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
                             project_status = gr.Textbox(label="Project status", interactive=False, visible=False)
 
                         with gr.Accordion("Character voices", open=False):
-                            gr.Markdown(
-                                "Analyze the book to find characters and label their dialogue. Book text is sent to the configured LLM."
+                            use_local_qwen = gr.Checkbox(
+                                label="Use local Qwen3.8-27B for book analysis", value=False,
+                                info="Downloads the Hugging Face UD-Q5_K_M model through local Ollama on first use "
+                                     "(about 21 GB). Tags characters and delivery with a 40,960-token context. "
+                                     "Leave unchecked to use the configured LLM.",
                             )
                             with gr.Row():
                                 api_key = gr.Textbox(
@@ -712,10 +716,10 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
         save_new.click(save_named_project, [project_name, *persist_inputs], persist_outputs, **PRIVATE_EVENT)
         save_changes.click(save_loaded_project, [active_project, *persist_inputs], persist_outputs, **PRIVATE_EVENT)
 
-        def analyze_book(session, key, model, reasoning, endpoint, settings_json, selected_role, character_voices,
+        def analyze_book(session, key, model, reasoning, endpoint, settings_json, selected_role, use_qwen, character_voices,
                          performance_cues, request: gr.Request):
             console = activity_panel.console_for(request.session_hash)
-            secret = (key or "").strip()
+            secret = "" if use_qwen else (key or "").strip()
 
             def redact(message: str) -> str:
                 return message.replace(secret, "[redacted]") if secret else message
@@ -728,15 +732,16 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
             try:
                 if session is None:
                     raise WebBackendError("Import book text first.")
-                if not secret:
+                if not use_qwen and not secret:
                     secret = load_api_key(endpoint or "")
                 if secret and secret in (endpoint or ""):
                     raise WebBackendError("Remove the API key from the chat completions URL.")
-                session = analyze_book_dialogue(
-                    session, secret, model, effort=reasoning or "", endpoint=endpoint,
-                    settings_json=settings_json or "", on_log=log, performance_cues=performance_cues,
-                    character_voices=character_voices,
-                )
+                with local_qwen(log) if use_qwen else nullcontext() as tagger:
+                    session = analyze_book_dialogue(
+                        session, secret, model, effort=reasoning or "", endpoint=endpoint,
+                        settings_json=settings_json or "", on_log=log, performance_cues=performance_cues,
+                        character_voices=character_voices, local_tagger=tagger,
+                    )
             except (StoredApiKeyError, WebBackendError) as exc:
                 message = str(exc)
             except Exception:
@@ -753,8 +758,8 @@ def build_app(*, terminal_log: bool = False) -> gr.Blocks:
 
         analyzed = analyze.click(
             analyze_book, [
-                book, api_key, llm_model, effort, llm_endpoint, llm_extra_params, cast_role, character_voices,
-                analyze_performance_cues,
+                book, api_key, llm_model, effort, llm_endpoint, llm_extra_params, cast_role, use_local_qwen,
+                character_voices, analyze_performance_cues,
             ],
             [book, characters, cast_role, analysis_status], show_progress="hidden", **PRIVATE_EVENT,
         )

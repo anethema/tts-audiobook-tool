@@ -577,3 +577,47 @@ def test_combined_reply_resolves_persisted_merged_ids():
 def test_combined_reply_rejects_ambiguous_quote_labels(speakers):
     with pytest.raises(ValueError):
         parse_chunk_reply('{"characters":[],"speakers":' + speakers + '}', Roster(()), {1})
+
+
+def test_local_qwen_downloads_tags_and_unloads_then_reuses_saved_analysis(tmp_path, monkeypatch):
+    from tts_audiobook_tool.web_local_tagger import CONTEXT_LENGTH, LOCAL_QWEN_MODEL, local_qwen
+
+    monkeypatch.setattr(L, "logger", logging.getLogger(__name__), raising=False)
+    calls = []
+    reply = _reply({"1": "ANNA"}, [{"id": "ANNA", "name": "Anna"}])
+    reply["delivery"] = {"1": {"direction": "with relief"}}
+
+    def post(http, url, **kwargs):
+        payload = kwargs["json"]
+        assert not http.trust_env and not kwargs["allow_redirects"]
+        assert url.startswith("http://127.0.0.1:11434/api/")
+        assert payload["model"] == LOCAL_QWEN_MODEL
+        route = url.split("/")[-1]
+        calls.append(route)
+        response = requests.Response()
+        response.status_code = 200
+        response._content_consumed = True
+        response._content = b"{}"
+        if route == "show":
+            response.status_code = 404
+        elif route == "pull":
+            response._content = b'{"status":"success"}\n'
+        elif route == "chat":
+            assert payload["options"]["num_ctx"] == CONTEXT_LENGTH
+            assert payload["truncate"] is False and payload["format"] == "json"
+            response._content = json.dumps({
+                "done": True, "message": {"content": json.dumps(reply)}, "done_reason": "stop",
+            }).encode()
+        elif route == "generate":
+            assert payload["keep_alive"] == 0
+        return response
+
+    monkeypatch.setattr(requests.Session, "post", post)
+    book = Book(sections=[_section("LOCAL")])
+    session = web_backend.BookSession(book, str(tmp_path))
+    for _ in range(2):
+        with local_qwen(lambda _line: None) as tagger:
+            session = web_backend.analyze_book_dialogue(session, "", local_tagger=tagger, performance_cues=True)
+    assert calls == ["show", "pull", "chat", "generate"]
+    saved = session.attributions.by_first_line(book)[1]
+    assert saved.speaker == "ANNA" and saved.delivery == DeliveryCue("with relief")
